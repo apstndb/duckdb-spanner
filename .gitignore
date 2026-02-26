@@ -1,0 +1,10 @@
+/target
+/build
+*.duckdb_extension
+*.dylib
+*.so
+*.dll
+*.duckdb
+*.wal
+.DS_Store
+.env
