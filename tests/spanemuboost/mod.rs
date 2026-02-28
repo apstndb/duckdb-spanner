@@ -72,6 +72,7 @@ pub struct SpanEmuBoostBuilder {
     project_id: String,
     instance_id: String,
     database_id: String,
+    database_dialect: DatabaseDialect,
     setup_ddls: Vec<String>,
     setup_dmls: Vec<String>,
 }
@@ -84,6 +85,7 @@ impl Default for SpanEmuBoostBuilder {
             project_id: DEFAULT_PROJECT_ID.to_string(),
             instance_id: DEFAULT_INSTANCE_ID.to_string(),
             database_id: DEFAULT_DATABASE_ID.to_string(),
+            database_dialect: DatabaseDialect::GoogleStandardSql,
             setup_ddls: Vec::new(),
             setup_dmls: Vec::new(),
         }
@@ -119,6 +121,11 @@ impl SpanEmuBoostBuilder {
 
     pub fn setup_ddls(mut self, ddls: Vec<String>) -> Self {
         self.setup_ddls = ddls;
+        self
+    }
+
+    pub fn database_dialect(mut self, dialect: DatabaseDialect) -> Self {
+        self.database_dialect = dialect;
         self
     }
 
@@ -177,12 +184,17 @@ impl SpanEmuBoostBuilder {
         instance_op.wait(None).await?;
 
         // 4. Create database with DDLs
+        // PG dialect uses unquoted identifiers; GoogleSQL uses backtick-quoted.
+        let create_statement = match self.database_dialect {
+            DatabaseDialect::Postgresql => format!("CREATE DATABASE {}", self.database_id),
+            _ => format!("CREATE DATABASE `{}`", self.database_id),
+        };
         let create_db_req = CreateDatabaseRequest {
             parent: instance_path,
-            create_statement: format!("CREATE DATABASE `{}`", self.database_id),
+            create_statement,
             extra_statements: self.setup_ddls,
             encryption_config: None,
-            database_dialect: DatabaseDialect::GoogleStandardSql.into(),
+            database_dialect: self.database_dialect.into(),
             proto_descriptors: vec![],
         };
         let mut db_op = admin_client

@@ -58,6 +58,50 @@ pub fn spanner_type_to_logical(spanner_type: &Type) -> LogicalTypeHandle {
     }
 }
 
+/// Parse a PG dialect SPANNER_TYPE string from INFORMATION_SCHEMA.COLUMNS into a Type proto.
+///
+/// PG dialect returns DDL-compatible type names like "boolean", "bigint",
+/// "character varying(256)", "timestamp with time zone", "bigint[]", etc.
+pub fn parse_pg_spanner_type(s: &str) -> Type {
+    let s = s.trim();
+
+    // Handle array types: "T[]"
+    if let Some(base) = s.strip_suffix("[]") {
+        let elem = parse_pg_spanner_type(base);
+        return Type {
+            code: TypeCode::Array as i32,
+            array_element_type: Some(Box::new(elem)),
+            ..Default::default()
+        };
+    }
+
+    // Normalize: lowercase and strip optional length specifier like (256)
+    let lower = s.to_lowercase();
+    let base = if let Some(idx) = lower.find('(') {
+        lower[..idx].trim()
+    } else {
+        lower.trim()
+    };
+
+    match base {
+        "boolean" | "bool" => Type { code: TypeCode::Bool as i32, ..Default::default() },
+        "bigint" | "int8" => Type { code: TypeCode::Int64 as i32, ..Default::default() },
+        "real" | "float4" => Type { code: TypeCode::Float32 as i32, ..Default::default() },
+        "double precision" | "float8" => Type { code: TypeCode::Float64 as i32, ..Default::default() },
+        "numeric" => Type { code: TypeCode::Numeric as i32, ..Default::default() },
+        "character varying" | "varchar" | "text" => Type { code: TypeCode::String as i32, ..Default::default() },
+        "bytea" => Type { code: TypeCode::Bytes as i32, ..Default::default() },
+        "date" => Type { code: TypeCode::Date as i32, ..Default::default() },
+        "timestamp with time zone" | "timestamptz" => Type { code: TypeCode::Timestamp as i32, ..Default::default() },
+        "jsonb" => Type { code: TypeCode::Json as i32, ..Default::default() },
+        "uuid" => Type { code: TypeCode::Uuid as i32, ..Default::default() },
+        other => {
+            eprintln!("[duckdb-spanner] Unknown PG Spanner type '{other}', falling back to STRING");
+            Type { code: TypeCode::String as i32, ..Default::default() }
+        }
+    }
+}
+
 /// Parse a SPANNER_TYPE string from INFORMATION_SCHEMA.COLUMNS into a Type proto.
 ///
 /// Examples: "BOOL", "INT64", "STRING(MAX)", "ARRAY<INT64>",
@@ -311,5 +355,73 @@ mod tests {
         let t = parse_spanner_type("ENUM<my.package.MyEnum>");
         assert_eq!(t.code, TypeCode::Enum as i32);
         assert_eq!(t.proto_type_fqn, "my.package.MyEnum");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // PG dialect type parser tests
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_parse_pg_scalar_types() {
+        assert_eq!(parse_pg_spanner_type("boolean").code, TypeCode::Bool as i32);
+        assert_eq!(parse_pg_spanner_type("bool").code, TypeCode::Bool as i32);
+        assert_eq!(parse_pg_spanner_type("bigint").code, TypeCode::Int64 as i32);
+        assert_eq!(parse_pg_spanner_type("int8").code, TypeCode::Int64 as i32);
+        assert_eq!(parse_pg_spanner_type("real").code, TypeCode::Float32 as i32);
+        assert_eq!(parse_pg_spanner_type("float4").code, TypeCode::Float32 as i32);
+        assert_eq!(parse_pg_spanner_type("double precision").code, TypeCode::Float64 as i32);
+        assert_eq!(parse_pg_spanner_type("float8").code, TypeCode::Float64 as i32);
+        assert_eq!(parse_pg_spanner_type("numeric").code, TypeCode::Numeric as i32);
+        assert_eq!(parse_pg_spanner_type("date").code, TypeCode::Date as i32);
+        assert_eq!(parse_pg_spanner_type("timestamp with time zone").code, TypeCode::Timestamp as i32);
+        assert_eq!(parse_pg_spanner_type("timestamptz").code, TypeCode::Timestamp as i32);
+        assert_eq!(parse_pg_spanner_type("jsonb").code, TypeCode::Json as i32);
+        assert_eq!(parse_pg_spanner_type("uuid").code, TypeCode::Uuid as i32);
+    }
+
+    #[test]
+    fn test_parse_pg_string_types() {
+        assert_eq!(parse_pg_spanner_type("character varying").code, TypeCode::String as i32);
+        assert_eq!(parse_pg_spanner_type("character varying(256)").code, TypeCode::String as i32);
+        assert_eq!(parse_pg_spanner_type("varchar").code, TypeCode::String as i32);
+        assert_eq!(parse_pg_spanner_type("text").code, TypeCode::String as i32);
+    }
+
+    #[test]
+    fn test_parse_pg_bytes() {
+        assert_eq!(parse_pg_spanner_type("bytea").code, TypeCode::Bytes as i32);
+    }
+
+    #[test]
+    fn test_parse_pg_array_types() {
+        let t = parse_pg_spanner_type("bigint[]");
+        assert_eq!(t.code, TypeCode::Array as i32);
+        let elem = t.array_element_type.unwrap();
+        assert_eq!(elem.code, TypeCode::Int64 as i32);
+
+        let t = parse_pg_spanner_type("character varying[]");
+        assert_eq!(t.code, TypeCode::Array as i32);
+        let elem = t.array_element_type.unwrap();
+        assert_eq!(elem.code, TypeCode::String as i32);
+
+        let t = parse_pg_spanner_type("boolean[]");
+        assert_eq!(t.code, TypeCode::Array as i32);
+        let elem = t.array_element_type.unwrap();
+        assert_eq!(elem.code, TypeCode::Bool as i32);
+
+        let t = parse_pg_spanner_type("double precision[]");
+        assert_eq!(t.code, TypeCode::Array as i32);
+        let elem = t.array_element_type.unwrap();
+        assert_eq!(elem.code, TypeCode::Float64 as i32);
+
+        let t = parse_pg_spanner_type("jsonb[]");
+        assert_eq!(t.code, TypeCode::Array as i32);
+        let elem = t.array_element_type.unwrap();
+        assert_eq!(elem.code, TypeCode::Json as i32);
+
+        let t = parse_pg_spanner_type("numeric[]");
+        assert_eq!(t.code, TypeCode::Array as i32);
+        let elem = t.array_element_type.unwrap();
+        assert_eq!(elem.code, TypeCode::Numeric as i32);
     }
 }

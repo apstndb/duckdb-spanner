@@ -100,8 +100,12 @@ async fn discover_via_execution(
 /// Returns columns in ordinal order. Parses SPANNER_TYPE strings into Type protos.
 ///
 /// The `table` parameter can be:
-/// - `"MyTable"` — resolves to the default schema (TABLE_SCHEMA = '')
+/// - `"MyTable"` — resolves to the default schema (TABLE_SCHEMA = '' for GoogleSQL, 'public' for PG)
 /// - `"myschema.MyTable"` — resolves to named schema `myschema`
+///
+/// Dialect detection is automatic: for unqualified table names, both GoogleSQL ('')
+/// and PG ('public') default schemas are tried. The returned TABLE_SCHEMA value
+/// determines which type parser to use.
 pub async fn discover_table_schema(
     client: &Client,
     table: &str,
@@ -110,23 +114,49 @@ pub async fn discover_table_schema(
 
     let mut tx = client.single().await?;
 
-    let mut stmt = Statement::new(
-        "SELECT COLUMN_NAME, SPANNER_TYPE, IS_NULLABLE, ORDINAL_POSITION \
-         FROM INFORMATION_SCHEMA.COLUMNS \
-         WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @table \
-         ORDER BY ORDINAL_POSITION",
-    );
-    stmt.add_param("schema", &schema_name.to_string());
+    // For unqualified tables (empty schema), try both GoogleSQL ('') and PG ('public')
+    // default schemas. Only one will match depending on the database dialect.
+    // For qualified tables, use the explicit schema.
+    let (sql, schemas) = if schema_name.is_empty() {
+        (
+            "SELECT TABLE_SCHEMA, COLUMN_NAME, SPANNER_TYPE \
+             FROM INFORMATION_SCHEMA.COLUMNS \
+             WHERE TABLE_SCHEMA IN ('', 'public') AND TABLE_NAME = @table \
+             ORDER BY ORDINAL_POSITION",
+            None,
+        )
+    } else {
+        (
+            "SELECT TABLE_SCHEMA, COLUMN_NAME, SPANNER_TYPE \
+             FROM INFORMATION_SCHEMA.COLUMNS \
+             WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @table \
+             ORDER BY ORDINAL_POSITION",
+            Some(schema_name),
+        )
+    };
+
+    let mut stmt = Statement::new(sql);
+    if let Some(schema) = schemas {
+        stmt.add_param("schema", &schema.to_string());
+    }
     stmt.add_param("table", &table_name.to_string());
 
     let mut iter = tx.query(stmt).await.map_err(SpannerError::Grpc)?;
 
     let mut columns = Vec::new();
     while let Some(row) = iter.next().await.map_err(SpannerError::Grpc)? {
-        let name: String = row.column_by_name("COLUMN_NAME")?;
-        let spanner_type_str: String = row.column_by_name("SPANNER_TYPE")?;
+        // Use positional access — we control the SELECT order, so this is safe
+        // and works regardless of whether column names are upper or lowercase.
+        let table_schema: String = row.column(0)?;
+        let name: String = row.column(1)?;
+        let spanner_type_str: String = row.column(2)?;
 
-        let spanner_type = types::parse_spanner_type(&spanner_type_str);
+        // Detect dialect from TABLE_SCHEMA: '' = GoogleSQL, 'public' = PG
+        let spanner_type = if table_schema == "public" {
+            types::parse_pg_spanner_type(&spanner_type_str)
+        } else {
+            types::parse_spanner_type(&spanner_type_str)
+        };
 
         columns.push(ColumnInfo { name, spanner_type });
     }

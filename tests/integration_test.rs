@@ -5,6 +5,7 @@ use std::sync::{Arc, OnceLock};
 use duckdb::Connection;
 use duckdb_spanner::{SpannerQueryVTab, SpannerScanVTab};
 use google_cloud_gax::conn::Environment;
+use google_cloud_googleapis::spanner::admin::database::v1::DatabaseDialect;
 use google_cloud_spanner::client::{Client, ClientConfig};
 use google_cloud_spanner::statement::Statement;
 use tokio::runtime::Runtime;
@@ -1001,5 +1002,235 @@ fn test_error_invalid_sql_query() {
     let sql = vtab_query_sql("THIS IS NOT VALID SQL!!!");
     let result = conn.query_row(&sql, [], |r| r.get::<_, i64>(0));
     assert!(result.is_err(), "invalid SQL should fail");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PostgreSQL dialect infrastructure
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Start a PG dialect Spanner emulator (once) with test tables and seed data.
+fn get_pg_emulator() -> &'static spanemuboost::SpanEmuBoost {
+    static PG_EMU: OnceLock<spanemuboost::SpanEmuBoost> = OnceLock::new();
+    PG_EMU.get_or_init(|| {
+        test_runtime().block_on(async {
+            spanemuboost::SpanEmuBoost::builder()
+                .database_id("pg-database")
+                .database_dialect(DatabaseDialect::Postgresql)
+                .setup_ddls(vec![
+                    "CREATE TABLE users (\
+                        id bigint NOT NULL, \
+                        name character varying(256), \
+                        age bigint, \
+                        PRIMARY KEY (id)\
+                    )"
+                    .into(),
+                    "CREATE TABLE pg_types (\
+                        id bigint NOT NULL, \
+                        bool_col boolean, \
+                        int_col bigint, \
+                        float4_col real, \
+                        float8_col double precision, \
+                        num_col numeric, \
+                        str_col character varying(256), \
+                        bytes_col bytea, \
+                        date_col date, \
+                        ts_col timestamp with time zone, \
+                        json_col jsonb, \
+                        PRIMARY KEY (id)\
+                    )"
+                    .into(),
+                ])
+                .setup_dmls(vec![
+                    "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)".into(),
+                    "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)".into(),
+                    "INSERT INTO users (id, name, age) VALUES (3, 'Charlie', NULL)".into(),
+                    "INSERT INTO pg_types (id, bool_col, int_col, float4_col, float8_col, num_col, str_col, bytes_col, date_col, ts_col, json_col) \
+                     VALUES (1, true, 42, 1.5, 3.125, 123.456789, 'hello', '\\x68656c6c6f', '2024-01-15', '2024-06-15T10:30:00Z', '{\"key\": \"value\"}')"
+                    .into(),
+                    "INSERT INTO pg_types (id, bool_col, int_col, float4_col, float8_col, num_col, str_col, bytes_col, date_col, ts_col, json_col) \
+                     VALUES (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)"
+                    .into(),
+                ])
+                .start()
+                .await
+                .expect("Failed to start PG dialect emulator")
+        })
+    })
+}
+
+fn pg_vtab_query_sql(spanner_sql: &str) -> String {
+    let env = get_pg_emulator();
+    format!(
+        "SELECT * FROM spanner_query('{}', '{}', endpoint := '{}')",
+        env.database_path(),
+        spanner_sql,
+        env.emulator_host()
+    )
+}
+
+fn pg_vtab_query_sql_with(spanner_sql: &str, extra_params: &str) -> String {
+    let env = get_pg_emulator();
+    format!(
+        "SELECT * FROM spanner_query('{}', '{}', endpoint := '{}', {})",
+        env.database_path(),
+        spanner_sql,
+        env.emulator_host(),
+        extra_params
+    )
+}
+
+fn pg_vtab_scan_sql(table: &str) -> String {
+    let env = get_pg_emulator();
+    format!(
+        "SELECT * FROM spanner_scan('{}', '{}', endpoint := '{}')",
+        env.database_path(),
+        table,
+        env.emulator_host()
+    )
+}
+
+fn pg_vtab_scan_sql_with(table: &str, extra_params: &str) -> String {
+    let env = get_pg_emulator();
+    format!(
+        "SELECT * FROM spanner_scan('{}', '{}', endpoint := '{}', {})",
+        env.database_path(),
+        table,
+        env.emulator_host(),
+        extra_params
+    )
+}
+
+fn create_pg_duckdb_connection() -> Connection {
+    let _ = get_pg_emulator(); // ensure PG emulator is running
+    let conn = Connection::open_in_memory().unwrap();
+    conn.register_table_function::<SpannerQueryVTab>("spanner_query_raw")
+        .unwrap();
+    conn.register_table_function::<SpannerScanVTab>("spanner_scan")
+        .unwrap();
+    conn.execute_batch("LOAD json").unwrap();
+    conn.execute_batch(include_str!("../src/macros.sql"))
+        .unwrap();
+    conn
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PostgreSQL dialect — spanner_query tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_pg_vtab_query() {
+    let conn = create_pg_duckdb_connection();
+    let sql = pg_vtab_query_sql("SELECT id, name, age FROM users ORDER BY id");
+    let count: i64 = conn
+        .query_row(&format!("SELECT COUNT(*) FROM ({sql})"), [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 3);
+
+    let (id, name): (i64, String) = conn
+        .query_row(
+            &format!("SELECT id, name FROM ({sql}) WHERE id = 1"),
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(id, 1);
+    assert_eq!(name, "Alice");
+}
+
+#[test]
+fn test_pg_vtab_query_types() {
+    let conn = create_pg_duckdb_connection();
+    let sql = pg_vtab_query_sql(
+        "SELECT bool_col, int_col, float4_col, float8_col, str_col FROM pg_types WHERE id = 1",
+    );
+    let (b, i, f4, f8, s): (bool, i64, f64, f64, String) = conn
+        .query_row(&sql, [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
+        .unwrap();
+    assert!(b);
+    assert_eq!(i, 42);
+    assert!((f4 - 1.5).abs() < 0.001);
+    assert!((f8 - 3.125).abs() < 0.001);
+    assert_eq!(s, "hello");
+}
+
+#[test]
+fn test_pg_vtab_query_null() {
+    let conn = create_pg_duckdb_connection();
+    let sql = pg_vtab_query_sql("SELECT bool_col IS NULL, int_col IS NULL FROM pg_types WHERE id = 2");
+    let (b_null, i_null): (bool, bool) = conn
+        .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert!(b_null);
+    assert!(i_null);
+}
+
+#[test]
+fn test_pg_vtab_query_params() {
+    let conn = create_pg_duckdb_connection();
+    let sql = pg_vtab_query_sql_with(
+        "SELECT id, name FROM users WHERE id = $1 AND name = $2",
+        "params := {'p1': 1, 'p2': 'Alice'}",
+    );
+    let (id, name): (i64, String) = conn
+        .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert_eq!(id, 1);
+    assert_eq!(name, "Alice");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PostgreSQL dialect — spanner_scan tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_pg_vtab_scan() {
+    let conn = create_pg_duckdb_connection();
+    let sql = pg_vtab_scan_sql("users");
+    let count: i64 = conn
+        .query_row(&format!("SELECT COUNT(*) FROM ({sql})"), [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 3);
+}
+
+#[test]
+fn test_pg_vtab_scan_types() {
+    let conn = create_pg_duckdb_connection();
+    let base = pg_vtab_scan_sql("pg_types");
+    let (b, i, s): (bool, i64, String) = conn
+        .query_row(
+            &format!("SELECT bool_col, int_col, str_col FROM ({base}) WHERE id = 1"),
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert!(b);
+    assert_eq!(i, 42);
+    assert_eq!(s, "hello");
+}
+
+#[test]
+fn test_pg_vtab_scan_projection() {
+    let conn = create_pg_duckdb_connection();
+    let base = pg_vtab_scan_sql("users");
+    let val: String = conn
+        .query_row(
+            &format!("SELECT name FROM ({base}) WHERE id = 2"),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(val, "Bob");
+}
+
+#[test]
+fn test_pg_vtab_scan_exact_staleness() {
+    let conn = create_pg_duckdb_connection();
+    let sql = pg_vtab_scan_sql_with("users", "exact_staleness_secs := 0");
+    let count: i64 = conn
+        .query_row(&format!("SELECT COUNT(*) FROM ({sql})"), [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 3);
 }
 
