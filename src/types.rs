@@ -1,5 +1,5 @@
 use duckdb::core::{LogicalTypeHandle, LogicalTypeId};
-use google_cloud_googleapis::spanner::v1::{StructType, Type, TypeCode};
+use google_cloud_googleapis::spanner::v1::{StructType, Type, TypeAnnotationCode, TypeCode};
 
 /// Convert a Spanner Type proto to a DuckDB LogicalTypeHandle.
 pub fn spanner_type_to_logical(spanner_type: &Type) -> LogicalTypeHandle {
@@ -88,12 +88,26 @@ pub fn parse_pg_spanner_type(s: &str) -> Type {
         "bigint" | "int8" => Type { code: TypeCode::Int64 as i32, ..Default::default() },
         "real" | "float4" => Type { code: TypeCode::Float32 as i32, ..Default::default() },
         "double precision" | "float8" => Type { code: TypeCode::Float64 as i32, ..Default::default() },
-        "numeric" => Type { code: TypeCode::Numeric as i32, ..Default::default() },
+        "numeric" => Type {
+            code: TypeCode::Numeric as i32,
+            type_annotation: TypeAnnotationCode::PgNumeric as i32,
+            ..Default::default()
+        },
         "character varying" | "varchar" | "text" => Type { code: TypeCode::String as i32, ..Default::default() },
         "bytea" => Type { code: TypeCode::Bytes as i32, ..Default::default() },
         "date" => Type { code: TypeCode::Date as i32, ..Default::default() },
         "timestamp with time zone" | "timestamptz" => Type { code: TypeCode::Timestamp as i32, ..Default::default() },
-        "jsonb" => Type { code: TypeCode::Json as i32, ..Default::default() },
+        "jsonb" => Type {
+            code: TypeCode::Json as i32,
+            type_annotation: TypeAnnotationCode::PgJsonb as i32,
+            ..Default::default()
+        },
+        "oid" => Type {
+            code: TypeCode::Int64 as i32,
+            type_annotation: TypeAnnotationCode::PgOid as i32,
+            ..Default::default()
+        },
+        "interval" => Type { code: TypeCode::Interval as i32, ..Default::default() },
         "uuid" => Type { code: TypeCode::Uuid as i32, ..Default::default() },
         other => {
             eprintln!("[duckdb-spanner] Unknown PG Spanner type '{other}', falling back to STRING");
@@ -376,7 +390,25 @@ mod tests {
         assert_eq!(parse_pg_spanner_type("timestamp with time zone").code, TypeCode::Timestamp as i32);
         assert_eq!(parse_pg_spanner_type("timestamptz").code, TypeCode::Timestamp as i32);
         assert_eq!(parse_pg_spanner_type("jsonb").code, TypeCode::Json as i32);
+        assert_eq!(parse_pg_spanner_type("oid").code, TypeCode::Int64 as i32);
+        assert_eq!(parse_pg_spanner_type("interval").code, TypeCode::Interval as i32);
         assert_eq!(parse_pg_spanner_type("uuid").code, TypeCode::Uuid as i32);
+    }
+
+    #[test]
+    fn test_parse_pg_type_annotations() {
+        let numeric = parse_pg_spanner_type("numeric");
+        assert_eq!(numeric.type_annotation, TypeAnnotationCode::PgNumeric as i32);
+
+        let jsonb = parse_pg_spanner_type("jsonb");
+        assert_eq!(jsonb.type_annotation, TypeAnnotationCode::PgJsonb as i32);
+
+        let oid = parse_pg_spanner_type("oid");
+        assert_eq!(oid.type_annotation, TypeAnnotationCode::PgOid as i32);
+
+        // Non-PG-specific types should have Unspecified annotation
+        let boolean = parse_pg_spanner_type("boolean");
+        assert_eq!(boolean.type_annotation, TypeAnnotationCode::Unspecified as i32);
     }
 
     #[test]
@@ -423,5 +455,16 @@ mod tests {
         assert_eq!(t.code, TypeCode::Array as i32);
         let elem = t.array_element_type.unwrap();
         assert_eq!(elem.code, TypeCode::Numeric as i32);
+
+        let t = parse_pg_spanner_type("oid[]");
+        assert_eq!(t.code, TypeCode::Array as i32);
+        let elem = t.array_element_type.unwrap();
+        assert_eq!(elem.code, TypeCode::Int64 as i32);
+        assert_eq!(elem.type_annotation, TypeAnnotationCode::PgOid as i32);
+
+        let t = parse_pg_spanner_type("interval[]");
+        assert_eq!(t.code, TypeCode::Array as i32);
+        let elem = t.array_element_type.unwrap();
+        assert_eq!(elem.code, TypeCode::Interval as i32);
     }
 }

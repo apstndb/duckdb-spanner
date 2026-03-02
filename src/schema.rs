@@ -1,3 +1,4 @@
+use google_cloud_googleapis::spanner::admin::database::v1::DatabaseDialect;
 use google_cloud_googleapis::spanner::v1::execute_sql_request::QueryMode;
 use google_cloud_googleapis::spanner::v1::Type;
 use google_cloud_spanner::client::Client;
@@ -14,28 +15,37 @@ pub struct ColumnInfo {
     pub spanner_type: Type,
 }
 
-/// Discover the output schema of a SQL query using Plan mode.
-///
-/// Falls back to normal execution if Plan mode returns empty metadata.
-pub async fn discover_query_schema(
-    client: &Client,
-    sql: &str,
-    params_json: Option<&str>,
-) -> Result<Vec<ColumnInfo>, SpannerError> {
-    match discover_via_plan(client, sql, params_json).await {
-        Ok(cols) if !cols.is_empty() => return Ok(cols),
-        Ok(_) => {
-            eprintln!("[duckdb-spanner] Plan mode returned empty columns, falling back to execution");
-        }
-        Err(e) => {
-            eprintln!("[duckdb-spanner] Plan mode failed: {e}, falling back to execution");
-        }
+/// Parse a dialect string from user input.
+pub fn parse_dialect(s: &str) -> Result<DatabaseDialect, Box<dyn std::error::Error>> {
+    match s.to_ascii_lowercase().as_str() {
+        "googlesql" => Ok(DatabaseDialect::GoogleStandardSql),
+        "postgresql" => Ok(DatabaseDialect::Postgresql),
+        _ => Err(format!(
+            "Invalid dialect '{s}': must be 'googlesql' or 'postgresql'"
+        )
+        .into()),
     }
-
-    discover_via_execution(client, sql, params_json).await
 }
 
-async fn discover_via_plan(
+/// Detect the database dialect by querying INFORMATION_SCHEMA.SCHEMATA.
+///
+/// PostgreSQL-dialect databases have a 'public' schema; GoogleSQL databases do not.
+/// This query uses no parameters, so it works in both dialects.
+pub async fn detect_dialect(client: &Client) -> Result<DatabaseDialect, SpannerError> {
+    let stmt = Statement::new(
+        "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = 'public'",
+    );
+    let mut tx = client.single().await?;
+    let mut iter = tx.query(stmt).await.map_err(SpannerError::Grpc)?;
+    if iter.next().await.map_err(SpannerError::Grpc)?.is_some() {
+        Ok(DatabaseDialect::Postgresql)
+    } else {
+        Ok(DatabaseDialect::GoogleStandardSql)
+    }
+}
+
+/// Discover the output schema of a SQL query using Plan mode.
+pub async fn discover_query_schema(
     client: &Client,
     sql: &str,
     params_json: Option<&str>,
@@ -50,32 +60,6 @@ async fn discover_via_plan(
 
     // Consume the iterator to ensure metadata is fully populated
     while let Some(_row) = iter.next().await.map_err(SpannerError::Grpc)? {}
-
-    let metadata = iter.columns_metadata();
-    let columns = metadata
-        .iter()
-        .map(|field| ColumnInfo {
-            name: field.name.clone(),
-            spanner_type: field.r#type.clone().unwrap_or_default(),
-        })
-        .collect();
-
-    Ok(columns)
-}
-
-async fn discover_via_execution(
-    client: &Client,
-    sql: &str,
-    params_json: Option<&str>,
-) -> Result<Vec<ColumnInfo>, SpannerError> {
-    let mut tx = client.single().await?;
-    // Wrap in LIMIT 1 subquery to minimize data transfer
-    let limited_sql = format!("SELECT * FROM ({sql}) AS _sub LIMIT 1");
-    let stmt = crate::params::create_statement(&limited_sql, params_json)?;
-    let mut iter = tx.query(stmt).await.map_err(SpannerError::Grpc)?;
-
-    // Read first row to ensure metadata is populated
-    let _ = iter.next().await.map_err(SpannerError::Grpc)?;
 
     let metadata = iter.columns_metadata();
     if metadata.is_empty() {
@@ -97,61 +81,36 @@ async fn discover_via_execution(
 
 /// Discover table schema from INFORMATION_SCHEMA.COLUMNS.
 ///
-/// Returns columns in ordinal order. Parses SPANNER_TYPE strings into Type protos.
+/// If `dialect` is `Unspecified`, auto-detects by querying INFORMATION_SCHEMA.SCHEMATA first
+/// (one extra round-trip). Specify `GoogleStandardSql` or `Postgresql` to skip detection.
 ///
 /// The `table` parameter can be:
-/// - `"MyTable"` — resolves to the default schema (TABLE_SCHEMA = '' for GoogleSQL, 'public' for PG)
+/// - `"MyTable"` — resolves to the default schema ('' for GoogleSQL, 'public' for PG)
 /// - `"myschema.MyTable"` — resolves to named schema `myschema`
-///
-/// Dialect detection is automatic: for unqualified table names, both GoogleSQL ('')
-/// and PG ('public') default schemas are tried. The returned TABLE_SCHEMA value
-/// determines which type parser to use.
 pub async fn discover_table_schema(
     client: &Client,
     table: &str,
+    dialect: DatabaseDialect,
 ) -> Result<Vec<ColumnInfo>, SpannerError> {
+    let dialect = if dialect == DatabaseDialect::Unspecified {
+        detect_dialect(client).await?
+    } else {
+        dialect
+    };
+
     let (schema_name, table_name) = split_schema_table(table);
 
     let mut tx = client.single().await?;
-
-    // For unqualified tables (empty schema), try both GoogleSQL ('') and PG ('public')
-    // default schemas. Only one will match depending on the database dialect.
-    // For qualified tables, use the explicit schema.
-    let (sql, schemas) = if schema_name.is_empty() {
-        (
-            "SELECT TABLE_SCHEMA, COLUMN_NAME, SPANNER_TYPE \
-             FROM INFORMATION_SCHEMA.COLUMNS \
-             WHERE TABLE_SCHEMA IN ('', 'public') AND TABLE_NAME = @table \
-             ORDER BY ORDINAL_POSITION",
-            None,
-        )
-    } else {
-        (
-            "SELECT TABLE_SCHEMA, COLUMN_NAME, SPANNER_TYPE \
-             FROM INFORMATION_SCHEMA.COLUMNS \
-             WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @table \
-             ORDER BY ORDINAL_POSITION",
-            Some(schema_name),
-        )
-    };
-
-    let mut stmt = Statement::new(sql);
-    if let Some(schema) = schemas {
-        stmt.add_param("schema", &schema.to_string());
-    }
-    stmt.add_param("table", &table_name.to_string());
-
+    let stmt = build_columns_query(dialect, schema_name, table_name);
     let mut iter = tx.query(stmt).await.map_err(SpannerError::Grpc)?;
 
     let mut columns = Vec::new();
     while let Some(row) = iter.next().await.map_err(SpannerError::Grpc)? {
-        // Use positional access — we control the SELECT order, so this is safe
-        // and works regardless of whether column names are upper or lowercase.
         let table_schema: String = row.column(0)?;
         let name: String = row.column(1)?;
         let spanner_type_str: String = row.column(2)?;
 
-        // Detect dialect from TABLE_SCHEMA: '' = GoogleSQL, 'public' = PG
+        // Use dialect-appropriate type parser
         let spanner_type = if table_schema == "public" {
             types::parse_pg_spanner_type(&spanner_type_str)
         } else {
@@ -162,12 +121,69 @@ pub async fn discover_table_schema(
     }
 
     if columns.is_empty() {
-        return Err(SpannerError::Other(format!(
-            "Table not found or has no columns: {table}"
-        )));
+        let msg = if schema_name.is_empty() {
+            format!("Table {table_name} not found in INFORMATION_SCHEMA (searched schemas '' and 'public')")
+        } else {
+            format!("Table {table_name} in schema {schema_name} not found in INFORMATION_SCHEMA")
+        };
+        return Err(SpannerError::Other(msg));
     }
 
     Ok(columns)
+}
+
+/// Build an INFORMATION_SCHEMA.COLUMNS query with dialect-appropriate parameter syntax.
+///
+/// GoogleSQL uses `@param`; PostgreSQL uses `$N` with param names `pN`.
+fn build_columns_query(
+    dialect: DatabaseDialect,
+    schema_name: &str,
+    table_name: &str,
+) -> Statement {
+    if schema_name.is_empty() {
+        let (sql, table_param) = match dialect {
+            DatabaseDialect::Postgresql => (
+                "SELECT TABLE_SCHEMA, COLUMN_NAME, SPANNER_TYPE \
+                 FROM INFORMATION_SCHEMA.COLUMNS \
+                 WHERE TABLE_SCHEMA IN ('', 'public') AND TABLE_NAME = $1 \
+                 ORDER BY ORDINAL_POSITION",
+                "p1",
+            ),
+            _ => (
+                "SELECT TABLE_SCHEMA, COLUMN_NAME, SPANNER_TYPE \
+                 FROM INFORMATION_SCHEMA.COLUMNS \
+                 WHERE TABLE_SCHEMA IN ('', 'public') AND TABLE_NAME = @table \
+                 ORDER BY ORDINAL_POSITION",
+                "table",
+            ),
+        };
+        let mut stmt = Statement::new(sql);
+        stmt.add_param(table_param, &table_name.to_string());
+        stmt
+    } else {
+        let (sql, schema_param, table_param) = match dialect {
+            DatabaseDialect::Postgresql => (
+                "SELECT TABLE_SCHEMA, COLUMN_NAME, SPANNER_TYPE \
+                 FROM INFORMATION_SCHEMA.COLUMNS \
+                 WHERE TABLE_SCHEMA = $1 AND TABLE_NAME = $2 \
+                 ORDER BY ORDINAL_POSITION",
+                "p1",
+                "p2",
+            ),
+            _ => (
+                "SELECT TABLE_SCHEMA, COLUMN_NAME, SPANNER_TYPE \
+                 FROM INFORMATION_SCHEMA.COLUMNS \
+                 WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @table \
+                 ORDER BY ORDINAL_POSITION",
+                "schema",
+                "table",
+            ),
+        };
+        let mut stmt = Statement::new(sql);
+        stmt.add_param(schema_param, &schema_name.to_string());
+        stmt.add_param(table_param, &table_name.to_string());
+        stmt
+    }
 }
 
 /// Split a potentially schema-qualified table name into (schema, table).

@@ -27,7 +27,7 @@ google-cloud-spanner = { package = "gcloud-spanner", version = "1.7", default-fe
 google-cloud-googleapis = { package = "gcloud-googleapis", version = "1.3", features = ["spanner"] }
 google-cloud-gax = { package = "gcloud-gax", version = "1.3" }
 prost-types = "0.14"
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 bigdecimal = "0.4"
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 thiserror = "2"

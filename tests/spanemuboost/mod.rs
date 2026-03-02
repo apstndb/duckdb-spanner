@@ -184,9 +184,9 @@ impl SpanEmuBoostBuilder {
         instance_op.wait(None).await?;
 
         // 4. Create database with DDLs
-        // PG dialect uses unquoted identifiers; GoogleSQL uses backtick-quoted.
+        // GoogleSQL uses backtick-quoted identifiers; PostgreSQL uses double-quoted.
         let create_statement = match self.database_dialect {
-            DatabaseDialect::Postgresql => format!("CREATE DATABASE {}", self.database_id),
+            DatabaseDialect::Postgresql => format!("CREATE DATABASE \"{}\"", self.database_id),
             _ => format!("CREATE DATABASE `{}`", self.database_id),
         };
         let create_db_req = CreateDatabaseRequest {

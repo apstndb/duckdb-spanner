@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
@@ -8,7 +7,9 @@ use google_cloud_spanner::row::Row;
 use google_cloud_spanner::statement::Statement;
 use google_cloud_googleapis::spanner::v1::request_options::Priority;
 use google_cloud_spanner::transaction::{CallOptions, QueryOptions};
+use tokio::sync::mpsc;
 
+use crate::error::SpannerError;
 use crate::schema::ColumnInfo;
 use crate::{client, convert, runtime, schema, types};
 
@@ -28,12 +29,9 @@ pub struct QueryBindData {
     columns: Vec<ColumnInfo>,
 }
 
-// TODO: Stream rows incrementally instead of buffering all rows in memory.
-// Currently init() fetches all rows into a VecDeque, which can use excessive
-// memory for large result sets. Streaming would require holding an async
-// iterator across sync func() calls.
+/// Streaming init data: rows arrive via an mpsc channel from a background tokio task.
 pub struct QueryInitData {
-    rows: Mutex<VecDeque<Row>>,
+    receiver: Mutex<mpsc::Receiver<Result<Row, SpannerError>>>,
 }
 
 pub struct SpannerQueryVTab;
@@ -95,50 +93,73 @@ impl VTab for SpannerQueryVTab {
     fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
         let bind_data = unsafe { &*init.get_bind_data::<QueryBindData>() };
 
-        // Parse params JSON once; create_statement is called per-execution path
-        // because Statement is not Clone, but the JSON parsing validates early.
-        let params_json = bind_data.params_json.as_deref();
-        let sql = &bind_data.sql;
+        let (tx, rx) = mpsc::channel(BATCH_SIZE);
 
-        let rows = runtime::block_on(async {
-            let client = client::get_or_create_client(&bind_data.database, bind_data.endpoint.as_deref()).await?;
+        // Clone bind data fields for the spawned task ('static requirement)
+        let database = bind_data.database.clone();
+        let endpoint = bind_data.endpoint.clone();
+        let sql = bind_data.sql.clone();
+        let params_json = bind_data.params_json.clone();
+        let use_parallelism = bind_data.use_parallelism;
+        let use_data_boost = bind_data.use_data_boost;
+        let max_parallelism = bind_data.max_parallelism;
+        let timestamp_bound = bind_data.timestamp_bound.clone();
+        let priority = bind_data.priority;
 
-            if bind_data.use_parallelism {
-                let partition_options = bind_data.max_parallelism.map(|max| PartitionOptions {
-                    max_partitions: max,
-                    ..Default::default()
-                });
+        runtime::spawn(async move {
+            let result: Result<(), SpannerError> = async {
+                let client =
+                    client::get_or_create_client(&database, endpoint.as_deref()).await?;
 
-                let stmt = crate::params::create_statement(sql, params_json)?;
-                match try_partitioned_query(
-                    &client,
-                    stmt,
-                    bind_data.timestamp_bound.as_ref(),
-                    bind_data.priority,
-                    bind_data.use_data_boost,
-                    partition_options,
-                )
-                .await
-                {
-                    Ok(rows) => return Ok(rows),
-                    Err(e) => {
-                        eprintln!("[duckdb-spanner] Partitioned query failed: {e}, falling back to single query");
+                if use_parallelism {
+                    let partition_options =
+                        max_parallelism.map(|max| PartitionOptions {
+                            max_partitions: max,
+                            ..Default::default()
+                        });
+
+                    let stmt =
+                        crate::params::create_statement(&sql, params_json.as_deref())?;
+                    match stream_partitioned_query(
+                        &client,
+                        &tx,
+                        stmt,
+                        timestamp_bound.as_ref(),
+                        priority,
+                        use_data_boost,
+                        partition_options,
+                    )
+                    .await
+                    {
+                        Ok(()) => return Ok(()),
+                        Err(e) => {
+                            eprintln!("[duckdb-spanner] Partitioned query failed: {e}, falling back to single query");
+                        }
                     }
                 }
+
+                let stmt =
+                    crate::params::create_statement(&sql, params_json.as_deref())?;
+                stream_single_query(
+                    &client,
+                    &tx,
+                    stmt,
+                    timestamp_bound.as_ref(),
+                    priority,
+                )
+                .await
             }
+            .await;
 
-            // Fallback: single query
-            let stmt = crate::params::create_statement(sql, params_json)?;
-            execute_single_query(&client, stmt, bind_data.timestamp_bound.as_ref(), bind_data.priority).await
-        })??;
+            if let Err(e) = result {
+                let _ = tx.send(Err(e)).await;
+            }
+        })?;
 
-        // Allow DuckDB to use multiple threads for processing fetched rows
-        let thread_count = std::cmp::max(1, rows.len() / BATCH_SIZE);
-        let thread_count = std::cmp::min(thread_count, 8);
-        init.set_max_threads(thread_count as u64);
+        init.set_max_threads(1);
 
         Ok(QueryInitData {
-            rows: Mutex::new(rows),
+            receiver: Mutex::new(rx),
         })
     }
 
@@ -149,16 +170,30 @@ impl VTab for SpannerQueryVTab {
         let bind_data = func.get_bind_data();
         let init_data = func.get_init_data();
 
-        let mut rows_queue = init_data.rows.lock().unwrap_or_else(|e| e.into_inner());
+        let mut rx = init_data.receiver.lock().unwrap_or_else(|e| e.into_inner());
 
-        if rows_queue.is_empty() {
-            output.set_len(0);
-            return Ok(());
+        // Block for the first row to ensure forward progress
+        let first = match rx.blocking_recv() {
+            Some(Ok(row)) => row,
+            Some(Err(e)) => return Err(e.into()),
+            None => {
+                output.set_len(0);
+                return Ok(());
+            }
+        };
+
+        let mut batch = Vec::with_capacity(BATCH_SIZE);
+        batch.push(first);
+
+        // Fill the rest of the batch non-blocking
+        while batch.len() < BATCH_SIZE {
+            match rx.try_recv() {
+                Ok(Ok(row)) => batch.push(row),
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => break, // Empty or Disconnected
+            }
         }
-
-        let batch_size = std::cmp::min(rows_queue.len(), BATCH_SIZE);
-        let batch: Vec<_> = rows_queue.drain(..batch_size).collect();
-        drop(rows_queue);
+        drop(rx);
 
         convert::write_rows_to_chunk(output, &batch, &bind_data.columns)?;
         Ok(())
@@ -219,20 +254,21 @@ impl VTab for SpannerQueryVTab {
     }
 }
 
-async fn try_partitioned_query(
+async fn stream_partitioned_query(
     client: &google_cloud_spanner::client::Client,
+    tx: &mpsc::Sender<Result<Row, SpannerError>>,
     stmt: Statement,
     timestamp_bound: Option<&crate::bind_utils::TimestampBoundConfig>,
     priority: Option<Priority>,
     data_boost_enabled: bool,
     partition_options: Option<PartitionOptions>,
-) -> Result<VecDeque<Row>, crate::error::SpannerError> {
+) -> Result<(), SpannerError> {
     let call_options = CallOptions {
         priority,
         ..Default::default()
     };
 
-    let mut tx = if let Some(tb) = timestamp_bound {
+    let mut batch_tx = if let Some(tb) = timestamp_bound {
         client
             .batch_read_only_transaction_with_option(
                 google_cloud_spanner::client::ReadOnlyTransactionOption {
@@ -250,7 +286,7 @@ async fn try_partitioned_query(
         ..Default::default()
     };
 
-    let partitions = tx
+    let partitions = batch_tx
         .partition_query_with_option(
             stmt,
             partition_options,
@@ -259,28 +295,30 @@ async fn try_partitioned_query(
             None,
         )
         .await
-        .map_err(crate::error::SpannerError::Grpc)?;
+        .map_err(SpannerError::Grpc)?;
 
-    let mut rows = VecDeque::new();
     for partition in partitions {
-        let mut iter = tx
+        let mut iter = batch_tx
             .execute(partition, None)
             .await
-            .map_err(crate::error::SpannerError::Grpc)?;
-        while let Some(row) = iter.next().await.map_err(crate::error::SpannerError::Grpc)? {
-            rows.push_back(row);
+            .map_err(SpannerError::Grpc)?;
+        while let Some(row) = iter.next().await.map_err(SpannerError::Grpc)? {
+            if tx.send(Ok(row)).await.is_err() {
+                return Ok(()); // receiver dropped
+            }
         }
     }
-    Ok(rows)
+    Ok(())
 }
 
-async fn execute_single_query(
+async fn stream_single_query(
     client: &google_cloud_spanner::client::Client,
+    tx: &mpsc::Sender<Result<Row, SpannerError>>,
     stmt: Statement,
     timestamp_bound: Option<&crate::bind_utils::TimestampBoundConfig>,
     priority: Option<Priority>,
-) -> Result<VecDeque<Row>, crate::error::SpannerError> {
-    let mut tx = if let Some(tb) = timestamp_bound {
+) -> Result<(), SpannerError> {
+    let mut spanner_tx = if let Some(tb) = timestamp_bound {
         client
             .single_with_timestamp_bound(tb.to_timestamp_bound())
             .await?
@@ -296,11 +334,15 @@ async fn execute_single_query(
         ..Default::default()
     };
 
-    let mut iter = tx.query_with_option(stmt, query_options).await.map_err(crate::error::SpannerError::Grpc)?;
+    let mut iter = spanner_tx
+        .query_with_option(stmt, query_options)
+        .await
+        .map_err(SpannerError::Grpc)?;
 
-    let mut rows = VecDeque::new();
-    while let Some(row) = iter.next().await.map_err(crate::error::SpannerError::Grpc)? {
-        rows.push_back(row);
+    while let Some(row) = iter.next().await.map_err(SpannerError::Grpc)? {
+        if tx.send(Ok(row)).await.is_err() {
+            return Ok(()); // receiver dropped
+        }
     }
-    Ok(rows)
+    Ok(())
 }

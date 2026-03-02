@@ -1024,7 +1024,7 @@ fn get_pg_emulator() -> &'static spanemuboost::SpanEmuBoost {
                         PRIMARY KEY (id)\
                     )"
                     .into(),
-                    "CREATE TABLE pg_types (\
+                    "CREATE TABLE pgsql_types (\
                         id bigint NOT NULL, \
                         bool_col boolean, \
                         int_col bigint, \
@@ -1044,10 +1044,10 @@ fn get_pg_emulator() -> &'static spanemuboost::SpanEmuBoost {
                     "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)".into(),
                     "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)".into(),
                     "INSERT INTO users (id, name, age) VALUES (3, 'Charlie', NULL)".into(),
-                    "INSERT INTO pg_types (id, bool_col, int_col, float4_col, float8_col, num_col, str_col, bytes_col, date_col, ts_col, json_col) \
+                    "INSERT INTO pgsql_types (id, bool_col, int_col, float4_col, float8_col, num_col, str_col, bytes_col, date_col, ts_col, json_col) \
                      VALUES (1, true, 42, 1.5, 3.125, 123.456789, 'hello', '\\x68656c6c6f', '2024-01-15', '2024-06-15T10:30:00Z', '{\"key\": \"value\"}')"
                     .into(),
-                    "INSERT INTO pg_types (id, bool_col, int_col, float4_col, float8_col, num_col, str_col, bytes_col, date_col, ts_col, json_col) \
+                    "INSERT INTO pgsql_types (id, bool_col, int_col, float4_col, float8_col, num_col, str_col, bytes_col, date_col, ts_col, json_col) \
                      VALUES (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)"
                     .into(),
                 ])
@@ -1141,7 +1141,7 @@ fn test_pg_vtab_query() {
 fn test_pg_vtab_query_types() {
     let conn = create_pg_duckdb_connection();
     let sql = pg_vtab_query_sql(
-        "SELECT bool_col, int_col, float4_col, float8_col, str_col FROM pg_types WHERE id = 1",
+        "SELECT bool_col, int_col, float4_col, float8_col, str_col FROM pgsql_types WHERE id = 1",
     );
     let (b, i, f4, f8, s): (bool, i64, f64, f64, String) = conn
         .query_row(&sql, [], |r| {
@@ -1158,7 +1158,7 @@ fn test_pg_vtab_query_types() {
 #[test]
 fn test_pg_vtab_query_null() {
     let conn = create_pg_duckdb_connection();
-    let sql = pg_vtab_query_sql("SELECT bool_col IS NULL, int_col IS NULL FROM pg_types WHERE id = 2");
+    let sql = pg_vtab_query_sql("SELECT bool_col IS NULL AS b_null, int_col IS NULL AS i_null FROM pgsql_types WHERE id = 2");
     let (b_null, i_null): (bool, bool) = conn
         .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
         .unwrap();
@@ -1197,7 +1197,7 @@ fn test_pg_vtab_scan() {
 #[test]
 fn test_pg_vtab_scan_types() {
     let conn = create_pg_duckdb_connection();
-    let base = pg_vtab_scan_sql("pg_types");
+    let base = pg_vtab_scan_sql("pgsql_types");
     let (b, i, s): (bool, i64, String) = conn
         .query_row(
             &format!("SELECT bool_col, int_col, str_col FROM ({base}) WHERE id = 1"),

@@ -19,7 +19,7 @@ Both **GoogleSQL** and **PostgreSQL** dialect databases are supported transparen
 
 - `database_role` ([fine-grained access control](https://cloud.google.com/spanner/docs/fgac-about)) is not yet supported as a named parameter. The upstream gcloud-spanner `SessionConfig` does not expose `creator_role` for session creation (the underlying `BatchCreateSessionsRequest.session_template` supports it, but the Rust client hardcodes it to `None`).
 
-- Results are fully buffered in memory. For very large result sets, use Spanner-side `LIMIT` or `WHERE` clauses to control result size.
+- Results are streamed via an internal channel. Memory usage is bounded regardless of result set size.
 
 - `use_parallelism` enables the [partitioned API](https://cloud.google.com/spanner/docs/reads#read_data_in_parallel) (required for Data Boost), but partitions are currently executed sequentially. True concurrent partition execution is planned for a future release.
 
@@ -168,7 +168,7 @@ Both functions accept the following named parameters:
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `endpoint` | VARCHAR | (production) | Custom gRPC endpoint (e.g., `localhost:9010` for the emulator) |
-| `use_parallelism` | BOOLEAN | `true` | Use partitioned query/read for parallel execution |
+| `use_parallelism` | BOOLEAN | `false` | Use partitioned query/read for parallel execution |
 | `use_data_boost` | BOOLEAN | `false` | Enable [Data Boost](https://cloud.google.com/spanner/docs/databoost/databoost-overview) |
 | `max_parallelism` | INTEGER | (default) | Maximum number of partitions |
 | `exact_staleness_secs` | BIGINT | | Read at an exact staleness (seconds ago) |

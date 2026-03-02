@@ -33,3 +33,12 @@ pub fn block_on<F: std::future::Future>(future: F) -> Result<F::Output, SpannerE
     let rt = get_or_init_runtime()?;
     Ok(rt.block_on(future))
 }
+
+pub fn spawn<F>(future: F) -> Result<tokio::task::JoinHandle<F::Output>, SpannerError>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    let rt = get_or_init_runtime()?;
+    Ok(rt.spawn(future))
+}
