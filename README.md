@@ -190,6 +190,7 @@ At most one timestamp bound parameter can be specified. If none is set, Spanner 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `index` | VARCHAR | Secondary index name to use for the read |
+| `dialect` | VARCHAR | Database dialect: `'googlesql'` or `'postgresql'` (auto-detected if omitted) |
 
 ## Query Parameters
 

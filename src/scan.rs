@@ -49,7 +49,7 @@ impl VTab for SpannerScanVTab {
         let table = bind.get_parameter(1).to_string();
 
         let endpoint = crate::bind_utils::get_named_string(bind, "endpoint");
-        let use_parallelism = crate::bind_utils::get_named_bool(bind, "use_parallelism", true);
+        let use_parallelism = crate::bind_utils::get_named_bool(bind, "use_parallelism", false);
         let use_data_boost = crate::bind_utils::get_named_bool(bind, "use_data_boost", false);
         let max_parallelism = crate::bind_utils::get_named_int64(bind, "max_parallelism");
         let index = crate::bind_utils::get_named_string(bind, "index").unwrap_or_default();
