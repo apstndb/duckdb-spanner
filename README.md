@@ -2,6 +2,8 @@
 
 A DuckDB extension for querying [Google Cloud Spanner](https://cloud.google.com/spanner) databases directly from DuckDB.
 
+> **Experimental**: This extension is under active development. The API (function signatures, named parameters, configuration) may change without notice between versions. Do not depend on backward compatibility.
+
 Both **GoogleSQL** and **PostgreSQL** dialect databases are supported transparently. Dialect detection is automatic — no configuration needed. `spanner_query` and `spanner_scan` work the same way regardless of the database dialect.
 
 ## Prerequisites
