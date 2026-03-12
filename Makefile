@@ -23,7 +23,7 @@ RAW_LIB := target/release/libduckdb_spanner.$(LIB_EXT)
 EXTENSION := spanner.duckdb_extension
 METADATA_SCRIPT := extension-ci-tools/scripts/append_extension_metadata.py
 EMULATOR_NAME := spanner-emulator
-DUCKDB_VERSION := v1.4.4
+DUCKDB_VERSION := v1.5.0
 EXT_VERSION := v0.1.0
 
 build:

@@ -71,6 +71,43 @@ unsafe fn register_varchar_option(con: ffi::duckdb_connection, name: &str, descr
     CONFIG_REGISTERED.store(true, Ordering::Release);
 }
 
+/// Read a spanner config option from a raw client context.
+///
+/// Returns `None` if the option is unset, empty, or config options were never registered.
+/// Does **not** destroy `ctx` — the caller is responsible for cleanup.
+///
+/// # Safety
+/// `ctx` must be a valid, non-null `duckdb_client_context`.
+pub unsafe fn get_config_string_from_context(
+    ctx: ffi::duckdb_client_context,
+    option_name: &str,
+) -> Option<String> {
+    if !CONFIG_REGISTERED.load(Ordering::Acquire) {
+        return None;
+    }
+    unsafe {
+        let c_name = CString::new(option_name).ok()?;
+        let mut scope = ffi::duckdb_config_option_scope_DUCKDB_CONFIG_OPTION_SCOPE_INVALID;
+        let val = ffi::duckdb_client_context_get_config_option(ctx, c_name.as_ptr(), &mut scope);
+
+        if val.is_null() {
+            return None;
+        }
+
+        let c_str = ffi::duckdb_get_varchar(val);
+        let result = if c_str.is_null() {
+            None
+        } else {
+            let s = std::ffi::CStr::from_ptr(c_str).to_string_lossy().into_owned();
+            ffi::duckdb_free(c_str as *mut _);
+            if s.is_empty() { None } else { Some(s) }
+        };
+
+        ffi::duckdb_destroy_value(&mut { val });
+        result
+    }
+}
+
 /// Read a spanner config option from the client context during bind.
 ///
 /// Returns `None` if the option is unset, empty, or config options were never registered.
@@ -93,26 +130,8 @@ pub fn get_config_string(bind: &BindInfo, option_name: &str) -> Option<String> {
             return None;
         }
 
-        let c_name = CString::new(option_name).ok()?;
-        let mut scope = ffi::duckdb_config_option_scope_DUCKDB_CONFIG_OPTION_SCOPE_INVALID;
-        let val = ffi::duckdb_client_context_get_config_option(ctx, c_name.as_ptr(), &mut scope);
-
+        let result = get_config_string_from_context(ctx, option_name);
         ffi::duckdb_destroy_client_context(&mut ctx);
-
-        if val.is_null() {
-            return None;
-        }
-
-        let c_str = ffi::duckdb_get_varchar(val);
-        let result = if c_str.is_null() {
-            None
-        } else {
-            let s = std::ffi::CStr::from_ptr(c_str).to_string_lossy().into_owned();
-            ffi::duckdb_free(c_str as *mut _);
-            if s.is_empty() { None } else { Some(s) }
-        };
-
-        ffi::duckdb_destroy_value(&mut { val });
         result
     }
 }

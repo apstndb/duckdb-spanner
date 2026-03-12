@@ -2,6 +2,8 @@ mod bind_utils;
 mod client;
 mod config;
 mod convert;
+#[cfg(feature = "loadable-extension")]
+mod copy;
 mod error;
 mod params;
 mod query;
@@ -54,6 +56,7 @@ unsafe fn spanner_init_c_api_internal(
             return Err("Failed to create connection for config option registration".into());
         }
         config::register_config_options(raw_con);
+        copy::register_copy_function(raw_con);
         duckdb::ffi::duckdb_disconnect(&mut raw_con);
 
         // Create the Rust Connection wrapper for table function and macro registration.
