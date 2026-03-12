@@ -41,10 +41,10 @@ impl VTab for SpannerQueryVTab {
     type InitData = QueryInitData;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        let database = bind.get_parameter(0).to_string();
-        let sql = bind.get_parameter(1).to_string();
+        let sql = bind.get_parameter(0).to_string();
+        let database = crate::bind_utils::resolve_database_path(bind)?;
 
-        let endpoint = crate::bind_utils::get_named_string(bind, "endpoint");
+        let endpoint = crate::bind_utils::resolve_endpoint(bind);
         let use_parallelism = crate::bind_utils::get_named_bool(bind, "use_parallelism", false);
         let use_data_boost = crate::bind_utils::get_named_bool(bind, "use_data_boost", false);
         let max_parallelism = crate::bind_utils::get_named_int64(bind, "max_parallelism");
@@ -201,7 +201,6 @@ impl VTab for SpannerQueryVTab {
 
     fn parameters() -> Option<Vec<LogicalTypeHandle>> {
         Some(vec![
-            LogicalTypeHandle::from(LogicalTypeId::Varchar), // database
             LogicalTypeHandle::from(LogicalTypeId::Varchar), // sql
         ])
     }
@@ -210,10 +209,28 @@ impl VTab for SpannerQueryVTab {
     // TODO: Add database_role once gcloud-spanner exposes creator_role in SessionConfig.
     fn named_parameters() -> Option<Vec<(String, LogicalTypeHandle)>> {
         Some(vec![
+            // Database identification
+            (
+                "database_path".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            ),
+            (
+                "project".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            ),
+            (
+                "instance".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            ),
+            (
+                "database".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            ),
             (
                 "endpoint".to_string(),
                 LogicalTypeHandle::from(LogicalTypeId::Varchar),
             ),
+            // Query options
             (
                 "use_parallelism".to_string(),
                 LogicalTypeHandle::from(LogicalTypeId::Boolean),

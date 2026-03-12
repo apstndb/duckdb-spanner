@@ -94,21 +94,50 @@ export SPANNER_EMULATOR_HOST=localhost:9010
 
 ## Getting Started
 
+### Configure the Database
+
+Set session-level defaults so you don't need to specify the database on every query:
+
+```sql
+SET spanner_project = 'myproj';
+SET spanner_instance = 'myinst';
+SET spanner_database = 'mydb';
+```
+
+Or use a full resource path:
+
+```sql
+SET spanner_database_path = 'projects/myproj/instances/myinst/databases/mydb';
+```
+
 ### Run a SQL Query
 
 ```sql
-SELECT * FROM spanner_query(
-    'projects/myproj/instances/myinst/databases/mydb',
-    'SELECT Id, Name FROM Users WHERE Age > 20'
-);
+SELECT * FROM spanner_query('SELECT Id, Name FROM Users WHERE Age > 20');
 ```
 
 ### Read a Table
 
 ```sql
+SELECT * FROM spanner_scan('Users');
+```
+
+### Explicit Database Path
+
+You can also pass the database path directly as a named parameter:
+
+```sql
+SELECT * FROM spanner_query(
+    'SELECT Id, Name FROM Users',
+    database_path := 'projects/myproj/instances/myinst/databases/mydb'
+);
+
+-- Or use individual components (overrides config defaults)
 SELECT * FROM spanner_scan(
-    'projects/myproj/instances/myinst/databases/mydb',
-    'Users'
+    'Users',
+    project := 'myproj',
+    instance := 'myinst',
+    database := 'mydb'
 );
 ```
 
@@ -120,15 +149,13 @@ export SPANNER_EMULATOR_HOST=localhost:9010
 
 ```sql
 -- endpoint is inferred from SPANNER_EMULATOR_HOST
-SELECT * FROM spanner_query(
-    'projects/test/instances/test/databases/test',
-    'SELECT * FROM Users'
-);
+SET spanner_database_path = 'projects/test/instances/test/databases/test';
+SELECT * FROM spanner_query('SELECT * FROM Users');
 
 -- Or pass endpoint explicitly
 SELECT * FROM spanner_query(
-    'projects/test/instances/test/databases/test',
     'SELECT * FROM Users',
+    database_path := 'projects/test/instances/test/databases/test',
     endpoint := 'localhost:9010'
 );
 ```
@@ -141,7 +168,6 @@ Runs arbitrary Spanner SQL. Implemented as a [table macro](https://duckdb.org/do
 
 ```sql
 SELECT * FROM spanner_query(
-    'projects/myproj/instances/myinst/databases/mydb',
     'SELECT * FROM Users WHERE Age > @min_age',
     params := {'min_age': spanner_value(21::BIGINT)},
     exact_staleness_secs := 10,
@@ -154,11 +180,41 @@ SELECT * FROM spanner_query(
 Reads all rows from a table using the Spanner Read API.
 
 ```sql
-SELECT * FROM spanner_scan(
-    'projects/myproj/instances/myinst/databases/mydb',
-    'Users',
-    index := 'UsersByName'
-);
+SELECT * FROM spanner_scan('Users', index := 'UsersByName');
+```
+
+### Config Options
+
+Session-level defaults can be set via `SET` statements. These are used when the corresponding named parameter is not specified.
+
+| Config Option | Type | Description |
+|---------------|------|-------------|
+| `spanner_project` | VARCHAR | Default Google Cloud project ID |
+| `spanner_instance` | VARCHAR | Default Spanner instance ID |
+| `spanner_database` | VARCHAR | Default Spanner database ID |
+| `spanner_database_path` | VARCHAR | Default full database resource path (`projects/P/instances/I/databases/D`) |
+| `spanner_endpoint` | VARCHAR | Default gRPC endpoint |
+
+### Database Resolution
+
+The database is resolved in the following order (first match wins):
+
+1. **`project`/`instance`/`database` named args** (mixed with config fallback) — if any component is specified via named arg or config, all three must resolve or an error is raised
+2. **`database_path` named arg** — full resource path
+3. **`spanner_database_path` config** — session-level default
+
+Named args override config values for each individual component. For example:
+
+```sql
+SET spanner_project = 'myproj';
+SET spanner_instance = 'myinst';
+SET spanner_database = 'default_db';
+
+-- Uses myproj/myinst/default_db
+SELECT * FROM spanner_query('SELECT 1');
+
+-- Overrides just the database component
+SELECT * FROM spanner_query('SELECT 1', database := 'other_db');
 ```
 
 ### Named Parameters
@@ -169,7 +225,11 @@ Both functions accept the following named parameters:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `endpoint` | VARCHAR | (production) | Custom gRPC endpoint (e.g., `localhost:9010` for the emulator) |
+| `database_path` | VARCHAR | (config) | Full database resource path (`projects/P/instances/I/databases/D`) |
+| `project` | VARCHAR | (config) | Google Cloud project ID |
+| `instance` | VARCHAR | (config) | Spanner instance ID |
+| `database` | VARCHAR | (config) | Spanner database ID |
+| `endpoint` | VARCHAR | (config) | Custom gRPC endpoint (e.g., `localhost:9010` for the emulator) |
 | `use_parallelism` | BOOLEAN | `false` | Use partitioned query/read for parallel execution |
 | `use_data_boost` | BOOLEAN | `false` | Enable [Data Boost](https://cloud.google.com/spanner/docs/databoost/databoost-overview) |
 | `max_parallelism` | INTEGER | (default) | Maximum number of partitions |
@@ -319,8 +379,8 @@ The underlying table function that `spanner_query` wraps. Use this when:
 
 ```sql
 SELECT * FROM spanner_query_raw(
-    'projects/myproj/instances/myinst/databases/mydb',
     'SELECT * FROM Users WHERE Age > @min_age',
+    database_path := 'projects/myproj/instances/myinst/databases/mydb',
     params := '{"min_age": {"value": 21, "type": "INT64"}}'
 );
 ```
@@ -329,7 +389,6 @@ The `params` parameter is a VARCHAR containing a JSON object. Use `spanner_param
 
 ```sql
 SELECT * FROM spanner_query_raw(
-    'projects/myproj/instances/myinst/databases/mydb',
     'SELECT * FROM Users WHERE Age > @min_age',
     params := spanner_params({'min_age': spanner_value(21::BIGINT)})
 );
@@ -338,6 +397,8 @@ SELECT * FROM spanner_query_raw(
 ### Registered Names
 
 This extension registers the following names into the global DuckDB namespace.
+
+**Table functions and macros:**
 
 | Name | Kind | Description |
 |------|------|-------------|
@@ -353,9 +414,34 @@ This extension registers the following names into the global DuckDB namespace.
 
 Names prefixed with `_` are internal implementation details and may change without notice.
 
+**Config options** (see [Config Options](#config-options)):
+
+| Name | Type | Description |
+|------|------|-------------|
+| `spanner_project` | VARCHAR | Default Google Cloud project ID |
+| `spanner_instance` | VARCHAR | Default Spanner instance ID |
+| `spanner_database` | VARCHAR | Default Spanner database ID |
+| `spanner_database_path` | VARCHAR | Default full database resource path |
+| `spanner_endpoint` | VARCHAR | Default gRPC endpoint |
+
 ### Convenience Macro Pattern
 
-You can define a convenience macro that hardcodes your database and endpoint:
+With config options, convenience macros are often unnecessary. Just set your defaults once:
+
+```sql
+SET spanner_project = 'myproj';
+SET spanner_instance = 'myinst';
+SET spanner_database = 'mydb';
+SET spanner_endpoint = 'localhost:9010';
+
+SELECT * FROM spanner_query('SELECT * FROM Users');
+SELECT * FROM spanner_query(
+    'SELECT * FROM Users WHERE Age > @min',
+    params := {'min': spanner_value(21::BIGINT)}
+);
+```
+
+If you need a reusable macro that overrides specific config values:
 
 ```sql
 CREATE MACRO my_query(
@@ -366,8 +452,8 @@ CREATE MACRO my_query(
     priority := NULL
 ) AS TABLE
 SELECT * FROM spanner_query(
-    'projects/myproj/instances/myinst/databases/mydb',
     sql,
+    database_path := 'projects/myproj/instances/myinst/databases/mydb',
     endpoint := 'localhost:9010',
     params := params,
     use_parallelism := use_parallelism,
@@ -378,12 +464,5 @@ SELECT * FROM spanner_query(
     read_timestamp := read_timestamp,
     min_read_timestamp := min_read_timestamp,
     priority := priority
-);
-
--- Usage
-SELECT * FROM my_query('SELECT * FROM Users');
-SELECT * FROM my_query(
-    'SELECT * FROM Users WHERE Age > @min',
-    params := {'min': spanner_value(21::BIGINT)}
 );
 ```

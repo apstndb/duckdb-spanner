@@ -2,6 +2,8 @@ use duckdb::vtab::BindInfo;
 use google_cloud_googleapis::spanner::v1::request_options::Priority;
 use google_cloud_spanner::value::TimestampBound;
 
+use crate::config;
+
 /// Configuration for Spanner read timestamp bounds.
 ///
 /// Constructed from named parameters in bind() and converted to
@@ -162,4 +164,55 @@ pub fn resolve_timestamp_bound(
     }
 
     Ok(None)
+}
+
+/// Resolve the Spanner database resource path from named args and config options.
+///
+/// Resolution order (named arg overrides config for each component):
+/// 1. project/instance/database (named arg ?? config) — if any component is resolved,
+///    all three must be present or error
+/// 2. database_path named arg
+/// 3. spanner_database_path config
+/// 4. error
+pub fn resolve_database_path(bind: &BindInfo) -> Result<String, Box<dyn std::error::Error>> {
+    let arg_project = get_named_string(bind, "project");
+    let arg_instance = get_named_string(bind, "instance");
+    let arg_database = get_named_string(bind, "database");
+
+    let cfg_project = config::get_config_string(bind, "spanner_project");
+    let cfg_instance = config::get_config_string(bind, "spanner_instance");
+    let cfg_database = config::get_config_string(bind, "spanner_database");
+
+    let project = arg_project.or(cfg_project);
+    let instance = arg_instance.or(cfg_instance);
+    let database = arg_database.or(cfg_database);
+
+    if project.is_some() || instance.is_some() || database.is_some() {
+        let p = project.ok_or(
+            "project is required when instance or database is specified. \
+             Use project := '...' or SET spanner_project = '...'")?;
+        let i = instance.ok_or(
+            "instance is required when project or database is specified. \
+             Use instance := '...' or SET spanner_instance = '...'")?;
+        let d = database.ok_or(
+            "database is required when project or instance is specified. \
+             Use database := '...' or SET spanner_database = '...'")?;
+        return Ok(format!("projects/{p}/instances/{i}/databases/{d}"));
+    }
+
+    if let Some(path) = get_named_string(bind, "database_path") {
+        return Ok(path);
+    }
+
+    if let Some(path) = config::get_config_string(bind, "spanner_database_path") {
+        return Ok(path);
+    }
+
+    Err("No database specified. Use database_path := '...', or SET spanner_project/spanner_instance/spanner_database, or SET spanner_database_path".into())
+}
+
+/// Resolve the Spanner endpoint from named arg or config option.
+pub fn resolve_endpoint(bind: &BindInfo) -> Option<String> {
+    get_named_string(bind, "endpoint")
+        .or_else(|| config::get_config_string(bind, "spanner_endpoint"))
 }

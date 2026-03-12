@@ -150,9 +150,9 @@ fn create_duckdb_connection() -> Connection {
 fn vtab_query_sql(spanner_sql: &str) -> String {
     let env = get_emulator();
     format!(
-        "SELECT * FROM spanner_query('{}', '{}', endpoint := '{}')",
-        env.database_path(),
+        "SELECT * FROM spanner_query('{}', database_path := '{}', endpoint := '{}')",
         spanner_sql,
+        env.database_path(),
         env.emulator_host()
     )
 }
@@ -160,9 +160,9 @@ fn vtab_query_sql(spanner_sql: &str) -> String {
 fn vtab_query_sql_with(spanner_sql: &str, extra_params: &str) -> String {
     let env = get_emulator();
     format!(
-        "SELECT * FROM spanner_query('{}', '{}', endpoint := '{}', {})",
-        env.database_path(),
+        "SELECT * FROM spanner_query('{}', database_path := '{}', endpoint := '{}', {})",
         spanner_sql,
+        env.database_path(),
         env.emulator_host(),
         extra_params
     )
@@ -171,9 +171,9 @@ fn vtab_query_sql_with(spanner_sql: &str, extra_params: &str) -> String {
 fn vtab_scan_sql_with(table: &str, extra_params: &str) -> String {
     let env = get_emulator();
     format!(
-        "SELECT * FROM spanner_scan('{}', '{}', endpoint := '{}', {})",
-        env.database_path(),
+        "SELECT * FROM spanner_scan('{}', database_path := '{}', endpoint := '{}', {})",
         table,
+        env.database_path(),
         env.emulator_host(),
         extra_params
     )
@@ -182,9 +182,9 @@ fn vtab_scan_sql_with(table: &str, extra_params: &str) -> String {
 fn vtab_scan_sql(table: &str) -> String {
     let env = get_emulator();
     format!(
-        "SELECT * FROM spanner_scan('{}', '{}', endpoint := '{}')",
-        env.database_path(),
+        "SELECT * FROM spanner_scan('{}', database_path := '{}', endpoint := '{}')",
         table,
+        env.database_path(),
         env.emulator_host()
     )
 }
@@ -674,7 +674,7 @@ fn test_vtab_endpoint_parameter() {
     let env = get_emulator();
     let conn = create_duckdb_connection();
     let sql = format!(
-        "SELECT COUNT(*) FROM spanner_query('{}', 'SELECT 1', endpoint := '{}')",
+        "SELECT COUNT(*) FROM spanner_query('SELECT 1', database_path := '{}', endpoint := '{}')",
         env.database_path(),
         env.emulator_host(),
     );
@@ -987,7 +987,7 @@ fn test_error_invalid_params_json() {
     let conn = create_duckdb_connection();
     let env = get_emulator();
     let sql = format!(
-        "SELECT * FROM spanner_query_raw('{}', 'SELECT 1', endpoint := '{}', params := '{{not valid json')",
+        "SELECT * FROM spanner_query_raw('SELECT 1', database_path := '{}', endpoint := '{}', params := '{{not valid json')",
         env.database_path(),
         env.emulator_host()
     );
@@ -1068,9 +1068,9 @@ fn get_pg_emulator() -> &'static spanemuboost::SpanEmuBoost {
 fn pg_vtab_query_sql(spanner_sql: &str) -> String {
     let env = get_pg_emulator();
     format!(
-        "SELECT * FROM spanner_query('{}', '{}', endpoint := '{}')",
-        env.database_path(),
+        "SELECT * FROM spanner_query('{}', database_path := '{}', endpoint := '{}')",
         spanner_sql,
+        env.database_path(),
         env.emulator_host()
     )
 }
@@ -1078,9 +1078,9 @@ fn pg_vtab_query_sql(spanner_sql: &str) -> String {
 fn pg_vtab_query_sql_with(spanner_sql: &str, extra_params: &str) -> String {
     let env = get_pg_emulator();
     format!(
-        "SELECT * FROM spanner_query('{}', '{}', endpoint := '{}', {})",
-        env.database_path(),
+        "SELECT * FROM spanner_query('{}', database_path := '{}', endpoint := '{}', {})",
         spanner_sql,
+        env.database_path(),
         env.emulator_host(),
         extra_params
     )
@@ -1089,9 +1089,9 @@ fn pg_vtab_query_sql_with(spanner_sql: &str, extra_params: &str) -> String {
 fn pg_vtab_scan_sql(table: &str) -> String {
     let env = get_pg_emulator();
     format!(
-        "SELECT * FROM spanner_scan('{}', '{}', endpoint := '{}')",
-        env.database_path(),
+        "SELECT * FROM spanner_scan('{}', database_path := '{}', endpoint := '{}')",
         table,
+        env.database_path(),
         env.emulator_host()
     )
 }
@@ -1099,9 +1099,9 @@ fn pg_vtab_scan_sql(table: &str) -> String {
 fn pg_vtab_scan_sql_with(table: &str, extra_params: &str) -> String {
     let env = get_pg_emulator();
     format!(
-        "SELECT * FROM spanner_scan('{}', '{}', endpoint := '{}', {})",
-        env.database_path(),
+        "SELECT * FROM spanner_scan('{}', database_path := '{}', endpoint := '{}', {})",
         table,
+        env.database_path(),
         env.emulator_host(),
         extra_params
     )

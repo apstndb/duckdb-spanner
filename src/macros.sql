@@ -147,7 +147,8 @@ CREATE MACRO spanner_value(val) AS
 --   - Named parameters default to NULL (VTab treats NULL as absent)
 
 CREATE MACRO spanner_query(
-    database, sql,
+    sql,
+    database_path := NULL, project := NULL, instance := NULL, database := NULL,
     params := NULL, endpoint := NULL, use_parallelism := NULL,
     use_data_boost := NULL, max_parallelism := NULL,
     exact_staleness_secs := NULL, max_staleness_secs := NULL,
@@ -155,7 +156,11 @@ CREATE MACRO spanner_query(
     priority := NULL
 ) AS TABLE
 SELECT * FROM spanner_query_raw(
-    database, sql,
+    sql,
+    database_path := database_path,
+    project := project,
+    instance := instance,
+    database := database,
     endpoint := endpoint,
     params := spanner_params(params),
     use_parallelism := use_parallelism,
