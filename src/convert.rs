@@ -1,4 +1,5 @@
 use duckdb::core::{DataChunkHandle, Inserter, ListVector, StructVector};
+use duckdb::ffi;
 use google_cloud_googleapis::spanner::v1::{Type, TypeCode};
 use google_cloud_spanner::row::{Row, TryFromValue};
 use prost_types::value::Kind;
@@ -8,6 +9,40 @@ use crate::error::SpannerError;
 use crate::schema::ColumnInfo;
 
 const EPOCH_DATE: time::Date = time::macros::date!(1970 - 01 - 01);
+
+/// Extract the raw `duckdb_vector` handle from a FlatVector.
+///
+/// FlatVector wraps `{ptr: duckdb_vector, capacity: usize}` with `ptr` as the
+/// first field. We read the first pointer-sized value. A debug assertion verifies
+/// correctness by cross-checking with `duckdb_vector_get_data`.
+unsafe fn flat_vector_raw(vector: &duckdb::core::FlatVector) -> ffi::duckdb_vector {
+    let candidate = *(vector as *const _ as *const ffi::duckdb_vector);
+    debug_assert_eq!(
+        ffi::duckdb_vector_get_data(candidate) as usize,
+        vector.as_mut_ptr::<u8>() as usize,
+        "FlatVector field layout assumption violated — ptr is not at offset 0"
+    );
+    candidate
+}
+
+/// Assign a string to a FlatVector without UTF-8 validation.
+///
+/// Spanner guarantees that STRING and JSON values are valid UTF-8, so we can
+/// skip the validation that `duckdb_vector_assign_string_element_len` performs.
+/// This uses `duckdb_unsafe_vector_assign_string_element_len` from the v1.5.0 C API.
+///
+/// # Safety
+/// - `idx` must be within the vector's allocated capacity
+/// - The caller must guarantee the input bytes are valid UTF-8 (Spanner does this)
+unsafe fn unsafe_assign_string(vector: &mut duckdb::core::FlatVector, idx: usize, s: &str) {
+    let raw_vector = flat_vector_raw(vector);
+    ffi::duckdb_unsafe_vector_assign_string_element_len(
+        raw_vector,
+        idx as u64,
+        s.as_ptr() as *const i8,
+        s.len() as u64,
+    );
+}
 
 /// Newtype wrapper for extracting raw prost_types::Value from a Spanner Row.
 /// All type conversions go through this: Row → RawValue (proto) → DuckDB vector.
@@ -445,7 +480,8 @@ fn write_raw_scalar_to_flat(
         }
         TypeCode::String | TypeCode::Json => {
             if let Some(Kind::StringValue(s)) = &value.kind {
-                vector.insert(idx, s.as_str());
+                // SAFETY: Spanner guarantees STRING and JSON values are valid UTF-8.
+                unsafe { unsafe_assign_string(vector, idx, s) }
             } else {
                 vector.set_null(idx);
             }
@@ -508,7 +544,8 @@ fn write_raw_scalar_to_flat(
         _ => {
             // Unknown: try as string
             if let Some(Kind::StringValue(s)) = &value.kind {
-                vector.insert(idx, s.as_str());
+                // SAFETY: Spanner only returns valid UTF-8 string values.
+                unsafe { unsafe_assign_string(vector, idx, s) }
             } else {
                 vector.set_null(idx);
             }
