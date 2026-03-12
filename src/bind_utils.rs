@@ -51,17 +51,16 @@ impl TimestampBoundConfig {
 /// `pub(crate)`. The static_assert verifies Value is a single-pointer struct.
 ///
 /// TODO: Replace this entire function with `value.is_null()` once
-/// duckdb/duckdb-rs#676 is merged. That will also allow removing the direct
-/// `libduckdb-sys` dependency (see duckdb/duckdb-rs#674).
+/// duckdb/duckdb-rs#676 is merged.
 fn value_is_null(value: &duckdb::vtab::Value) -> bool {
     // SAFETY: `duckdb::vtab::Value` wraps a single `duckdb_value` (a pointer) as its
     // only field. We reinterpret the reference to read that pointer.
     const _: () = assert!(
-        std::mem::size_of::<duckdb::vtab::Value>() == std::mem::size_of::<libduckdb_sys::duckdb_value>(),
+        std::mem::size_of::<duckdb::vtab::Value>() == std::mem::size_of::<duckdb::ffi::duckdb_value>(),
         "Value size mismatch — duckdb crate layout may have changed"
     );
-    let ptr = unsafe { *(value as *const _ as *const libduckdb_sys::duckdb_value) };
-    unsafe { libduckdb_sys::duckdb_is_null_value(ptr) }
+    let ptr = unsafe { *(value as *const _ as *const duckdb::ffi::duckdb_value) };
+    unsafe { duckdb::ffi::duckdb_is_null_value(ptr) }
 }
 
 /// Get a named VARCHAR parameter, returning None if absent, NULL, or empty.

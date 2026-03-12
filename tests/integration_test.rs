@@ -133,8 +133,15 @@ fn create_duckdb_connection() -> Connection {
         .unwrap();
     conn.register_table_function::<SpannerScanVTab>("spanner_scan")
         .unwrap();
-    // Load json extension and register helper macros (spanner_value, spanner_typed, etc.)
-    conn.execute_batch("LOAD json").unwrap();
+    // DuckDB v1.5.0+: core_functions/json are bundled but need explicit load.
+    // ICU is NOT bundled (too large) and must be installed from the extension repo.
+    // ICU is required for TIMESTAMPTZ operations (AT TIME ZONE) used in macros.sql.
+    conn.execute_batch("\
+        LOAD core_functions;\
+        LOAD json;\
+        INSTALL icu;\
+        LOAD icu;\
+    ").unwrap();
     conn.execute_batch(include_str!("../src/macros.sql"))
         .unwrap();
     conn
@@ -1107,7 +1114,12 @@ fn create_pg_duckdb_connection() -> Connection {
         .unwrap();
     conn.register_table_function::<SpannerScanVTab>("spanner_scan")
         .unwrap();
-    conn.execute_batch("LOAD json").unwrap();
+    conn.execute_batch("\
+        LOAD core_functions;\
+        LOAD json;\
+        INSTALL icu;\
+        LOAD icu;\
+    ").unwrap();
     conn.execute_batch(include_str!("../src/macros.sql"))
         .unwrap();
     conn
