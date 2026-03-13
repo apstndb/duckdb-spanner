@@ -8,6 +8,13 @@
 //!     mode 'insert_or_update',
 //!     batch_size 500);
 //! ```
+//!
+//! ## batch_size and mutation limits
+//!
+//! Each row produces one mutation per column. Spanner limits commits to
+//! **80,000 mutations** (including secondary index entries). The default
+//! `batch_size` of 1000 rows is conservative; for wide tables or tables
+//! with many secondary indexes, consider lowering it.
 
 use std::ffi::{c_void, CStr, CString};
 use std::sync::Arc;
@@ -166,7 +173,7 @@ unsafe fn copy_bind_inner(
     let ctx = ffi::duckdb_copy_function_bind_get_client_context(info);
     let have_ctx = !ctx.is_null();
 
-    let cfg = |name| {
+    let cfg = |name: &str| -> Option<String> {
         if have_ctx {
             unsafe { config::get_config_string_from_context(ctx, name) }
         } else {
@@ -175,27 +182,7 @@ unsafe fn copy_bind_inner(
     };
 
     // Resolve database path: options → component parts → config
-    let database_path = opts
-        .get("database_path")
-        .cloned()
-        .or_else(|| {
-            let project = opts.get("project").cloned().or_else(|| cfg("spanner_project"));
-            let instance = opts.get("instance").cloned().or_else(|| cfg("spanner_instance"));
-            let database = opts.get("database").cloned().or_else(|| cfg("spanner_database"));
-            match (project, instance, database) {
-                (Some(p), Some(i), Some(d)) => {
-                    Some(format!("projects/{p}/instances/{i}/databases/{d}"))
-                }
-                (None, None, None) => None,
-                _ => None, // partial — fall through to database_path config
-            }
-        })
-        .or_else(|| cfg("spanner_database_path"))
-        .ok_or_else(|| {
-            "No database specified. Use database_path, project/instance/database options, \
-             or SET spanner_database_path"
-                .to_string()
-        })?;
+    let database_path = resolve_copy_database_path(&opts, &cfg)?;
 
     let endpoint = opts
         .get("endpoint")
@@ -486,6 +473,58 @@ unsafe fn value_to_string(val: ffi::duckdb_value) -> Option<String> {
     } else {
         Some(s)
     }
+}
+
+/// Resolve the Spanner database resource path from COPY options and config.
+///
+/// Resolution order (matching `bind_utils::resolve_database_path`):
+/// 1. project/instance/database (option → config) — if any is present, all three required
+/// 2. database_path option
+/// 3. spanner_database_path config
+/// 4. error
+fn resolve_copy_database_path(
+    opts: &std::collections::HashMap<String, String>,
+    cfg: impl Fn(&str) -> Option<String>,
+) -> Result<String, String> {
+    let project = opts
+        .get("project")
+        .cloned()
+        .or_else(|| cfg("spanner_project"));
+    let instance = opts
+        .get("instance")
+        .cloned()
+        .or_else(|| cfg("spanner_instance"));
+    let database = opts
+        .get("database")
+        .cloned()
+        .or_else(|| cfg("spanner_database"));
+
+    if project.is_some() || instance.is_some() || database.is_some() {
+        let p = project.ok_or(
+            "project is required when instance or database is specified. \
+             Use project option or SET spanner_project = '...'")?;
+        let i = instance.ok_or(
+            "instance is required when project or database is specified. \
+             Use instance option or SET spanner_instance = '...'")?;
+        let d = database.ok_or(
+            "database is required when project or instance is specified. \
+             Use database option or SET spanner_database = '...'")?;
+        return Ok(format!("projects/{p}/instances/{i}/databases/{d}"));
+    }
+
+    if let Some(path) = opts.get("database_path").cloned() {
+        return Ok(path);
+    }
+
+    if let Some(path) = cfg("spanner_database_path") {
+        return Ok(path);
+    }
+
+    Err(
+        "No database specified. Use database_path, project/instance/database options, \
+         or SET spanner_database_path"
+            .to_string(),
+    )
 }
 
 // ─── Buffer flush / mutation building ───────────────────────────────────────
