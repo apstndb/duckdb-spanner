@@ -3,7 +3,10 @@ mod spanemuboost;
 use std::sync::{Arc, OnceLock};
 
 use duckdb::Connection;
-use duckdb_spanner::{register_copy_function, SpannerQueryVTab, SpannerScanVTab};
+use duckdb_spanner::{
+    register_copy_function, SpannerDdlAsyncVTab, SpannerDdlVTab, SpannerOperationsVTab,
+    SpannerQueryVTab, SpannerScanVTab,
+};
 use google_cloud_gax::conn::Environment;
 use google_cloud_googleapis::spanner::admin::database::v1::DatabaseDialect;
 use google_cloud_spanner::client::{Client, ClientConfig};
@@ -141,6 +144,12 @@ fn create_duckdb_connection() -> Connection {
     conn.register_table_function::<SpannerQueryVTab>("spanner_query_raw")
         .unwrap();
     conn.register_table_function::<SpannerScanVTab>("spanner_scan")
+        .unwrap();
+    conn.register_table_function::<SpannerDdlVTab>("spanner_ddl_raw")
+        .unwrap();
+    conn.register_table_function::<SpannerDdlAsyncVTab>("spanner_ddl_async_raw")
+        .unwrap();
+    conn.register_table_function::<SpannerOperationsVTab>("spanner_operations_raw")
         .unwrap();
     // DuckDB v1.5.0+: core_functions/json are bundled but need explicit load.
     // ICU is NOT bundled (too large) and must be installed from the extension repo.
@@ -1123,6 +1132,12 @@ fn create_pg_duckdb_connection() -> Connection {
         .unwrap();
     conn.register_table_function::<SpannerScanVTab>("spanner_scan")
         .unwrap();
+    conn.register_table_function::<SpannerDdlVTab>("spanner_ddl_raw")
+        .unwrap();
+    conn.register_table_function::<SpannerDdlAsyncVTab>("spanner_ddl_async_raw")
+        .unwrap();
+    conn.register_table_function::<SpannerOperationsVTab>("spanner_operations_raw")
+        .unwrap();
     conn.execute_batch("\
         LOAD core_functions;\
         LOAD json;\
@@ -1285,6 +1300,12 @@ fn create_duckdb_connection_with_copy() -> Connection {
         conn.register_table_function::<SpannerQueryVTab>("spanner_query_raw")
             .unwrap();
         conn.register_table_function::<SpannerScanVTab>("spanner_scan")
+            .unwrap();
+        conn.register_table_function::<SpannerDdlVTab>("spanner_ddl_raw")
+            .unwrap();
+        conn.register_table_function::<SpannerDdlAsyncVTab>("spanner_ddl_async_raw")
+            .unwrap();
+        conn.register_table_function::<SpannerOperationsVTab>("spanner_operations_raw")
             .unwrap();
         conn.execute_batch("\
             LOAD core_functions;\

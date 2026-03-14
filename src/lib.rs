@@ -3,6 +3,7 @@ mod client;
 mod config;
 mod convert;
 mod copy;
+mod ddl;
 mod error;
 mod params;
 mod query;
@@ -12,6 +13,7 @@ mod schema;
 mod types;
 
 pub use copy::register_copy_function;
+pub use ddl::{SpannerDdlAsyncVTab, SpannerDdlVTab, SpannerOperationsVTab};
 pub use query::SpannerQueryVTab;
 pub use scan::SpannerScanVTab;
 
@@ -19,6 +21,9 @@ pub use scan::SpannerScanVTab;
 fn extension_entrypoint(con: duckdb::Connection) -> Result<(), Box<dyn std::error::Error>> {
     con.register_table_function::<SpannerQueryVTab>("spanner_query_raw")?;
     con.register_table_function::<SpannerScanVTab>("spanner_scan")?;
+    con.register_table_function::<SpannerDdlVTab>("spanner_ddl_raw")?;
+    con.register_table_function::<SpannerDdlAsyncVTab>("spanner_ddl_async_raw")?;
+    con.register_table_function::<SpannerOperationsVTab>("spanner_operations_raw")?;
     con.execute_batch(include_str!("macros.sql"))?;
     Ok(())
 }

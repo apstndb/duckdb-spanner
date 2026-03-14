@@ -173,3 +173,44 @@ SELECT * FROM spanner_query_raw(
     priority := priority
 );
 
+CREATE MACRO spanner_ddl(
+    sql,
+    database_path := NULL, project := NULL, instance := NULL, database := NULL,
+    endpoint := NULL
+) AS TABLE
+SELECT * FROM spanner_ddl_raw(
+    sql,
+    database_path := database_path,
+    project := project,
+    instance := instance,
+    database := database,
+    endpoint := endpoint
+);
+
+CREATE MACRO spanner_ddl_async(
+    sql,
+    database_path := NULL, project := NULL, instance := NULL, database := NULL,
+    endpoint := NULL
+) AS TABLE
+SELECT * FROM spanner_ddl_async_raw(
+    sql,
+    database_path := database_path,
+    project := project,
+    instance := instance,
+    database := database,
+    endpoint := endpoint
+);
+
+CREATE MACRO spanner_operations(
+    database_path := NULL, project := NULL, instance := NULL, database := NULL,
+    endpoint := NULL, filter := NULL
+) AS TABLE
+SELECT * FROM spanner_operations_raw(
+    database_path := database_path,
+    project := project,
+    instance := instance,
+    database := database,
+    endpoint := endpoint,
+    filter := filter
+);
+
