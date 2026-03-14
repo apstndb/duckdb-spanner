@@ -3,7 +3,7 @@ mod spanemuboost;
 use std::sync::{Arc, OnceLock};
 
 use duckdb::Connection;
-use duckdb_spanner::{SpannerQueryVTab, SpannerScanVTab};
+use duckdb_spanner::{register_copy_function, SpannerQueryVTab, SpannerScanVTab};
 use google_cloud_gax::conn::Environment;
 use google_cloud_googleapis::spanner::admin::database::v1::DatabaseDialect;
 use google_cloud_spanner::client::{Client, ClientConfig};
@@ -51,6 +51,15 @@ fn get_emulator() -> &'static spanemuboost::SpanEmuBoost {
                         .into(),
                     "CREATE TABLE UuidTypes (\
                         Id INT64 NOT NULL, UuidCol UUID\
+                    ) PRIMARY KEY (Id)"
+                        .into(),
+                    "CREATE TABLE CopyTarget (\
+                        Id INT64 NOT NULL, Name STRING(MAX), Value FLOAT64\
+                    ) PRIMARY KEY (Id)"
+                        .into(),
+                    "CREATE TABLE CopyTypes (\
+                        Id INT64 NOT NULL, BoolCol BOOL, Int64Col INT64, Float64Col FLOAT64, \
+                        StringCol STRING(MAX), DateCol DATE, TimestampCol TIMESTAMP\
                     ) PRIMARY KEY (Id)"
                         .into(),
                 ])
@@ -1244,5 +1253,217 @@ fn test_pg_vtab_scan_exact_staleness() {
         .query_row(&format!("SELECT COUNT(*) FROM ({sql})"), [], |r| r.get(0))
         .unwrap();
     assert_eq!(count, 3);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COPY TO tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Create a DuckDB connection with the copy function registered via C API.
+fn create_duckdb_connection_with_copy() -> Connection {
+    let _ = get_emulator();
+    unsafe {
+        let mut db: duckdb::ffi::duckdb_database = std::ptr::null_mut();
+        let mut c_err: *mut std::os::raw::c_char = std::ptr::null_mut();
+        let r = duckdb::ffi::duckdb_open_ext(
+            c":memory:".as_ptr(),
+            &mut db,
+            std::ptr::null_mut(),
+            &mut c_err,
+        );
+        assert_eq!(r, duckdb::ffi::DuckDBSuccess, "duckdb_open_ext failed");
+
+        // Register copy function on a raw connection
+        let mut raw_con: duckdb::ffi::duckdb_connection = std::ptr::null_mut();
+        let rc = duckdb::ffi::duckdb_connect(db, &mut raw_con);
+        assert_eq!(rc, duckdb::ffi::DuckDBSuccess, "duckdb_connect failed");
+        register_copy_function(raw_con);
+        duckdb::ffi::duckdb_disconnect(&mut raw_con);
+
+        // Wrap in Connection for table functions and macros
+        let conn = Connection::open_from_raw(db).unwrap();
+        conn.register_table_function::<SpannerQueryVTab>("spanner_query_raw")
+            .unwrap();
+        conn.register_table_function::<SpannerScanVTab>("spanner_scan")
+            .unwrap();
+        conn.execute_batch("\
+            LOAD core_functions;\
+            LOAD json;\
+            INSTALL icu;\
+            LOAD icu;\
+        ").unwrap();
+        conn.execute_batch(include_str!("../src/macros.sql"))
+            .unwrap();
+        conn
+    }
+}
+
+#[test]
+fn test_copy_to_registration() {
+    // Verify the copy function is registered and DuckDB can parse COPY TO spanner syntax.
+    // Uses raw C API to avoid Rust exception handling issues.
+    unsafe {
+        let mut db: duckdb::ffi::duckdb_database = std::ptr::null_mut();
+        let r = duckdb::ffi::duckdb_open(c":memory:".as_ptr(), &mut db);
+        assert_eq!(r, duckdb::ffi::DuckDBSuccess);
+
+        let mut con: duckdb::ffi::duckdb_connection = std::ptr::null_mut();
+        let rc = duckdb::ffi::duckdb_connect(db, &mut con);
+        assert_eq!(rc, duckdb::ffi::DuckDBSuccess);
+
+        register_copy_function(con);
+
+        // Try COPY with invalid database — should fail with Spanner connection error, not crash
+        let sql = std::ffi::CString::new(
+            "COPY (SELECT CAST(1 AS BIGINT) AS a) TO 'T' (FORMAT spanner, database_path 'projects/p/instances/i/databases/d')"
+        ).unwrap();
+        let mut result = std::mem::MaybeUninit::zeroed();
+        let r = duckdb::ffi::duckdb_query(con, sql.as_ptr(), result.as_mut_ptr());
+        let mut result = result.assume_init();
+        if r != duckdb::ffi::DuckDBSuccess {
+            let err = duckdb::ffi::duckdb_result_error(&mut result);
+            assert!(!err.is_null(), "error message should not be null");
+            let err_str = std::ffi::CStr::from_ptr(err).to_string_lossy();
+            eprintln!("Expected COPY error: {err_str}");
+        }
+        duckdb::ffi::duckdb_destroy_result(&mut result);
+        duckdb::ffi::duckdb_disconnect(&mut con);
+        duckdb::ffi::duckdb_close(&mut db);
+    }
+}
+
+#[test]
+fn test_copy_to_basic() {
+    let conn = create_duckdb_connection_with_copy();
+    let env = get_emulator();
+
+    // COPY 3 rows to CopyTarget
+    let sql = format!(
+        "COPY (SELECT CAST(Id AS BIGINT) AS Id, Name, CAST(Value AS DOUBLE) AS Value \
+         FROM (VALUES (100, 'alice', 1.5), (101, 'bob', 2.5), (102, 'charlie', 3.5)) AS t(Id, Name, Value)) \
+         TO 'CopyTarget' (FORMAT spanner, database_path '{}', endpoint '{}')",
+        env.database_path(),
+        env.emulator_host()
+    );
+    conn.execute_batch(&sql).unwrap();
+
+    // Read back via spanner_query (filter by Id range to avoid conflicts with other tests)
+    let read_sql = vtab_query_sql("SELECT Id, Name, Value FROM CopyTarget WHERE Id BETWEEN 100 AND 102 ORDER BY Id");
+    let rows: Vec<(i64, String, f64)> = conn
+        .prepare(&read_sql)
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0], (100, "alice".to_string(), 1.5));
+    assert_eq!(rows[1], (101, "bob".to_string(), 2.5));
+    assert_eq!(rows[2], (102, "charlie".to_string(), 3.5));
+}
+
+#[test]
+fn test_copy_to_types() {
+    let conn = create_duckdb_connection_with_copy();
+    let env = get_emulator();
+
+    let sql = format!(
+        "COPY (SELECT \
+            CAST(1 AS BIGINT) AS Id, \
+            true AS BoolCol, \
+            CAST(42 AS BIGINT) AS Int64Col, \
+            CAST(3.125 AS DOUBLE) AS Float64Col, \
+            'hello' AS StringCol, \
+            DATE '2024-01-15' AS DateCol, \
+            TIMESTAMPTZ '2024-06-15T10:30:00Z' AS TimestampCol \
+        ) TO 'CopyTypes' (FORMAT spanner, database_path '{}', endpoint '{}')",
+        env.database_path(),
+        env.emulator_host()
+    );
+    conn.execute_batch(&sql).unwrap();
+
+    // Read back and verify types
+    let read_sql = vtab_query_sql(
+        "SELECT Id, BoolCol, Int64Col, Float64Col, StringCol, DateCol, TimestampCol FROM CopyTypes WHERE Id = 1"
+    );
+    let (id, b, i, f, s): (i64, bool, i64, f64, String) = conn
+        .query_row(
+            &read_sql,
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!(id, 1);
+    assert!(b);
+    assert_eq!(i, 42);
+    assert!((f - 3.125).abs() < f64::EPSILON);
+    assert_eq!(s, "hello");
+}
+
+#[test]
+fn test_copy_to_insert_mode() {
+    let conn = create_duckdb_connection_with_copy();
+    let env = get_emulator();
+
+    // Insert with mode 'insert'
+    let sql = format!(
+        "COPY (SELECT CAST(200 AS BIGINT) AS Id, 'insert_test' AS Name, CAST(9.9 AS DOUBLE) AS Value) \
+         TO 'CopyTarget' (FORMAT spanner, database_path '{}', endpoint '{}', mode 'insert')",
+        env.database_path(),
+        env.emulator_host()
+    );
+    conn.execute_batch(&sql).unwrap();
+
+    let read_sql = vtab_query_sql("SELECT Name FROM CopyTarget WHERE Id = 200");
+    let name: String = conn.query_row(&read_sql, [], |r| r.get(0)).unwrap();
+    assert_eq!(name, "insert_test");
+}
+
+#[test]
+fn test_copy_to_with_nulls() {
+    let conn = create_duckdb_connection_with_copy();
+    let env = get_emulator();
+
+    let sql = format!(
+        "COPY (SELECT CAST(300 AS BIGINT) AS Id, CAST(NULL AS BOOLEAN) AS BoolCol, \
+            CAST(NULL AS BIGINT) AS Int64Col, CAST(NULL AS DOUBLE) AS Float64Col, \
+            CAST(NULL AS VARCHAR) AS StringCol, CAST(NULL AS DATE) AS DateCol, \
+            CAST(NULL AS TIMESTAMPTZ) AS TimestampCol) \
+         TO 'CopyTypes' (FORMAT spanner, database_path '{}', endpoint '{}')",
+        env.database_path(),
+        env.emulator_host()
+    );
+    conn.execute_batch(&sql).unwrap();
+
+    let read_sql = vtab_query_sql(
+        "SELECT BoolCol IS NULL, Int64Col IS NULL, StringCol IS NULL FROM CopyTypes WHERE Id = 300"
+    );
+    let (b_null, i_null, s_null): (bool, bool, bool) = conn
+        .query_row(&read_sql, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap();
+    assert!(b_null);
+    assert!(i_null);
+    assert!(s_null);
+}
+
+#[test]
+fn test_copy_to_column_count_mismatch() {
+    let conn = create_duckdb_connection_with_copy();
+    let env = get_emulator();
+
+    // CopyTarget has 3 columns (Id, Name, Value); source has 2
+    let sql = format!(
+        "COPY (SELECT CAST(999 AS BIGINT) AS Id, 'oops' AS Name) \
+         TO 'CopyTarget' (FORMAT spanner, database_path '{}', endpoint '{}')",
+        env.database_path(),
+        env.emulator_host()
+    );
+    let result = conn.execute_batch(&sql);
+    assert!(result.is_err(), "column count mismatch should fail");
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("Column count mismatch"),
+        "error should mention column count mismatch, got: {err_msg}"
+    );
 }
 

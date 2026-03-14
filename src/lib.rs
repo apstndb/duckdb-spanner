@@ -2,7 +2,6 @@ mod bind_utils;
 mod client;
 mod config;
 mod convert;
-#[cfg(feature = "loadable-extension")]
 mod copy;
 mod error;
 mod params;
@@ -12,6 +11,7 @@ mod scan;
 mod schema;
 mod types;
 
+pub use copy::register_copy_function;
 pub use query::SpannerQueryVTab;
 pub use scan::SpannerScanVTab;
 

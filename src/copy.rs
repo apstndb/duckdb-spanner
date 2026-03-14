@@ -398,6 +398,7 @@ unsafe fn extract_options(
         return opts;
     }
 
+    // NOTE: duckdb_get_value_type returns an internal reference — do NOT destroy it.
     let options_type = ffi::duckdb_get_value_type(options_val);
     let type_id = ffi::duckdb_get_type_id(options_type);
 
@@ -418,10 +419,10 @@ unsafe fn extract_options(
 
             let child_val = ffi::duckdb_get_struct_child(options_val, i);
             if !child_val.is_null() && !ffi::duckdb_is_null_value(child_val) {
-                // Child may be a LIST; try to get the first element
+                // Child may be a LIST; try to get the first element.
+                // NOTE: duckdb_get_value_type returns an internal reference — do NOT destroy it.
                 let child_type = ffi::duckdb_get_value_type(child_val);
                 let child_type_id = ffi::duckdb_get_type_id(child_type);
-                ffi::duckdb_destroy_logical_type(&mut { child_type });
 
                 if child_type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST {
                     let list_size = ffi::duckdb_get_list_size(child_val);
@@ -453,7 +454,7 @@ unsafe fn extract_options(
         }
     }
 
-    ffi::duckdb_destroy_logical_type(&mut { options_type });
+    // NOTE: options_type is an internal reference from duckdb_get_value_type — do NOT destroy it.
     opts
 }
 
