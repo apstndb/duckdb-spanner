@@ -1030,6 +1030,128 @@ fn test_error_invalid_sql_query() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// DDL execution tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn vtab_ddl_sql(ddl: &str) -> String {
+    let env = get_emulator();
+    format!(
+        "SELECT * FROM spanner_ddl('{}', database_path := '{}', endpoint := '{}')",
+        ddl.replace('\'', "''"),
+        env.database_path(),
+        env.emulator_host()
+    )
+}
+
+fn vtab_ddl_async_sql(ddl: &str) -> String {
+    let env = get_emulator();
+    format!(
+        "SELECT * FROM spanner_ddl_async('{}', database_path := '{}', endpoint := '{}')",
+        ddl.replace('\'', "''"),
+        env.database_path(),
+        env.emulator_host()
+    )
+}
+
+/// Comprehensive DDL test — runs all DDL operations sequentially in one test
+/// to avoid Spanner's "concurrent schema change" rejection.
+/// The emulator only allows one schema change at a time.
+#[test]
+fn test_ddl_operations() {
+    let conn = create_duckdb_connection();
+
+    // --- spanner_ddl (sync) ---
+
+    // 1. CREATE TABLE
+    let sql = vtab_ddl_sql(
+        "CREATE TABLE DdlTest (Id INT64 NOT NULL, Name STRING(MAX)) PRIMARY KEY (Id)"
+    );
+    let (op_name, done, duration): (String, bool, f64) = conn
+        .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap();
+    assert!(!op_name.is_empty(), "operation_name should not be empty");
+    assert!(done, "sync DDL should complete before returning");
+    assert!(duration >= 0.0, "duration should be non-negative");
+
+    // Verify table exists
+    let verify_sql = vtab_query_sql("SELECT COUNT(*) AS cnt FROM DdlTest");
+    let count: i64 = conn.query_row(&verify_sql, [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 0);
+
+    // 2. ALTER TABLE — add column
+    let alter_sql = vtab_ddl_sql("ALTER TABLE DdlTest ADD COLUMN Value FLOAT64");
+    let (_, done, _): (String, bool, f64) = conn
+        .query_row(&alter_sql, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap();
+    assert!(done);
+
+    let verify_sql = vtab_query_sql(
+        "SELECT column_name FROM INFORMATION_SCHEMA.COLUMNS \
+         WHERE table_name = ''DdlTest'' AND column_name = ''Value''"
+    );
+    let col_name: String = conn.query_row(&verify_sql, [], |r| r.get(0)).unwrap();
+    assert_eq!(col_name, "Value");
+
+    // 3. CREATE INDEX
+    let index_sql = vtab_ddl_sql("CREATE INDEX DdlTestByName ON DdlTest(Name)");
+    let (_, done, _): (String, bool, f64) = conn
+        .query_row(&index_sql, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap();
+    assert!(done);
+
+    let verify_sql = vtab_query_sql(
+        "SELECT index_name FROM INFORMATION_SCHEMA.INDEXES \
+         WHERE table_name = ''DdlTest'' AND index_name = ''DdlTestByName''"
+    );
+    let idx_name: String = conn.query_row(&verify_sql, [], |r| r.get(0)).unwrap();
+    assert_eq!(idx_name, "DdlTestByName");
+
+    // 4. DROP INDEX then DROP TABLE
+    let drop_idx_sql = vtab_ddl_sql("DROP INDEX DdlTestByName");
+    conn.execute_batch(&format!("SELECT * FROM ({drop_idx_sql})")).unwrap();
+
+    let drop_sql = vtab_ddl_sql("DROP TABLE DdlTest");
+    let (_, done, _): (String, bool, f64) = conn
+        .query_row(&drop_sql, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap();
+    assert!(done);
+
+    let verify_sql = vtab_query_sql(
+        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE table_name = ''DdlTest''"
+    );
+    let count: i64 = conn.query_row(&verify_sql, [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 0);
+
+    // --- spanner_ddl_async ---
+
+    // 5. Async CREATE TABLE
+    let sql = vtab_ddl_async_sql(
+        "CREATE TABLE DdlAsyncTest (Id INT64 NOT NULL, Data BYTES(MAX)) PRIMARY KEY (Id)"
+    );
+    let (op_name, done): (String, bool) = conn
+        .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert!(!op_name.is_empty(), "operation_name should not be empty");
+    // Emulator typically completes immediately
+    eprintln!("DDL async: op={op_name}, done={done}");
+
+    if !done {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+
+    let verify_sql = vtab_query_sql("SELECT COUNT(*) AS cnt FROM DdlAsyncTest");
+    let count: i64 = conn.query_row(&verify_sql, [], |r| r.get(0)).unwrap();
+    assert_eq!(count, 0);
+
+    // --- Error case ---
+
+    // 6. Invalid DDL should produce an error
+    let sql = vtab_ddl_sql("THIS IS NOT VALID DDL");
+    let result = conn.query_row(&sql, [], |r| r.get::<_, String>(0));
+    assert!(result.is_err(), "invalid DDL should fail");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // PostgreSQL dialect infrastructure
 // ═══════════════════════════════════════════════════════════════════════════
 

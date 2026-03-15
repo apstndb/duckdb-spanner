@@ -1,2 +1,7 @@
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-Ctarget-feature=+crt-static"]
+
+# Limit test parallelism to avoid Docker/testcontainers resource contention
+# when multiple Spanner emulator containers start concurrently.
+[env]
+RUST_TEST_THREADS = "4"
