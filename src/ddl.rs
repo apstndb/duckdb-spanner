@@ -5,11 +5,12 @@ use std::time::Instant;
 use duckdb::core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId};
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
 use google_cloud_gax::conn::Environment;
+use google_cloud_gax::grpc::transport::Channel;
 use google_cloud_googleapis::longrunning::operation;
+use google_cloud_googleapis::longrunning::operations_client::OperationsClient;
+use google_cloud_googleapis::longrunning::ListOperationsRequest;
 use google_cloud_googleapis::longrunning::Operation as InternalOperation;
-use google_cloud_googleapis::spanner::admin::database::v1::{
-    ListDatabaseOperationsRequest, UpdateDatabaseDdlRequest,
-};
+use google_cloud_googleapis::spanner::admin::database::v1::UpdateDatabaseDdlRequest;
 use google_cloud_spanner::admin::client::Client as AdminClient;
 use google_cloud_spanner::admin::AdminClientConfig;
 
@@ -98,21 +99,6 @@ fn database_named_parameters() -> Vec<(String, LogicalTypeHandle)> {
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
         ),
     ]
-}
-
-/// Extract the instance path (`projects/P/instances/I`) from a full database
-/// path (`projects/P/instances/I/databases/D`).
-fn instance_parent_from_database_path(database_path: &str) -> Result<String, SpannerError> {
-    // Expected format: projects/<p>/instances/<i>/databases/<d>
-    let parts: Vec<&str> = database_path.split('/').collect();
-    if parts.len() >= 4 && parts[0] == "projects" && parts[2] == "instances" {
-        Ok(format!("{}/{}/{}/{}", parts[0], parts[1], parts[2], parts[3]))
-    } else {
-        Err(SpannerError::Other(format!(
-            "Invalid database path '{}': expected projects/<p>/instances/<i>/databases/<d>",
-            database_path
-        )))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -423,25 +409,59 @@ impl VTab for SpannerOperationsVTab {
         let filter = bind_data.filter.clone();
 
         let ops = runtime::block_on(async {
-            let admin = get_or_create_admin_client(endpoint.as_deref()).await?;
+            // Use google.longrunning.Operations/ListOperations (not DatabaseAdmin/ListDatabaseOperations)
+            // because the Spanner emulator only implements the generic Operations service.
+            let ep = endpoint.or_else(|| std::env::var("SPANNER_EMULATOR_HOST").ok());
 
-            // ListDatabaseOperationsRequest needs the instance path as parent
-            let parent = instance_parent_from_database_path(&database_path)?;
-
-            let req = ListDatabaseOperationsRequest {
-                parent,
-                filter: filter.unwrap_or_default(),
-                page_size: 0,
-                page_token: String::new(),
+            let channel = match ep.as_deref() {
+                Some(ep) => {
+                    let url = if ep.starts_with("http") {
+                        ep.to_string()
+                    } else {
+                        format!("http://{ep}")
+                    };
+                    Channel::from_shared(url)
+                        .map_err(|e| SpannerError::Other(format!("Invalid endpoint: {e}")))?
+                        .connect()
+                        .await
+                        .map_err(|e| SpannerError::Other(format!("Connect error: {e}")))?
+                }
+                None => {
+                    Channel::from_static("https://spanner.googleapis.com")
+                        .connect()
+                        .await
+                        .map_err(|e| SpannerError::Other(format!("Connect error: {e}")))?
+                }
             };
 
-            let operations = admin
-                .database()
-                .list_database_operations(req, None)
-                .await
-                .map_err(SpannerError::Grpc)?;
+            let mut client = OperationsClient::new(channel);
 
-            let rows: Vec<OperationRow> = operations
+            let mut all_operations = Vec::new();
+            let mut page_token = String::new();
+
+            loop {
+                let req = ListOperationsRequest {
+                    name: format!("{database_path}/operations"),
+                    filter: filter.clone().unwrap_or_default(),
+                    page_size: 0,
+                    page_token: page_token.clone(),
+                };
+
+                let response = client
+                    .list_operations(req)
+                    .await
+                    .map_err(SpannerError::Grpc)?
+                    .into_inner();
+
+                all_operations.extend(response.operations);
+
+                if response.next_page_token.is_empty() {
+                    break;
+                }
+                page_token = response.next_page_token;
+            }
+
+            let rows: Vec<OperationRow> = all_operations
                 .into_iter()
                 .map(|op| operation_to_row(op))
                 .collect();

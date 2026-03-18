@@ -1143,9 +1143,30 @@ fn test_ddl_operations() {
     let count: i64 = conn.query_row(&verify_sql, [], |r| r.get(0)).unwrap();
     assert_eq!(count, 0);
 
+    // --- spanner_operations ---
+
+    // 6. List operations via spanner_operations
+    let env = get_emulator();
+    let ops_sql = format!(
+        "SELECT * FROM spanner_operations(database_path := '{}', endpoint := '{}')",
+        env.database_path(),
+        env.emulator_host()
+    );
+    let mut stmt = conn.prepare(&ops_sql).unwrap();
+    let rows: Vec<(String, bool)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(!rows.is_empty(), "should have at least one operation after DDL");
+    for (name, done) in &rows {
+        assert!(!name.is_empty(), "operation name should not be empty");
+        assert!(done, "all operations should be done");
+    }
+
     // --- Error case ---
 
-    // 6. Invalid DDL should produce an error
+    // 7. Invalid DDL should produce an error
     let sql = vtab_ddl_sql("THIS IS NOT VALID DDL");
     let result = conn.query_row(&sql, [], |r| r.get::<_, String>(0));
     assert!(result.is_err(), "invalid DDL should fail");
