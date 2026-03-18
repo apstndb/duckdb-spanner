@@ -66,6 +66,8 @@ struct ColumnMeta {
     decimal_scale: u8,
     /// DECIMAL internal storage type (0 for non-decimal types).
     decimal_internal_type: u32,
+    /// Target Spanner column type code (populated during GlobalInit).
+    spanner_type_code: i32,
 }
 
 /// Bind-phase data stored for the lifetime of the COPY operation.
@@ -229,6 +231,7 @@ unsafe fn copy_bind_inner(
             type_id,
             decimal_scale,
             decimal_internal_type,
+            spanner_type_code: 0, // populated during GlobalInit
         });
     }
 
@@ -298,13 +301,19 @@ unsafe fn copy_global_init_inner(
 
     let column_names: Vec<String> = schema_columns.iter().map(|c| c.name.clone()).collect();
 
+    // Enrich DuckDB column metadata with Spanner target type codes
+    let mut columns = bind_data.columns.clone();
+    for (col, schema_col) in columns.iter_mut().zip(schema_columns.iter()) {
+        col.spanner_type_code = schema_col.spanner_type.code;
+    }
+
     let state = Box::new(CopyGlobalState {
         client,
         table_name,
         column_names,
         mode: bind_data.mode,
         batch_size: bind_data.batch_size,
-        columns: bind_data.columns.clone(),
+        columns,
         buffer: Vec::with_capacity(bind_data.batch_size),
         rows_written: 0,
     });
@@ -697,7 +706,20 @@ unsafe fn read_duckdb_value(
         }
         ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL => {
             let raw_i128 = read_decimal_raw(data, row_idx, col.decimal_internal_type);
-            Kind::StringValue(decimal_i128_to_string(raw_i128, col.decimal_scale))
+            // If the target Spanner column is FLOAT64 or FLOAT32, convert to NumberValue.
+            // Spanner FLOAT64 rejects StringValue (except for NaN/Infinity).
+            use google_cloud_googleapis::spanner::v1::TypeCode;
+            if col.spanner_type_code == TypeCode::Float64 as i32
+                || col.spanner_type_code == TypeCode::Float32 as i32
+            {
+                let s = decimal_i128_to_string(raw_i128, col.decimal_scale);
+                let f: f64 = s
+                    .parse()
+                    .map_err(|e| format!("DECIMAL to FLOAT64 conversion failed: {e}"))?;
+                Kind::NumberValue(f)
+            } else {
+                Kind::StringValue(decimal_i128_to_string(raw_i128, col.decimal_scale))
+            }
         }
         ffi::DUCKDB_TYPE_DUCKDB_TYPE_UUID => {
             let raw = *data.cast::<u128>().add(row_idx);

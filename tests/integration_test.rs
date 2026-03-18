@@ -1501,9 +1501,10 @@ fn test_copy_to_basic() {
     let conn = create_duckdb_connection_with_copy();
     let env = get_emulator();
 
-    // COPY 3 rows to CopyTarget
+    // COPY 3 rows to CopyTarget — Value is DECIMAL from VALUES clause,
+    // which should auto-convert to NumberValue for Spanner FLOAT64 columns.
     let sql = format!(
-        "COPY (SELECT CAST(Id AS BIGINT) AS Id, Name, CAST(Value AS DOUBLE) AS Value \
+        "COPY (SELECT CAST(Id AS BIGINT) AS Id, Name, Value \
          FROM (VALUES (100, 'alice', 1.5), (101, 'bob', 2.5), (102, 'charlie', 3.5)) AS t(Id, Name, Value)) \
          TO 'CopyTarget' (FORMAT spanner, database_path '{}', endpoint '{}')",
         env.database_path(),
@@ -1536,7 +1537,7 @@ fn test_copy_to_types() {
             CAST(1 AS BIGINT) AS Id, \
             true AS BoolCol, \
             CAST(42 AS BIGINT) AS Int64Col, \
-            CAST(3.125 AS DOUBLE) AS Float64Col, \
+            3.125 AS Float64Col, \
             'hello' AS StringCol, \
             DATE '2024-01-15' AS DateCol, \
             TIMESTAMPTZ '2024-06-15T10:30:00Z' AS TimestampCol \
