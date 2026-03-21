@@ -5,6 +5,7 @@ use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
 use google_cloud_googleapis::spanner::v1::request_options::Priority;
 use google_cloud_googleapis::spanner::v1::PartitionOptions;
 use google_cloud_spanner::key;
+use google_cloud_spanner::reader::RowIterator;
 use google_cloud_spanner::row::Row;
 use google_cloud_spanner::transaction::{CallOptions, ReadOptions};
 use tokio::sync::mpsc;
@@ -356,15 +357,32 @@ async fn stream_partitioned_read(
         .await
         .map_err(SpannerError::Grpc)?;
 
+    // Execute partitions concurrently, each with its own session from the pool.
+    // Partitions embed the transaction selector, so any session can execute them
+    // against the same consistent snapshot.
+    let mut handles = Vec::with_capacity(partitions.len());
     for partition in partitions {
-        let mut iter = batch_tx
-            .execute(partition, None)
-            .await
-            .map_err(SpannerError::Grpc)?;
-        while let Some(row) = iter.next().await.map_err(SpannerError::Grpc)? {
-            if tx.send(Ok(row)).await.is_err() {
-                return Ok(()); // receiver dropped
+        let tx = tx.clone();
+        let client = client.clone();
+        handles.push(tokio::spawn(async move {
+            let mut session = client.get_session().await.map_err(|e| SpannerError::Other(e.to_string()))?;
+            let mut iter = RowIterator::new(&mut *session, partition.reader, None, false)
+                .await
+                .map_err(SpannerError::Grpc)?;
+            while let Some(row) = iter.next().await.map_err(SpannerError::Grpc)? {
+                if tx.send(Ok(row)).await.is_err() {
+                    return Ok(()); // receiver dropped
+                }
             }
+            Ok::<(), SpannerError>(())
+        }));
+    }
+
+    for handle in handles {
+        match handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(e) => return Err(SpannerError::Other(format!("Task join error: {e}"))),
         }
     }
     Ok(())
