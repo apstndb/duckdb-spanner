@@ -36,13 +36,11 @@ serde_json = "1"
 testcontainers = "0.23"
 duckdb = { version = "1.10500", features = ["bundled", "vtab", "json"] }
 
-# Patched google-cloud-rust crates.
-# gcloud-spanner patch: fix metadata/stats processing for empty PartialResultSets
-# (QueryMode::Plan and zero-row results).
-# https://github.com/yoshidan/google-cloud-rust/pull/428
+# Patched google-cloud-rust: public Client::get_session and RowIterator::new
+# for concurrent partition execution support.
 # gcloud-googleapis and gcloud-gax must use the same git source to avoid
 # duplicate crate conflicts with gcloud-spanner's workspace path dependencies.
 [patch.crates-io]
-gcloud-spanner = { git = "https://github.com/apstndb/google-cloud-rust.git", rev = "5f75fb7c7381f1f933c1998165e7bf11ea50e42e" }
-gcloud-googleapis = { git = "https://github.com/apstndb/google-cloud-rust.git", rev = "5f75fb7c7381f1f933c1998165e7bf11ea50e42e" }
-gcloud-gax = { git = "https://github.com/apstndb/google-cloud-rust.git", rev = "5f75fb7c7381f1f933c1998165e7bf11ea50e42e" }
+gcloud-spanner = { git = "https://github.com/apstndb/google-cloud-rust.git", rev = "b5ff3a0ad48704a0e7e4d95136c9ebbee84dd0f8" }
+gcloud-googleapis = { git = "https://github.com/apstndb/google-cloud-rust.git", rev = "b5ff3a0ad48704a0e7e4d95136c9ebbee84dd0f8" }
+gcloud-gax = { git = "https://github.com/apstndb/google-cloud-rust.git", rev = "b5ff3a0ad48704a0e7e4d95136c9ebbee84dd0f8" }

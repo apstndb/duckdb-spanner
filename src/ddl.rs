@@ -45,6 +45,7 @@ async fn get_or_create_admin_client(
     let config = match endpoint {
         Some(ep) => AdminClientConfig {
             environment: Environment::Emulator(ep.to_string()),
+            ..Default::default()
         },
         None => {
             if std::env::var("SPANNER_EMULATOR_HOST").is_ok() {

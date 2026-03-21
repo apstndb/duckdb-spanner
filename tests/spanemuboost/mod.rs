@@ -151,6 +151,7 @@ impl SpanEmuBoostBuilder {
         // 2. Create admin client
         let admin_config = AdminClientConfig {
             environment: Environment::Emulator(emulator_host.clone()),
+            ..Default::default()
         };
         let admin_client = AdminClient::new(admin_config).await?;
 
