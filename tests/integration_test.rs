@@ -1632,3 +1632,158 @@ fn test_copy_to_column_count_mismatch() {
     );
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// PostgreSQL dialect — DDL tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+fn pg_vtab_ddl_sql(ddl: &str) -> String {
+    let env = get_pg_emulator();
+    format!(
+        "SELECT * FROM spanner_ddl('{}', database_path := '{}', endpoint := '{}')",
+        ddl.replace('\'', "''"),
+        env.database_path(),
+        env.emulator_host()
+    )
+}
+
+/// PG DDL test — all operations in one test to avoid concurrent schema change rejection.
+#[test]
+fn test_pg_ddl_operations() {
+    let conn = create_pg_duckdb_connection();
+
+    // 1. CREATE TABLE
+    let sql = pg_vtab_ddl_sql(
+        "CREATE TABLE pgsql_ddl_test (id bigint NOT NULL, name character varying(256), PRIMARY KEY (id))"
+    );
+    let (op_name, done): (String, bool) = conn
+        .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert!(!op_name.is_empty());
+    assert!(done);
+
+    // 2. ALTER TABLE
+    let alter_sql = pg_vtab_ddl_sql(
+        "ALTER TABLE pgsql_ddl_test ADD COLUMN value double precision"
+    );
+    let done: bool = conn.query_row(&alter_sql, [], |r| r.get(1)).unwrap();
+    assert!(done);
+
+    // 3. CREATE INDEX
+    let index_sql = pg_vtab_ddl_sql("CREATE INDEX pgsql_ddl_test_by_name ON pgsql_ddl_test(name)");
+    let done: bool = conn.query_row(&index_sql, [], |r| r.get(1)).unwrap();
+    assert!(done);
+
+    // 4. DROP INDEX
+    let drop_idx_sql = pg_vtab_ddl_sql("DROP INDEX pgsql_ddl_test_by_name");
+    let done: bool = conn.query_row(&drop_idx_sql, [], |r| r.get(1)).unwrap();
+    assert!(done);
+
+    // 5. DROP TABLE
+    let drop_sql = pg_vtab_ddl_sql("DROP TABLE pgsql_ddl_test");
+    let done: bool = conn.query_row(&drop_sql, [], |r| r.get(1)).unwrap();
+    assert!(done);
+
+    // 6. spanner_operations
+    let env = get_pg_emulator();
+    let ops_sql = format!(
+        "SELECT * FROM spanner_operations(database_path := '{}', endpoint := '{}')",
+        env.database_path(),
+        env.emulator_host()
+    );
+    let mut stmt = conn.prepare(&ops_sql).unwrap();
+    let rows: Vec<(String, bool)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(!rows.is_empty(), "should have operations after DDL");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PostgreSQL dialect — COPY TO tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Create a DuckDB connection with copy function registered, using the PG emulator.
+fn create_pg_duckdb_connection_with_copy() -> Connection {
+    let _ = get_pg_emulator();
+    unsafe {
+        let mut db: duckdb::ffi::duckdb_database = std::ptr::null_mut();
+        let mut c_err: *mut std::os::raw::c_char = std::ptr::null_mut();
+        let r = duckdb::ffi::duckdb_open_ext(
+            c":memory:".as_ptr(),
+            &mut db,
+            std::ptr::null_mut(),
+            &mut c_err,
+        );
+        assert_eq!(r, duckdb::ffi::DuckDBSuccess, "duckdb_open_ext failed");
+
+        let mut raw_con: duckdb::ffi::duckdb_connection = std::ptr::null_mut();
+        let rc = duckdb::ffi::duckdb_connect(db, &mut raw_con);
+        assert_eq!(rc, duckdb::ffi::DuckDBSuccess, "duckdb_connect failed");
+        register_copy_function(raw_con);
+        duckdb::ffi::duckdb_disconnect(&mut raw_con);
+
+        let conn = Connection::open_from_raw(db).unwrap();
+        conn.register_table_function::<SpannerQueryVTab>("spanner_query_raw")
+            .unwrap();
+        conn.register_table_function::<SpannerScanVTab>("spanner_scan")
+            .unwrap();
+        conn.register_table_function::<SpannerDdlVTab>("spanner_ddl_raw")
+            .unwrap();
+        conn.register_table_function::<SpannerDdlAsyncVTab>("spanner_ddl_async_raw")
+            .unwrap();
+        conn.register_table_function::<SpannerOperationsVTab>("spanner_operations_raw")
+            .unwrap();
+        conn.execute_batch("\
+            LOAD core_functions;\
+            LOAD json;\
+            INSTALL icu;\
+            LOAD icu;\
+        ").unwrap();
+        conn.execute_batch(include_str!("../src/macros.sql"))
+            .unwrap();
+        conn
+    }
+}
+
+#[test]
+fn test_pg_copy_to_basic() {
+    let conn = create_pg_duckdb_connection_with_copy();
+    let env = get_pg_emulator();
+
+    // Create target table via DDL
+    let ddl_sql = pg_vtab_ddl_sql(
+        "CREATE TABLE pgsql_copy_target (id bigint NOT NULL, name character varying(256), value double precision, PRIMARY KEY (id))"
+    );
+    conn.query_row(&ddl_sql, [], |_| Ok(())).unwrap();
+
+    // COPY 3 rows
+    let sql = format!(
+        "COPY (SELECT CAST(100 AS BIGINT) AS id, 'alice' AS name, 1.5 AS value \
+         UNION ALL SELECT CAST(101 AS BIGINT), 'bob', 2.5 \
+         UNION ALL SELECT CAST(102 AS BIGINT), 'charlie', 3.5) \
+         TO 'pgsql_copy_target' (FORMAT spanner, database_path '{}', endpoint '{}')",
+        env.database_path(),
+        env.emulator_host()
+    );
+    conn.execute_batch(&sql).unwrap();
+
+    // Read back
+    let read_sql = pg_vtab_query_sql("SELECT id, name, value FROM pgsql_copy_target WHERE id BETWEEN 100 AND 102 ORDER BY id");
+    let rows: Vec<(i64, String, f64)> = {
+        let mut stmt = conn.prepare(&read_sql).unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    };
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0], (100, "alice".into(), 1.5));
+    assert_eq!(rows[1], (101, "bob".into(), 2.5));
+    assert_eq!(rows[2], (102, "charlie".into(), 3.5));
+
+    // Cleanup
+    let drop_sql = pg_vtab_ddl_sql("DROP TABLE pgsql_copy_target");
+    conn.query_row(&drop_sql, [], |_| Ok(())).unwrap();
+}
+
