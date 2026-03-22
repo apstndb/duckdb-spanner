@@ -18,12 +18,13 @@ Both **GoogleSQL** and **PostgreSQL** dialect databases are supported transparen
 - This project depends on a patched version of [gcloud-spanner](https://github.com/yoshidan/google-cloud-rust) via `[patch.crates-io]`.
   The upstream `RowIterator::try_recv()` discards metadata and stats when a `PartialResultSet` has empty values, which breaks `columns_metadata()` and `stats()` for `QueryMode::Plan`, empty result sets, and other scenarios.
   See [yoshidan/google-cloud-rust#428](https://github.com/yoshidan/google-cloud-rust/pull/428) for details.
+  Additionally, `Client::get_session` and `RowIterator::new` are made public for concurrent partition execution.
 
 - `database_role` ([fine-grained access control](https://cloud.google.com/spanner/docs/fgac-about)) is not yet supported as a named parameter. The upstream gcloud-spanner `SessionConfig` does not expose `creator_role` for session creation (the underlying `BatchCreateSessionsRequest.session_template` supports it, but the Rust client hardcodes it to `None`).
 
 - Results are streamed via an internal channel. Memory usage is bounded regardless of result set size.
 
-- `use_parallelism` enables the [partitioned API](https://cloud.google.com/spanner/docs/reads#read_data_in_parallel) (required for Data Boost), but partitions are currently executed sequentially. True concurrent partition execution is planned for a future release.
+- `use_parallelism` enables the [partitioned API](https://cloud.google.com/spanner/docs/reads#read_data_in_parallel) (required for Data Boost). Partitions are executed concurrently, each with its own session from the pool.
 
 ## Installation
 
@@ -254,6 +255,80 @@ At most one timestamp bound parameter can be specified. If none is set, Spanner 
 | `index` | VARCHAR | Secondary index name to use for the read |
 | `dialect` | VARCHAR | Database dialect: `'googlesql'` or `'postgresql'` (auto-detected if omitted) |
 
+### `spanner_ddl`
+
+Executes a DDL statement synchronously and waits for completion.
+
+```sql
+SELECT * FROM spanner_ddl('CREATE TABLE Users (Id INT64 NOT NULL, Name STRING(MAX)) PRIMARY KEY (Id)');
+```
+
+Returns one row with `operation_name` (VARCHAR), `done` (BOOLEAN), and `duration_secs` (DOUBLE).
+
+### `spanner_ddl_async`
+
+Submits a DDL statement and returns immediately without waiting for completion.
+
+```sql
+SELECT * FROM spanner_ddl_async('CREATE INDEX UsersByName ON Users(Name)');
+```
+
+Returns one row with `operation_name` (VARCHAR) and `done` (BOOLEAN).
+
+### `spanner_operations`
+
+Lists DDL operations for a database via the `google.longrunning.Operations` API.
+
+```sql
+SELECT * FROM spanner_operations();
+```
+
+Returns rows with `operation_name` (VARCHAR), `done` (BOOLEAN), `metadata_type` (VARCHAR), and `error` (VARCHAR).
+
+An optional `filter` parameter can be used:
+
+```sql
+SELECT * FROM spanner_operations(filter := 'done=true');
+```
+
+All DDL functions accept the same database identification parameters as `spanner_query` (`database_path`, `project`, `instance`, `database`, `endpoint`).
+
+### `COPY TO` (Write to Spanner)
+
+Write data to Spanner tables using the `COPY` statement with `FORMAT spanner`.
+
+```sql
+COPY my_table TO 'SpannerTable' (FORMAT spanner);
+```
+
+Options:
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `database_path` | VARCHAR | (config) | Full database resource path |
+| `project` | VARCHAR | (config) | Google Cloud project ID |
+| `instance` | VARCHAR | (config) | Spanner instance ID |
+| `database` | VARCHAR | (config) | Spanner database ID |
+| `endpoint` | VARCHAR | (config) | Custom gRPC endpoint |
+| `mode` | VARCHAR | `insert_or_update` | Mutation mode: `insert`, `update`, `insert_or_update`, or `replace` |
+| `batch_size` | VARCHAR | `1000` | Number of rows per commit |
+
+The file path argument specifies the target Spanner table name. Source columns are mapped to Spanner columns by position (column count must match).
+
+```sql
+-- Write query results to a Spanner table
+COPY (SELECT Id, Name, Age FROM source_data) TO 'Users' (FORMAT spanner);
+
+-- Specify mutation mode
+COPY my_table TO 'Users' (FORMAT spanner, mode 'insert');
+
+-- With explicit database path
+COPY my_table TO 'Users' (
+    FORMAT spanner,
+    database_path 'projects/p/instances/i/databases/d'
+);
+```
+
 ## Query Parameters
 
 The `params` parameter accepts a STRUCT mapping parameter names to values. Two helper macros format values for Spanner type compatibility.
@@ -405,6 +480,10 @@ This extension registers the following names into the global DuckDB namespace.
 | `spanner_query` | table macro | Wraps `spanner_query_raw` with ergonomic params (see [Table Functions](#table-functions)) |
 | `spanner_query_raw` | table function | Execute Spanner SQL (see [Low-Level Table Function](#spanner_query_raw----low-level-table-function)) |
 | `spanner_scan` | table function | Read a Spanner table (see [Table Functions](#table-functions)) |
+| `spanner_ddl` | table macro | Execute DDL synchronously (see [`spanner_ddl`](#spanner_ddl)) |
+| `spanner_ddl_async` | table macro | Submit DDL asynchronously (see [`spanner_ddl_async`](#spanner_ddl_async)) |
+| `spanner_operations` | table macro | List DDL operations (see [`spanner_operations`](#spanner_operations)) |
+| `spanner` | copy function | Write to Spanner via `COPY TO` (see [`COPY TO`](#copy-to-write-to-spanner)) |
 | `spanner_value(val)` | scalar macro | Auto-detect Spanner type from DuckDB type (see [Query Parameters](#query-parameters)) |
 | `spanner_typed(val, type_name)` | scalar macro | Explicit Spanner type wrapper (see [Query Parameters](#query-parameters)) |
 | `spanner_params(s)` | scalar macro | Convert a STRUCT to a JSON params string for `spanner_query_raw` |
