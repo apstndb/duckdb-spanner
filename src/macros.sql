@@ -120,13 +120,13 @@ CREATE MACRO spanner_value(val) AS
     WHEN typeof(val) IN ('UBIGINT[]', 'HUGEINT[]', 'UHUGEINT[]')
       THEN json_object('value', TRY_CAST(val AS VARCHAR[]), 'type', _spanner_type_name(typeof(val)))
     WHEN typeof(val) = 'BLOB[]'
-      THEN json_object('value', list_transform(TRY_CAST(val AS BLOB[]), x -> base64(x)), 'type', _spanner_type_name(typeof(val)))
+      THEN json_object('value', list_transform(TRY_CAST(val AS BLOB[]), lambda x: base64(x)), 'type', _spanner_type_name(typeof(val)))
     WHEN typeof(val) = 'TIMESTAMP[]'
-      THEN json_object('value', list_transform(TRY_CAST(val AS TIMESTAMP[]), x -> strftime(x, '%Y-%m-%dT%H:%M:%S.%fZ')), 'type', _spanner_type_name(typeof(val)))
+      THEN json_object('value', list_transform(TRY_CAST(val AS TIMESTAMP[]), lambda x: strftime(x, '%Y-%m-%dT%H:%M:%S.%fZ')), 'type', _spanner_type_name(typeof(val)))
     WHEN typeof(val) = 'TIMESTAMP WITH TIME ZONE[]'
-      THEN json_object('value', list_transform(TRY_CAST(val AS TIMESTAMPTZ[]), x -> strftime(x AT TIME ZONE 'UTC', '%Y-%m-%dT%H:%M:%S.%fZ')), 'type', _spanner_type_name(typeof(val)))
+      THEN json_object('value', list_transform(TRY_CAST(val AS TIMESTAMPTZ[]), lambda x: strftime(x AT TIME ZONE 'UTC', '%Y-%m-%dT%H:%M:%S.%fZ')), 'type', _spanner_type_name(typeof(val)))
     WHEN typeof(val) = 'INTERVAL[]'
-      THEN json_object('value', list_transform(TRY_CAST(val AS INTERVAL[]), x -> interval_to_iso8601(x)), 'type', _spanner_type_name(typeof(val)))
+      THEN json_object('value', list_transform(TRY_CAST(val AS INTERVAL[]), lambda x: interval_to_iso8601(x)), 'type', _spanner_type_name(typeof(val)))
     -- DECIMAL types need LIKE matching and VARCHAR conversion
     WHEN typeof(val) LIKE 'DECIMAL%[]'
       THEN json_object('value', TRY_CAST(val AS VARCHAR[]), 'type', _spanner_type_name(typeof(val)))
@@ -213,4 +213,3 @@ SELECT * FROM spanner_operations_raw(
     endpoint := endpoint,
     filter := filter
 );
-

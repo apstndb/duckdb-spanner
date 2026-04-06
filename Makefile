@@ -1,4 +1,4 @@
-.PHONY: build build-release extension duckdb emulator-start emulator-stop emulator-status test clean sweep sweep-dry-run ensure-cargo-sweep
+.PHONY: build build-sweep build-release extension duckdb emulator-start emulator-stop emulator-status test clean sweep sweep-dry-run ensure-cargo-sweep
 
 # Detect OS for library extension
 UNAME := $(shell uname)
@@ -23,12 +23,18 @@ RAW_LIB := target/release/libduckdb_spanner.$(LIB_EXT)
 EXTENSION := spanner.duckdb_extension
 METADATA_SCRIPT := extension-ci-tools/scripts/append_extension_metadata.py
 EMULATOR_NAME := spanner-emulator
-DUCKDB_VERSION := v1.5.0
+DUCKDB_VERSION ?= $(shell duckdb --version 2>/dev/null | sed -nE 's/^v?([0-9]+\.[0-9]+\.[0-9]+).*/v\1/p')
+ifeq ($(DUCKDB_VERSION),)
+DUCKDB_VERSION := v1.5.1
+endif
 EXT_VERSION := v0.1.0
 SWEEP_DAYS ?= 3
 
 build:
-	cargo build
+	cargo build --features loadable-extension
+
+build-sweep: ensure-cargo-sweep build
+	cargo sweep --time $(SWEEP_DAYS)
 
 build-release:
 	cargo build --features loadable-extension --release

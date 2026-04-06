@@ -85,6 +85,8 @@ For a quick build-and-launch workflow:
 make duckdb
 ```
 
+`make duckdb` defaults the extension metadata version to your installed DuckDB CLI version. Override `DUCKDB_VERSION` explicitly if you need to target a different DuckDB release.
+
 ### Authentication
 
 This extension uses [Application Default Credentials (ADC)](https://cloud.google.com/docs/authentication/application-default-credentials).
@@ -455,6 +457,9 @@ cargo test
 This repository includes `cargo-sweep`-based cleanup targets for large debug builds:
 
 ```bash
+# Build the debug loadable extension first, then sweep artifacts older than 3 days
+make build-sweep
+
 # Preview artifacts older than 3 days
 make sweep-dry-run
 
