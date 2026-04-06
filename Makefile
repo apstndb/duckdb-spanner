@@ -1,4 +1,4 @@
-.PHONY: build build-release extension duckdb emulator-start emulator-stop emulator-status test clean
+.PHONY: build build-release extension duckdb emulator-start emulator-stop emulator-status test clean sweep sweep-dry-run ensure-cargo-sweep
 
 # Detect OS for library extension
 UNAME := $(shell uname)
@@ -25,6 +25,7 @@ METADATA_SCRIPT := extension-ci-tools/scripts/append_extension_metadata.py
 EMULATOR_NAME := spanner-emulator
 DUCKDB_VERSION := v1.5.0
 EXT_VERSION := v0.1.0
+SWEEP_DAYS ?= 3
 
 build:
 	cargo build
@@ -69,6 +70,18 @@ emulator-status:
 
 test: extension
 	@bash tests/integration.sh "$$(pwd)/$(EXTENSION)"
+
+ensure-cargo-sweep:
+	@command -v cargo-sweep >/dev/null 2>&1 || { \
+		echo "cargo-sweep is required for sweep targets. Install it with: brew install cargo-sweep"; \
+		exit 1; \
+	}
+
+sweep-dry-run: ensure-cargo-sweep
+	cargo sweep --dry-run --time $(SWEEP_DAYS)
+
+sweep: ensure-cargo-sweep
+	cargo sweep --time $(SWEEP_DAYS)
 
 clean:
 	cargo clean

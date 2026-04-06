@@ -12,6 +12,13 @@ Both **GoogleSQL** and **PostgreSQL** dialect databases are supported transparen
 - [DuckDB](https://duckdb.org/docs/installation/) CLI (for running the extension)
 - Python 3 (for `make extension` metadata appending)
 - Make
+- `cargo-sweep` (recommended for cleaning stale build artifacts)
+
+On macOS, prefer the bottled Homebrew binary:
+
+```bash
+brew install cargo-sweep
+```
 
 ## Known Issues
 
@@ -441,6 +448,24 @@ make emulator-start
 
 # Run integration tests (uses testcontainers, but the emulator must be available)
 cargo test
+```
+
+### Cleaning Stale Build Artifacts
+
+This repository includes `cargo-sweep`-based cleanup targets for large debug builds:
+
+```bash
+# Preview artifacts older than 3 days
+make sweep-dry-run
+
+# Delete artifacts older than 3 days
+make sweep
+```
+
+Override the retention window with `SWEEP_DAYS`:
+
+```bash
+make sweep SWEEP_DAYS=7
 ```
 
 ## Advanced
