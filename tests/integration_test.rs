@@ -17,11 +17,21 @@ use tokio::runtime::Runtime;
 // Shared test infrastructure
 // ═══════════════════════════════════════════════════════════════════════════
 
+fn ensure_rustls_provider() {
+    static PROVIDER: OnceLock<()> = OnceLock::new();
+    PROVIDER.get_or_init(|| {
+        // testcontainers/bollard and gcloud-auth enable different rustls providers.
+        // Installing one process-wide provider avoids rustls panicking during tests.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    });
+}
+
 /// Dedicated tokio runtime for test setup and Spanner client calls.
 /// Separate from the library's TOKIO_RUNTIME to avoid any interaction.
 fn test_runtime() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();
     RT.get_or_init(|| {
+        ensure_rustls_provider();
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
