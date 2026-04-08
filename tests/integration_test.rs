@@ -39,62 +39,13 @@ fn test_runtime() -> &'static Runtime {
     })
 }
 
-/// Start the Spanner emulator (once) with test tables and seed data.
+/// Start the Spanner emulator (once) — container + instance only.
+/// Databases are created separately via [`SpanEmuBoost::create_database`].
 fn get_emulator() -> &'static spanemuboost::SpanEmuBoost {
     static EMU: OnceLock<spanemuboost::SpanEmuBoost> = OnceLock::new();
     EMU.get_or_init(|| {
         test_runtime().block_on(async {
             spanemuboost::SpanEmuBoost::builder()
-                .setup_ddls(vec![
-                    "CREATE TABLE ScalarTypes (\
-                        Id INT64 NOT NULL, BoolCol BOOL, Int64Col INT64, Float64Col FLOAT64, \
-                        StringCol STRING(MAX), BytesCol BYTES(MAX), DateCol DATE, \
-                        TimestampCol TIMESTAMP\
-                    ) PRIMARY KEY (Id)"
-                        .into(),
-                    "CREATE TABLE EmptyTable (Id INT64 NOT NULL, Name STRING(MAX)) PRIMARY KEY (Id)"
-                        .into(),
-                    "CREATE TABLE NumericTypes (\
-                        Id INT64 NOT NULL, NumCol NUMERIC, JsonCol JSON\
-                    ) PRIMARY KEY (Id)"
-                        .into(),
-                    "CREATE TABLE ArrayTypes (\
-                        Id INT64 NOT NULL, IntArray ARRAY<INT64>, StrArray ARRAY<STRING(MAX)>\
-                    ) PRIMARY KEY (Id)"
-                        .into(),
-                    "CREATE TABLE UuidTypes (\
-                        Id INT64 NOT NULL, UuidCol UUID\
-                    ) PRIMARY KEY (Id)"
-                        .into(),
-                    "CREATE TABLE CopyTarget (\
-                        Id INT64 NOT NULL, Name STRING(MAX), Value FLOAT64\
-                    ) PRIMARY KEY (Id)"
-                        .into(),
-                    "CREATE TABLE CopyTypes (\
-                        Id INT64 NOT NULL, BoolCol BOOL, Int64Col INT64, Float64Col FLOAT64, \
-                        StringCol STRING(MAX), DateCol DATE, TimestampCol TIMESTAMP\
-                    ) PRIMARY KEY (Id)"
-                        .into(),
-                ])
-                .setup_dmls(vec![
-                    // ScalarTypes
-                    "INSERT INTO ScalarTypes (Id, BoolCol, Int64Col, Float64Col, StringCol, BytesCol, DateCol, TimestampCol) \
-                     VALUES (1, true, 42, 3.125, 'hello', b'hello', DATE '2024-01-15', TIMESTAMP '2024-06-15T10:30:00Z')".into(),
-                    "INSERT INTO ScalarTypes (Id, BoolCol, Int64Col, Float64Col, StringCol, BytesCol, DateCol, TimestampCol) \
-                     VALUES (2, false, -100, 2.625, 'world', b'world', DATE '1999-12-31', TIMESTAMP '2000-01-01T00:00:00Z')".into(),
-                    "INSERT INTO ScalarTypes (Id, BoolCol, Int64Col, Float64Col, StringCol, BytesCol, DateCol, TimestampCol) \
-                     VALUES (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL)".into(),
-                    // NumericTypes
-                    "INSERT INTO NumericTypes (Id, NumCol, JsonCol) VALUES (1, 123.456789, JSON '{\"key\": \"value\"}')".into(),
-                    "INSERT INTO NumericTypes (Id, NumCol, JsonCol) VALUES (2, -99999.999999999, NULL)".into(),
-                    // ArrayTypes
-                    "INSERT INTO ArrayTypes (Id, IntArray, StrArray) VALUES (1, [10, 20, 30], ['a', 'b', 'c'])".into(),
-                    "INSERT INTO ArrayTypes (Id, IntArray, StrArray) VALUES (2, [], [])".into(),
-                    "INSERT INTO ArrayTypes (Id, IntArray, StrArray) VALUES (3, NULL, NULL)".into(),
-                    // UuidTypes
-                    "INSERT INTO UuidTypes (Id, UuidCol) VALUES (1, '550e8400-e29b-41d4-a716-446655440000')".into(),
-                    "INSERT INTO UuidTypes (Id, UuidCol) VALUES (2, NULL)".into(),
-                ])
                 .start()
                 .await
                 .expect("Failed to start emulator")
@@ -102,18 +53,84 @@ fn get_emulator() -> &'static spanemuboost::SpanEmuBoost {
     })
 }
 
-/// Get a shared Spanner data client connected to the emulator.
+/// GoogleSQL database with read-only test tables and seed data.
+fn get_gsql_db() -> &'static spanemuboost::SpanEmuDatabase {
+    static DB: OnceLock<spanemuboost::SpanEmuDatabase> = OnceLock::new();
+    DB.get_or_init(|| {
+        let emu = get_emulator();
+        test_runtime().block_on(async {
+            emu.create_database(
+                "gsql-read",
+                DatabaseDialect::GoogleStandardSql,
+                vec![
+                    "CREATE TABLE ScalarTypes (\
+                        Id INT64 NOT NULL, BoolCol BOOL, Int64Col INT64, Float64Col FLOAT64, \
+                        StringCol STRING(MAX), BytesCol BYTES(MAX), DateCol DATE, \
+                        TimestampCol TIMESTAMP\
+                    ) PRIMARY KEY (Id)".into(),
+                    "CREATE TABLE EmptyTable (Id INT64 NOT NULL, Name STRING(MAX)) PRIMARY KEY (Id)".into(),
+                    "CREATE TABLE NumericTypes (\
+                        Id INT64 NOT NULL, NumCol NUMERIC, JsonCol JSON\
+                    ) PRIMARY KEY (Id)".into(),
+                    "CREATE TABLE ArrayTypes (\
+                        Id INT64 NOT NULL, IntArray ARRAY<INT64>, StrArray ARRAY<STRING(MAX)>\
+                    ) PRIMARY KEY (Id)".into(),
+                    "CREATE TABLE UuidTypes (\
+                        Id INT64 NOT NULL, UuidCol UUID\
+                    ) PRIMARY KEY (Id)".into(),
+                    "CREATE TABLE CopyTarget (\
+                        Id INT64 NOT NULL, Name STRING(MAX), Value FLOAT64\
+                    ) PRIMARY KEY (Id)".into(),
+                    "CREATE TABLE CopyTypes (\
+                        Id INT64 NOT NULL, BoolCol BOOL, Int64Col INT64, Float64Col FLOAT64, \
+                        StringCol STRING(MAX), DateCol DATE, TimestampCol TIMESTAMP\
+                    ) PRIMARY KEY (Id)".into(),
+                ],
+                vec![
+                    "INSERT INTO ScalarTypes (Id, BoolCol, Int64Col, Float64Col, StringCol, BytesCol, DateCol, TimestampCol) \
+                     VALUES (1, true, 42, 3.125, 'hello', b'hello', DATE '2024-01-15', TIMESTAMP '2024-06-15T10:30:00Z')".into(),
+                    "INSERT INTO ScalarTypes (Id, BoolCol, Int64Col, Float64Col, StringCol, BytesCol, DateCol, TimestampCol) \
+                     VALUES (2, false, -100, 2.625, 'world', b'world', DATE '1999-12-31', TIMESTAMP '2000-01-01T00:00:00Z')".into(),
+                    "INSERT INTO ScalarTypes (Id, BoolCol, Int64Col, Float64Col, StringCol, BytesCol, DateCol, TimestampCol) \
+                     VALUES (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL)".into(),
+                    "INSERT INTO NumericTypes (Id, NumCol, JsonCol) VALUES (1, 123.456789, JSON '{\"key\": \"value\"}')".into(),
+                    "INSERT INTO NumericTypes (Id, NumCol, JsonCol) VALUES (2, -99999.999999999, NULL)".into(),
+                    "INSERT INTO ArrayTypes (Id, IntArray, StrArray) VALUES (1, [10, 20, 30], ['a', 'b', 'c'])".into(),
+                    "INSERT INTO ArrayTypes (Id, IntArray, StrArray) VALUES (2, [], [])".into(),
+                    "INSERT INTO ArrayTypes (Id, IntArray, StrArray) VALUES (3, NULL, NULL)".into(),
+                    "INSERT INTO UuidTypes (Id, UuidCol) VALUES (1, '550e8400-e29b-41d4-a716-446655440000')".into(),
+                    "INSERT INTO UuidTypes (Id, UuidCol) VALUES (2, NULL)".into(),
+                ],
+            ).await.expect("Failed to create GoogleSQL read database")
+        })
+    })
+}
+
+/// Isolated GoogleSQL database for DDL tests (no tables pre-created).
+fn get_gsql_ddl_db() -> &'static spanemuboost::SpanEmuDatabase {
+    static DB: OnceLock<spanemuboost::SpanEmuDatabase> = OnceLock::new();
+    DB.get_or_init(|| {
+        let emu = get_emulator();
+        test_runtime().block_on(async {
+            emu.create_database("gsql-ddl", DatabaseDialect::GoogleStandardSql, vec![], vec![])
+                .await
+                .expect("Failed to create GoogleSQL DDL database")
+        })
+    })
+}
+
+/// Get a shared Spanner data client connected to the GoogleSQL read database.
 fn spanner_client() -> Arc<Client> {
     static CLIENT: OnceLock<Arc<Client>> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
-            let env = get_emulator();
+            let db = get_gsql_db();
             test_runtime().block_on(async {
                 let config = ClientConfig {
-                    environment: Environment::Emulator(env.emulator_host().to_string()),
+                    environment: Environment::Emulator(db.emulator_host().to_string()),
                     ..Default::default()
                 };
-                Arc::new(Client::new(&env.database_path(), config).await.unwrap())
+                Arc::new(Client::new(db.database_path(), config).await.unwrap())
             })
         })
         .clone()
@@ -149,7 +166,7 @@ fn exec_spanner_one(sql: &str) -> google_cloud_spanner::row::Row {
 // DuckDB VTab helpers
 
 fn create_duckdb_connection() -> Connection {
-    let _ = get_emulator(); // ensure emulator is running
+    let _ = get_gsql_db(); // ensure emulator + database are ready
     let conn = Connection::open_in_memory().unwrap();
     conn.register_table_function::<SpannerQueryVTab>("spanner_query_raw")
         .unwrap();
@@ -176,44 +193,44 @@ fn create_duckdb_connection() -> Connection {
 }
 
 fn vtab_query_sql(spanner_sql: &str) -> String {
-    let env = get_emulator();
+    let db = get_gsql_db();
     format!(
         "SELECT * FROM spanner_query('{}', database_path := '{}', endpoint := '{}')",
         spanner_sql,
-        env.database_path(),
-        env.emulator_host()
+        db.database_path(),
+        db.emulator_host()
     )
 }
 
 fn vtab_query_sql_with(spanner_sql: &str, extra_params: &str) -> String {
-    let env = get_emulator();
+    let db = get_gsql_db();
     format!(
         "SELECT * FROM spanner_query('{}', database_path := '{}', endpoint := '{}', {})",
         spanner_sql,
-        env.database_path(),
-        env.emulator_host(),
+        db.database_path(),
+        db.emulator_host(),
         extra_params
     )
 }
 
 fn vtab_scan_sql_with(table: &str, extra_params: &str) -> String {
-    let env = get_emulator();
+    let db = get_gsql_db();
     format!(
         "SELECT * FROM spanner_scan('{}', database_path := '{}', endpoint := '{}', {})",
         table,
-        env.database_path(),
-        env.emulator_host(),
+        db.database_path(),
+        db.emulator_host(),
         extra_params
     )
 }
 
 fn vtab_scan_sql(table: &str) -> String {
-    let env = get_emulator();
+    let db = get_gsql_db();
     format!(
         "SELECT * FROM spanner_scan('{}', database_path := '{}', endpoint := '{}')",
         table,
-        env.database_path(),
-        env.emulator_host()
+        db.database_path(),
+        db.emulator_host()
     )
 }
 
@@ -699,12 +716,12 @@ fn test_vtab_scan_types() {
 
 #[test]
 fn test_vtab_endpoint_parameter() {
-    let env = get_emulator();
+    let db = get_gsql_db();
     let conn = create_duckdb_connection();
     let sql = format!(
         "SELECT COUNT(*) FROM spanner_query('SELECT 1', database_path := '{}', endpoint := '{}')",
-        env.database_path(),
-        env.emulator_host(),
+        db.database_path(),
+        db.emulator_host(),
     );
     let count: i64 = conn.query_row(&sql, [], |r| r.get(0)).unwrap();
     assert_eq!(count, 1);
@@ -1013,11 +1030,11 @@ fn test_error_negative_exact_staleness_secs() {
 #[test]
 fn test_error_invalid_params_json() {
     let conn = create_duckdb_connection();
-    let env = get_emulator();
+    let db = get_gsql_db();
     let sql = format!(
         "SELECT * FROM spanner_query_raw('SELECT 1', database_path := '{}', endpoint := '{}', params := '{{not valid json')",
-        env.database_path(),
-        env.emulator_host()
+        db.database_path(),
+        db.emulator_host()
     );
     let result = conn.query_row(&sql, [], |r| r.get::<_, i64>(0));
     assert!(result.is_err(), "invalid params JSON should fail");
@@ -1043,37 +1060,43 @@ fn test_error_invalid_sql_query() {
 // DDL execution tests
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn vtab_ddl_sql(ddl: &str) -> String {
-    let env = get_emulator();
+fn make_ddl_sql(db: &spanemuboost::SpanEmuDatabase, ddl: &str) -> String {
     format!(
         "SELECT * FROM spanner_ddl('{}', database_path := '{}', endpoint := '{}')",
         ddl.replace('\'', "''"),
-        env.database_path(),
-        env.emulator_host()
+        db.database_path(),
+        db.emulator_host()
     )
 }
 
-fn vtab_ddl_async_sql(ddl: &str) -> String {
-    let env = get_emulator();
+fn make_ddl_async_sql(db: &spanemuboost::SpanEmuDatabase, ddl: &str) -> String {
     format!(
         "SELECT * FROM spanner_ddl_async('{}', database_path := '{}', endpoint := '{}')",
         ddl.replace('\'', "''"),
-        env.database_path(),
-        env.emulator_host()
+        db.database_path(),
+        db.emulator_host()
     )
 }
 
-/// Comprehensive DDL test — runs all DDL operations sequentially in one test
-/// to avoid Spanner's "concurrent schema change" rejection.
-/// The emulator only allows one schema change at a time.
+fn make_query_sql(db: &spanemuboost::SpanEmuDatabase, spanner_sql: &str) -> String {
+    format!(
+        "SELECT * FROM spanner_query('{}', database_path := '{}', endpoint := '{}')",
+        spanner_sql,
+        db.database_path(),
+        db.emulator_host()
+    )
+}
+
+/// Comprehensive DDL test — uses its own isolated database.
 #[test]
 fn test_ddl_operations() {
+    let db = get_gsql_ddl_db();
     let conn = create_duckdb_connection();
 
     // --- spanner_ddl (sync) ---
 
     // 1. CREATE TABLE
-    let sql = vtab_ddl_sql(
+    let sql = make_ddl_sql(db,
         "CREATE TABLE DdlTest (Id INT64 NOT NULL, Name STRING(MAX)) PRIMARY KEY (Id)"
     );
     let (op_name, done, duration): (String, bool, f64) = conn
@@ -1084,18 +1107,18 @@ fn test_ddl_operations() {
     assert!(duration >= 0.0, "duration should be non-negative");
 
     // Verify table exists
-    let verify_sql = vtab_query_sql("SELECT COUNT(*) AS cnt FROM DdlTest");
+    let verify_sql = make_query_sql(db, "SELECT COUNT(*) AS cnt FROM DdlTest");
     let count: i64 = conn.query_row(&verify_sql, [], |r| r.get(0)).unwrap();
     assert_eq!(count, 0);
 
     // 2. ALTER TABLE — add column
-    let alter_sql = vtab_ddl_sql("ALTER TABLE DdlTest ADD COLUMN Value FLOAT64");
+    let alter_sql = make_ddl_sql(db, "ALTER TABLE DdlTest ADD COLUMN Value FLOAT64");
     let (_, done, _): (String, bool, f64) = conn
         .query_row(&alter_sql, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .unwrap();
     assert!(done);
 
-    let verify_sql = vtab_query_sql(
+    let verify_sql = make_query_sql(db,
         "SELECT column_name FROM INFORMATION_SCHEMA.COLUMNS \
          WHERE table_name = ''DdlTest'' AND column_name = ''Value''"
     );
@@ -1103,13 +1126,13 @@ fn test_ddl_operations() {
     assert_eq!(col_name, "Value");
 
     // 3. CREATE INDEX
-    let index_sql = vtab_ddl_sql("CREATE INDEX DdlTestByName ON DdlTest(Name)");
+    let index_sql = make_ddl_sql(db, "CREATE INDEX DdlTestByName ON DdlTest(Name)");
     let (_, done, _): (String, bool, f64) = conn
         .query_row(&index_sql, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .unwrap();
     assert!(done);
 
-    let verify_sql = vtab_query_sql(
+    let verify_sql = make_query_sql(db,
         "SELECT index_name FROM INFORMATION_SCHEMA.INDEXES \
          WHERE table_name = ''DdlTest'' AND index_name = ''DdlTestByName''"
     );
@@ -1117,16 +1140,16 @@ fn test_ddl_operations() {
     assert_eq!(idx_name, "DdlTestByName");
 
     // 4. DROP INDEX then DROP TABLE
-    let drop_idx_sql = vtab_ddl_sql("DROP INDEX DdlTestByName");
+    let drop_idx_sql = make_ddl_sql(db, "DROP INDEX DdlTestByName");
     conn.execute_batch(&format!("SELECT * FROM ({drop_idx_sql})")).unwrap();
 
-    let drop_sql = vtab_ddl_sql("DROP TABLE DdlTest");
+    let drop_sql = make_ddl_sql(db, "DROP TABLE DdlTest");
     let (_, done, _): (String, bool, f64) = conn
         .query_row(&drop_sql, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
         .unwrap();
     assert!(done);
 
-    let verify_sql = vtab_query_sql(
+    let verify_sql = make_query_sql(db,
         "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE table_name = ''DdlTest''"
     );
     let count: i64 = conn.query_row(&verify_sql, [], |r| r.get(0)).unwrap();
@@ -1135,32 +1158,30 @@ fn test_ddl_operations() {
     // --- spanner_ddl_async ---
 
     // 5. Async CREATE TABLE
-    let sql = vtab_ddl_async_sql(
+    let sql = make_ddl_async_sql(db,
         "CREATE TABLE DdlAsyncTest (Id INT64 NOT NULL, Data BYTES(MAX)) PRIMARY KEY (Id)"
     );
     let (op_name, done): (String, bool) = conn
         .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
         .unwrap();
     assert!(!op_name.is_empty(), "operation_name should not be empty");
-    // Emulator typically completes immediately
     eprintln!("DDL async: op={op_name}, done={done}");
 
     if !done {
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
 
-    let verify_sql = vtab_query_sql("SELECT COUNT(*) AS cnt FROM DdlAsyncTest");
+    let verify_sql = make_query_sql(db, "SELECT COUNT(*) AS cnt FROM DdlAsyncTest");
     let count: i64 = conn.query_row(&verify_sql, [], |r| r.get(0)).unwrap();
     assert_eq!(count, 0);
 
     // --- spanner_operations ---
 
     // 6. List operations via spanner_operations
-    let env = get_emulator();
     let ops_sql = format!(
         "SELECT * FROM spanner_operations(database_path := '{}', endpoint := '{}')",
-        env.database_path(),
-        env.emulator_host()
+        db.database_path(),
+        db.emulator_host()
     );
     let mut stmt = conn.prepare(&ops_sql).unwrap();
     let rows: Vec<(String, bool)> = stmt
@@ -1177,7 +1198,7 @@ fn test_ddl_operations() {
     // --- Error case ---
 
     // 7. Invalid DDL should produce an error
-    let sql = vtab_ddl_sql("THIS IS NOT VALID DDL");
+    let sql = make_ddl_sql(db, "THIS IS NOT VALID DDL");
     let result = conn.query_row(&sql, [], |r| r.get::<_, String>(0));
     assert!(result.is_err(), "invalid DDL should fail");
 }
@@ -1186,22 +1207,22 @@ fn test_ddl_operations() {
 // PostgreSQL dialect infrastructure
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Start a PG dialect Spanner emulator (once) with test tables and seed data.
-fn get_pg_emulator() -> &'static spanemuboost::SpanEmuBoost {
-    static PG_EMU: OnceLock<spanemuboost::SpanEmuBoost> = OnceLock::new();
-    PG_EMU.get_or_init(|| {
+/// PG database with read-only test tables and seed data.
+fn get_pg_db() -> &'static spanemuboost::SpanEmuDatabase {
+    static DB: OnceLock<spanemuboost::SpanEmuDatabase> = OnceLock::new();
+    DB.get_or_init(|| {
+        let emu = get_emulator();
         test_runtime().block_on(async {
-            spanemuboost::SpanEmuBoost::builder()
-                .database_id("pg-database")
-                .database_dialect(DatabaseDialect::Postgresql)
-                .setup_ddls(vec![
+            emu.create_database(
+                "pg-read",
+                DatabaseDialect::Postgresql,
+                vec![
                     "CREATE TABLE users (\
                         id bigint NOT NULL, \
                         name character varying(256), \
                         age bigint, \
                         PRIMARY KEY (id)\
-                    )"
-                    .into(),
+                    )".into(),
                     "CREATE TABLE pgsql_types (\
                         id bigint NOT NULL, \
                         bool_col boolean, \
@@ -1215,71 +1236,102 @@ fn get_pg_emulator() -> &'static spanemuboost::SpanEmuBoost {
                         ts_col timestamp with time zone, \
                         json_col jsonb, \
                         PRIMARY KEY (id)\
-                    )"
-                    .into(),
-                ])
-                .setup_dmls(vec![
+                    )".into(),
+                ],
+                vec![
                     "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)".into(),
                     "INSERT INTO users (id, name, age) VALUES (2, 'Bob', 25)".into(),
                     "INSERT INTO users (id, name, age) VALUES (3, 'Charlie', NULL)".into(),
                     "INSERT INTO pgsql_types (id, bool_col, int_col, float4_col, float8_col, num_col, str_col, bytes_col, date_col, ts_col, json_col) \
-                     VALUES (1, true, 42, 1.5, 3.125, 123.456789, 'hello', '\\x68656c6c6f', '2024-01-15', '2024-06-15T10:30:00Z', '{\"key\": \"value\"}')"
-                    .into(),
+                     VALUES (1, true, 42, 1.5, 3.125, 123.456789, 'hello', '\\x68656c6c6f', '2024-01-15', '2024-06-15T10:30:00Z', '{\"key\": \"value\"}')".into(),
                     "INSERT INTO pgsql_types (id, bool_col, int_col, float4_col, float8_col, num_col, str_col, bytes_col, date_col, ts_col, json_col) \
-                     VALUES (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)"
-                    .into(),
-                ])
-                .start()
+                     VALUES (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)".into(),
+                ],
+            ).await.expect("Failed to create PG read database")
+        })
+    })
+}
+
+/// Isolated PG database for DDL tests (no tables pre-created).
+fn get_pg_ddl_db() -> &'static spanemuboost::SpanEmuDatabase {
+    static DB: OnceLock<spanemuboost::SpanEmuDatabase> = OnceLock::new();
+    DB.get_or_init(|| {
+        let emu = get_emulator();
+        test_runtime().block_on(async {
+            emu.create_database("pg-ddl", DatabaseDialect::Postgresql, vec![], vec![])
                 .await
-                .expect("Failed to start PG dialect emulator")
+                .expect("Failed to create PG DDL database")
+        })
+    })
+}
+
+/// Isolated PG database for COPY TO tests.
+fn get_pg_copy_db() -> &'static spanemuboost::SpanEmuDatabase {
+    static DB: OnceLock<spanemuboost::SpanEmuDatabase> = OnceLock::new();
+    DB.get_or_init(|| {
+        let emu = get_emulator();
+        test_runtime().block_on(async {
+            emu.create_database(
+                "pg-copy",
+                DatabaseDialect::Postgresql,
+                vec![
+                    "CREATE TABLE pgsql_copy_target (\
+                        id bigint NOT NULL, \
+                        name character varying(256), \
+                        value double precision, \
+                        PRIMARY KEY (id)\
+                    )".into(),
+                ],
+                vec![],
+            ).await.expect("Failed to create PG COPY database")
         })
     })
 }
 
 fn pg_vtab_query_sql(spanner_sql: &str) -> String {
-    let env = get_pg_emulator();
+    let db = get_pg_db();
     format!(
         "SELECT * FROM spanner_query('{}', database_path := '{}', endpoint := '{}')",
         spanner_sql,
-        env.database_path(),
-        env.emulator_host()
+        db.database_path(),
+        db.emulator_host()
     )
 }
 
 fn pg_vtab_query_sql_with(spanner_sql: &str, extra_params: &str) -> String {
-    let env = get_pg_emulator();
+    let db = get_pg_db();
     format!(
         "SELECT * FROM spanner_query('{}', database_path := '{}', endpoint := '{}', {})",
         spanner_sql,
-        env.database_path(),
-        env.emulator_host(),
+        db.database_path(),
+        db.emulator_host(),
         extra_params
     )
 }
 
 fn pg_vtab_scan_sql(table: &str) -> String {
-    let env = get_pg_emulator();
+    let db = get_pg_db();
     format!(
         "SELECT * FROM spanner_scan('{}', database_path := '{}', endpoint := '{}')",
         table,
-        env.database_path(),
-        env.emulator_host()
+        db.database_path(),
+        db.emulator_host()
     )
 }
 
 fn pg_vtab_scan_sql_with(table: &str, extra_params: &str) -> String {
-    let env = get_pg_emulator();
+    let db = get_pg_db();
     format!(
         "SELECT * FROM spanner_scan('{}', database_path := '{}', endpoint := '{}', {})",
         table,
-        env.database_path(),
-        env.emulator_host(),
+        db.database_path(),
+        db.emulator_host(),
         extra_params
     )
 }
 
 fn create_pg_duckdb_connection() -> Connection {
-    let _ = get_pg_emulator(); // ensure PG emulator is running
+    let _ = get_pg_db(); // ensure emulator + PG database are ready
     let conn = Connection::open_in_memory().unwrap();
     conn.register_table_function::<SpannerQueryVTab>("spanner_query_raw")
         .unwrap();
@@ -1429,7 +1481,7 @@ fn test_pg_vtab_scan_exact_staleness() {
 
 /// Create a DuckDB connection with the copy function registered via C API.
 fn create_duckdb_connection_with_copy() -> Connection {
-    let _ = get_emulator();
+    let _ = get_gsql_db();
     unsafe {
         let mut db: duckdb::ffi::duckdb_database = std::ptr::null_mut();
         let mut c_err: *mut std::os::raw::c_char = std::ptr::null_mut();
@@ -1509,7 +1561,7 @@ fn test_copy_to_registration() {
 #[test]
 fn test_copy_to_basic() {
     let conn = create_duckdb_connection_with_copy();
-    let env = get_emulator();
+    let db = get_gsql_db();
 
     // COPY 3 rows to CopyTarget — Value is DECIMAL from VALUES clause,
     // which should auto-convert to NumberValue for Spanner FLOAT64 columns.
@@ -1517,8 +1569,8 @@ fn test_copy_to_basic() {
         "COPY (SELECT CAST(Id AS BIGINT) AS Id, Name, Value \
          FROM (VALUES (100, 'alice', 1.5), (101, 'bob', 2.5), (102, 'charlie', 3.5)) AS t(Id, Name, Value)) \
          TO 'CopyTarget' (FORMAT spanner, database_path '{}', endpoint '{}')",
-        env.database_path(),
-        env.emulator_host()
+        db.database_path(),
+        db.emulator_host()
     );
     conn.execute_batch(&sql).unwrap();
 
@@ -1540,7 +1592,7 @@ fn test_copy_to_basic() {
 #[test]
 fn test_copy_to_types() {
     let conn = create_duckdb_connection_with_copy();
-    let env = get_emulator();
+    let db = get_gsql_db();
 
     let sql = format!(
         "COPY (SELECT \
@@ -1552,8 +1604,8 @@ fn test_copy_to_types() {
             DATE '2024-01-15' AS DateCol, \
             TIMESTAMPTZ '2024-06-15T10:30:00Z' AS TimestampCol \
         ) TO 'CopyTypes' (FORMAT spanner, database_path '{}', endpoint '{}')",
-        env.database_path(),
-        env.emulator_host()
+        db.database_path(),
+        db.emulator_host()
     );
     conn.execute_batch(&sql).unwrap();
 
@@ -1578,14 +1630,14 @@ fn test_copy_to_types() {
 #[test]
 fn test_copy_to_insert_mode() {
     let conn = create_duckdb_connection_with_copy();
-    let env = get_emulator();
+    let db = get_gsql_db();
 
     // Insert with mode 'insert'
     let sql = format!(
         "COPY (SELECT CAST(200 AS BIGINT) AS Id, 'insert_test' AS Name, CAST(9.9 AS DOUBLE) AS Value) \
          TO 'CopyTarget' (FORMAT spanner, database_path '{}', endpoint '{}', mode 'insert')",
-        env.database_path(),
-        env.emulator_host()
+        db.database_path(),
+        db.emulator_host()
     );
     conn.execute_batch(&sql).unwrap();
 
@@ -1597,7 +1649,7 @@ fn test_copy_to_insert_mode() {
 #[test]
 fn test_copy_to_with_nulls() {
     let conn = create_duckdb_connection_with_copy();
-    let env = get_emulator();
+    let db = get_gsql_db();
 
     let sql = format!(
         "COPY (SELECT CAST(300 AS BIGINT) AS Id, CAST(NULL AS BOOLEAN) AS BoolCol, \
@@ -1605,8 +1657,8 @@ fn test_copy_to_with_nulls() {
             CAST(NULL AS VARCHAR) AS StringCol, CAST(NULL AS DATE) AS DateCol, \
             CAST(NULL AS TIMESTAMPTZ) AS TimestampCol) \
          TO 'CopyTypes' (FORMAT spanner, database_path '{}', endpoint '{}')",
-        env.database_path(),
-        env.emulator_host()
+        db.database_path(),
+        db.emulator_host()
     );
     conn.execute_batch(&sql).unwrap();
 
@@ -1624,14 +1676,14 @@ fn test_copy_to_with_nulls() {
 #[test]
 fn test_copy_to_column_count_mismatch() {
     let conn = create_duckdb_connection_with_copy();
-    let env = get_emulator();
+    let db = get_gsql_db();
 
     // CopyTarget has 3 columns (Id, Name, Value); source has 2
     let sql = format!(
         "COPY (SELECT CAST(999 AS BIGINT) AS Id, 'oops' AS Name) \
          TO 'CopyTarget' (FORMAT spanner, database_path '{}', endpoint '{}')",
-        env.database_path(),
-        env.emulator_host()
+        db.database_path(),
+        db.emulator_host()
     );
     let result = conn.execute_batch(&sql);
     assert!(result.is_err(), "column count mismatch should fail");
@@ -1646,23 +1698,14 @@ fn test_copy_to_column_count_mismatch() {
 // PostgreSQL dialect — DDL tests
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn pg_vtab_ddl_sql(ddl: &str) -> String {
-    let env = get_pg_emulator();
-    format!(
-        "SELECT * FROM spanner_ddl('{}', database_path := '{}', endpoint := '{}')",
-        ddl.replace('\'', "''"),
-        env.database_path(),
-        env.emulator_host()
-    )
-}
-
-/// PG DDL test — all operations in one test to avoid concurrent schema change rejection.
+/// PG DDL test — uses its own isolated database.
 #[test]
 fn test_pg_ddl_operations() {
+    let db = get_pg_ddl_db();
     let conn = create_pg_duckdb_connection();
 
     // 1. CREATE TABLE
-    let sql = pg_vtab_ddl_sql(
+    let sql = make_ddl_sql(db,
         "CREATE TABLE pgsql_ddl_test (id bigint NOT NULL, name character varying(256), PRIMARY KEY (id))"
     );
     let (op_name, done): (String, bool) = conn
@@ -1672,33 +1715,32 @@ fn test_pg_ddl_operations() {
     assert!(done);
 
     // 2. ALTER TABLE
-    let alter_sql = pg_vtab_ddl_sql(
+    let alter_sql = make_ddl_sql(db,
         "ALTER TABLE pgsql_ddl_test ADD COLUMN value double precision"
     );
     let done: bool = conn.query_row(&alter_sql, [], |r| r.get(1)).unwrap();
     assert!(done);
 
     // 3. CREATE INDEX
-    let index_sql = pg_vtab_ddl_sql("CREATE INDEX pgsql_ddl_test_by_name ON pgsql_ddl_test(name)");
+    let index_sql = make_ddl_sql(db, "CREATE INDEX pgsql_ddl_test_by_name ON pgsql_ddl_test(name)");
     let done: bool = conn.query_row(&index_sql, [], |r| r.get(1)).unwrap();
     assert!(done);
 
     // 4. DROP INDEX
-    let drop_idx_sql = pg_vtab_ddl_sql("DROP INDEX pgsql_ddl_test_by_name");
+    let drop_idx_sql = make_ddl_sql(db, "DROP INDEX pgsql_ddl_test_by_name");
     let done: bool = conn.query_row(&drop_idx_sql, [], |r| r.get(1)).unwrap();
     assert!(done);
 
     // 5. DROP TABLE
-    let drop_sql = pg_vtab_ddl_sql("DROP TABLE pgsql_ddl_test");
+    let drop_sql = make_ddl_sql(db, "DROP TABLE pgsql_ddl_test");
     let done: bool = conn.query_row(&drop_sql, [], |r| r.get(1)).unwrap();
     assert!(done);
 
     // 6. spanner_operations
-    let env = get_pg_emulator();
     let ops_sql = format!(
         "SELECT * FROM spanner_operations(database_path := '{}', endpoint := '{}')",
-        env.database_path(),
-        env.emulator_host()
+        db.database_path(),
+        db.emulator_host()
     );
     let mut stmt = conn.prepare(&ops_sql).unwrap();
     let rows: Vec<(String, bool)> = stmt
@@ -1713,9 +1755,9 @@ fn test_pg_ddl_operations() {
 // PostgreSQL dialect — COPY TO tests
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Create a DuckDB connection with copy function registered, using the PG emulator.
+/// Create a DuckDB connection with copy function registered.
 fn create_pg_duckdb_connection_with_copy() -> Connection {
-    let _ = get_pg_emulator();
+    let _ = get_pg_copy_db();
     unsafe {
         let mut db: duckdb::ffi::duckdb_database = std::ptr::null_mut();
         let mut c_err: *mut std::os::raw::c_char = std::ptr::null_mut();
@@ -1759,27 +1801,21 @@ fn create_pg_duckdb_connection_with_copy() -> Connection {
 #[test]
 fn test_pg_copy_to_basic() {
     let conn = create_pg_duckdb_connection_with_copy();
-    let env = get_pg_emulator();
+    let db = get_pg_copy_db();
 
-    // Create target table via DDL
-    let ddl_sql = pg_vtab_ddl_sql(
-        "CREATE TABLE pgsql_copy_target (id bigint NOT NULL, name character varying(256), value double precision, PRIMARY KEY (id))"
-    );
-    conn.query_row(&ddl_sql, [], |_| Ok(())).unwrap();
-
-    // COPY 3 rows
+    // COPY 3 rows (pgsql_copy_target is pre-created in get_pg_copy_db)
     let sql = format!(
         "COPY (SELECT CAST(100 AS BIGINT) AS id, 'alice' AS name, 1.5 AS value \
          UNION ALL SELECT CAST(101 AS BIGINT), 'bob', 2.5 \
          UNION ALL SELECT CAST(102 AS BIGINT), 'charlie', 3.5) \
          TO 'pgsql_copy_target' (FORMAT spanner, database_path '{}', endpoint '{}')",
-        env.database_path(),
-        env.emulator_host()
+        db.database_path(),
+        db.emulator_host()
     );
     conn.execute_batch(&sql).unwrap();
 
     // Read back
-    let read_sql = pg_vtab_query_sql("SELECT id, name, value FROM pgsql_copy_target WHERE id BETWEEN 100 AND 102 ORDER BY id");
+    let read_sql = make_query_sql(db, "SELECT id, name, value FROM pgsql_copy_target WHERE id BETWEEN 100 AND 102 ORDER BY id");
     let rows: Vec<(i64, String, f64)> = {
         let mut stmt = conn.prepare(&read_sql).unwrap();
         stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
@@ -1791,9 +1827,4 @@ fn test_pg_copy_to_basic() {
     assert_eq!(rows[0], (100, "alice".into(), 1.5));
     assert_eq!(rows[1], (101, "bob".into(), 2.5));
     assert_eq!(rows[2], (102, "charlie".into(), 3.5));
-
-    // Cleanup
-    let drop_sql = pg_vtab_ddl_sql("DROP TABLE pgsql_copy_target");
-    conn.query_row(&drop_sql, [], |_| Ok(())).unwrap();
 }
-
