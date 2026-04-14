@@ -25,7 +25,7 @@ METADATA_SCRIPT := extension-ci-tools/scripts/append_extension_metadata.py
 EMULATOR_NAME := spanner-emulator
 DUCKDB_VERSION ?= $(shell duckdb --version 2>/dev/null | sed -nE 's/^v?([0-9]+\.[0-9]+\.[0-9]+).*/v\1/p')
 ifeq ($(DUCKDB_VERSION),)
-DUCKDB_VERSION := v1.5.1
+DUCKDB_VERSION := v1.5.2
 endif
 EXT_VERSION := v0.1.0
 SWEEP_DAYS ?= 3

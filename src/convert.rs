@@ -1,4 +1,4 @@
-use duckdb::core::{DataChunkHandle, Inserter, ListVector, StructVector};
+use duckdb::core::{DataChunkHandle, FlatVector, Inserter, ListVector, StructVector};
 use duckdb::ffi;
 use google_cloud_googleapis::spanner::v1::{Type, TypeCode};
 use google_cloud_spanner::row::{Row, TryFromValue};
@@ -12,10 +12,11 @@ const EPOCH_DATE: time::Date = time::macros::date!(1970 - 01 - 01);
 
 /// Extract the raw `duckdb_vector` handle from a FlatVector.
 ///
-/// FlatVector wraps `{ptr: duckdb_vector, capacity: usize}` with `ptr` as the
-/// first field. We read the first pointer-sized value. A debug assertion verifies
-/// correctness by cross-checking with `duckdb_vector_get_data`.
-unsafe fn flat_vector_raw(vector: &duckdb::core::FlatVector) -> ffi::duckdb_vector {
+/// duckdb-rs stores the underlying `duckdb_vector` pointer in the first field of
+/// `FlatVector<'_>`; newer releases add a lifetime marker but keep `ptr` first.
+/// We read the first pointer-sized value and debug-check it against
+/// `duckdb_vector_get_data`.
+unsafe fn flat_vector_raw(vector: &FlatVector<'_>) -> ffi::duckdb_vector {
     let candidate = *(vector as *const _ as *const ffi::duckdb_vector);
     debug_assert_eq!(
         ffi::duckdb_vector_get_data(candidate) as usize,
@@ -34,7 +35,7 @@ unsafe fn flat_vector_raw(vector: &duckdb::core::FlatVector) -> ffi::duckdb_vect
 /// # Safety
 /// - `idx` must be within the vector's allocated capacity
 /// - The caller must guarantee the input bytes are valid UTF-8 (Spanner does this)
-unsafe fn unsafe_assign_string(vector: &mut duckdb::core::FlatVector, idx: usize, s: &str) {
+unsafe fn unsafe_assign_string(vector: &mut FlatVector<'_>, idx: usize, s: &str) {
     let raw_vector = flat_vector_raw(vector);
     ffi::duckdb_unsafe_vector_assign_string_element_len(
         raw_vector,
@@ -275,7 +276,7 @@ fn write_struct_column(
 
 /// Write a single raw proto Value as a struct into a StructVector at the given row index.
 fn write_raw_struct_value(
-    struct_vector: &mut StructVector,
+    struct_vector: &mut StructVector<'_>,
     row_idx: usize,
     value: &prost_types::Value,
     struct_type: &google_cloud_googleapis::spanner::v1::StructType,
@@ -340,7 +341,7 @@ fn write_raw_struct_value(
 
 /// Write a single raw proto Value as a list entry into a ListVector at the given row index.
 fn write_raw_list_value(
-    list_vector: &mut ListVector,
+    list_vector: &mut ListVector<'_>,
     row_idx: usize,
     value: &prost_types::Value,
     element_type: &Type,
@@ -403,7 +404,7 @@ fn write_raw_list_value(
 /// TODO: Replace with safe API when duckdb-rs provides a safe setter for
 /// fixed-size types. See duckdb/duckdb-rs#414 (vtab safety RFC).
 fn write_raw_scalar_to_flat(
-    vector: &mut duckdb::core::FlatVector,
+    vector: &mut FlatVector<'_>,
     idx: usize,
     value: &prost_types::Value,
     type_code: TypeCode,
