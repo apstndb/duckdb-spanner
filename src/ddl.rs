@@ -10,7 +10,9 @@ use google_cloud_googleapis::longrunning::operation;
 use google_cloud_googleapis::longrunning::operations_client::OperationsClient;
 use google_cloud_googleapis::longrunning::ListOperationsRequest;
 use google_cloud_googleapis::longrunning::Operation as InternalOperation;
-use google_cloud_googleapis::spanner::admin::database::v1::UpdateDatabaseDdlRequest;
+use google_cloud_googleapis::spanner::admin::database::v1::{
+    ListDatabaseOperationsRequest, UpdateDatabaseDdlRequest,
+};
 use google_cloud_spanner::admin::client::Client as AdminClient;
 use google_cloud_spanner::admin::AdminClientConfig;
 
@@ -34,9 +36,7 @@ async fn get_or_create_admin_client(
     let cache_key = endpoint.unwrap_or("").to_string();
 
     {
-        let cache = ADMIN_CLIENT_CACHE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let cache = ADMIN_CLIENT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(client) = cache.get(&cache_key) {
             return Ok(Arc::clone(client));
         }
@@ -64,9 +64,7 @@ async fn get_or_create_admin_client(
         .map_err(|e| SpannerError::Other(format!("Admin client error: {e}")))?;
     let client = Arc::new(client);
 
-    let mut cache = ADMIN_CLIENT_CACHE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut cache = ADMIN_CLIENT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     let entry = cache
         .entry(cache_key)
         .or_insert_with(|| Arc::clone(&client));
@@ -134,9 +132,15 @@ impl VTab for SpannerDdlVTab {
         let database_path = bind_utils::resolve_database_path(bind)?;
         let endpoint = bind_utils::resolve_endpoint(bind);
 
-        bind.add_result_column("operation_name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column(
+            "operation_name",
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        );
         bind.add_result_column("done", LogicalTypeHandle::from(LogicalTypeId::Boolean));
-        bind.add_result_column("duration_secs", LogicalTypeHandle::from(LogicalTypeId::Double));
+        bind.add_result_column(
+            "duration_secs",
+            LogicalTypeHandle::from(LogicalTypeId::Double),
+        );
 
         Ok(DdlBindData {
             database_path,
@@ -263,7 +267,10 @@ impl VTab for SpannerDdlAsyncVTab {
         let database_path = bind_utils::resolve_database_path(bind)?;
         let endpoint = bind_utils::resolve_endpoint(bind);
 
-        bind.add_result_column("operation_name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column(
+            "operation_name",
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        );
         bind.add_result_column("done", LogicalTypeHandle::from(LogicalTypeId::Boolean));
 
         Ok(DdlAsyncBindData {
@@ -389,7 +396,10 @@ impl VTab for SpannerOperationsVTab {
             "metadata_type",
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
         );
-        bind.add_result_column("error_code", LogicalTypeHandle::from(LogicalTypeId::Integer));
+        bind.add_result_column(
+            "error_code",
+            LogicalTypeHandle::from(LogicalTypeId::Integer),
+        );
         bind.add_result_column(
             "error_message",
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
@@ -410,64 +420,7 @@ impl VTab for SpannerOperationsVTab {
         let filter = bind_data.filter.clone();
 
         let ops = runtime::block_on(async {
-            // Use google.longrunning.Operations/ListOperations (not DatabaseAdmin/ListDatabaseOperations)
-            // because the Spanner emulator only implements the generic Operations service.
-            let ep = endpoint.or_else(|| std::env::var("SPANNER_EMULATOR_HOST").ok());
-
-            let channel = match ep.as_deref() {
-                Some(ep) => {
-                    let url = if ep.starts_with("http") {
-                        ep.to_string()
-                    } else {
-                        format!("http://{ep}")
-                    };
-                    Channel::from_shared(url)
-                        .map_err(|e| SpannerError::Other(format!("Invalid endpoint: {e}")))?
-                        .connect()
-                        .await
-                        .map_err(|e| SpannerError::Other(format!("Connect error: {e}")))?
-                }
-                None => {
-                    Channel::from_static("https://spanner.googleapis.com")
-                        .connect()
-                        .await
-                        .map_err(|e| SpannerError::Other(format!("Connect error: {e}")))?
-                }
-            };
-
-            let mut client = OperationsClient::new(channel);
-
-            let mut all_operations = Vec::new();
-            let mut page_token = String::new();
-
-            loop {
-                let req = ListOperationsRequest {
-                    name: format!("{database_path}/operations"),
-                    filter: filter.clone().unwrap_or_default(),
-                    page_size: 0,
-                    page_token: page_token.clone(),
-                };
-
-                let response = client
-                    .list_operations(req)
-                    .await
-                    .map_err(SpannerError::Grpc)?
-                    .into_inner();
-
-                all_operations.extend(response.operations);
-
-                if response.next_page_token.is_empty() {
-                    break;
-                }
-                page_token = response.next_page_token;
-            }
-
-            let rows: Vec<OperationRow> = all_operations
-                .into_iter()
-                .map(|op| operation_to_row(op))
-                .collect();
-
-            Ok::<Vec<OperationRow>, SpannerError>(rows)
+            list_database_operations(&database_path, endpoint.as_deref(), filter.as_deref()).await
         })??;
 
         init.set_max_threads(1);
@@ -547,5 +500,113 @@ fn operation_to_row(op: InternalOperation) -> OperationRow {
         metadata_type,
         error_code,
         error_message,
+    }
+}
+
+async fn list_database_operations(
+    database_path: &str,
+    endpoint: Option<&str>,
+    filter: Option<&str>,
+) -> Result<Vec<OperationRow>, SpannerError> {
+    // The emulator only implements google.longrunning.Operations/ListOperations,
+    // while real Spanner exposes DatabaseAdmin/ListDatabaseOperations with auth.
+    let operations = match endpoint
+        .map(str::to_owned)
+        .or_else(|| std::env::var("SPANNER_EMULATOR_HOST").ok())
+    {
+        Some(emulator_endpoint) => {
+            list_emulator_database_operations(database_path, &emulator_endpoint, filter).await?
+        }
+        None => list_real_database_operations(database_path, filter).await?,
+    };
+
+    Ok(operations.into_iter().map(operation_to_row).collect())
+}
+
+async fn list_real_database_operations(
+    database_path: &str,
+    filter: Option<&str>,
+) -> Result<Vec<InternalOperation>, SpannerError> {
+    let admin = get_or_create_admin_client(None).await?;
+    let req = ListDatabaseOperationsRequest {
+        parent: instance_path_from_database_path(database_path)?.to_string(),
+        filter: filter.unwrap_or_default().to_string(),
+        page_size: 0,
+        page_token: String::new(),
+    };
+    admin
+        .database()
+        .list_database_operations(req, None)
+        .await
+        .map_err(SpannerError::Grpc)
+}
+
+async fn list_emulator_database_operations(
+    database_path: &str,
+    endpoint: &str,
+    filter: Option<&str>,
+) -> Result<Vec<InternalOperation>, SpannerError> {
+    let url = if endpoint.starts_with("http") {
+        endpoint.to_string()
+    } else {
+        format!("http://{endpoint}")
+    };
+    let channel = Channel::from_shared(url)
+        .map_err(|e| SpannerError::Other(format!("Invalid endpoint: {e}")))?
+        .connect()
+        .await
+        .map_err(|e| SpannerError::Other(format!("Connect error: {e}")))?;
+
+    let mut client = OperationsClient::new(channel);
+    let mut all_operations = Vec::new();
+    let mut page_token = String::new();
+
+    loop {
+        let req = ListOperationsRequest {
+            name: format!("{database_path}/operations"),
+            filter: filter.unwrap_or_default().to_string(),
+            page_size: 0,
+            page_token: page_token.clone(),
+        };
+
+        let response = client
+            .list_operations(req)
+            .await
+            .map_err(SpannerError::Grpc)?
+            .into_inner();
+
+        all_operations.extend(response.operations);
+
+        if response.next_page_token.is_empty() {
+            break;
+        }
+        page_token = response.next_page_token;
+    }
+
+    Ok(all_operations)
+}
+
+fn instance_path_from_database_path(database_path: &str) -> Result<&str, SpannerError> {
+    database_path
+        .rsplit_once("/databases/")
+        .map(|(prefix, _)| prefix)
+        .ok_or_else(|| {
+            SpannerError::Other(format!(
+                "Invalid database path for operations listing: {database_path}"
+            ))
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::instance_path_from_database_path;
+
+    #[test]
+    fn test_instance_path_from_database_path() {
+        assert_eq!(
+            instance_path_from_database_path("projects/p/instances/i/databases/d").unwrap(),
+            "projects/p/instances/i"
+        );
+        assert!(instance_path_from_database_path("projects/p/instances/i").is_err());
     }
 }
