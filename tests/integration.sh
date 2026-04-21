@@ -59,7 +59,8 @@ run_query() {
 }
 
 sql_escape() {
-    printf "%s" "${1//\'/\'\'}"
+    local quote="'"
+    printf "%s" "${1//${quote}/${quote}${quote}}"
 }
 
 spanner_query_source() {
@@ -352,12 +353,12 @@ run_spanner_query_tests() {
 
     assert_row_count \
         "SELECT all rows" \
-        "SELECT * FROM $(spanner_query_source "SELECT Id FROM ScalarTypes ORDER BY Id")" \
+        "SELECT * FROM $(spanner_query_source 'SELECT Id FROM ScalarTypes ORDER BY Id')" \
         3
 
     assert_row_count \
         "Empty table returns 0 rows" \
-        "SELECT * FROM $(spanner_query_source "SELECT * FROM EmptyTable")" \
+        "SELECT * FROM $(spanner_query_source 'SELECT * FROM EmptyTable')" \
         0
 
     echo ""
@@ -367,12 +368,12 @@ run_spanner_query_tests() {
 
     assert_eq \
         "String values" \
-        "SELECT * FROM $(spanner_query_source "SELECT StringCol FROM ScalarTypes WHERE Id = 1")" \
+        "SELECT * FROM $(spanner_query_source 'SELECT StringCol FROM ScalarTypes WHERE Id = 1')" \
         "hello"
 
     assert_eq \
         "NULL string" \
-        "SELECT * FROM $(spanner_query_source "SELECT StringCol IS NULL FROM ScalarTypes WHERE Id = 3")" \
+        "SELECT * FROM $(spanner_query_source 'SELECT StringCol IS NULL FROM ScalarTypes WHERE Id = 3')" \
         "true"
 
     echo ""
@@ -382,12 +383,12 @@ run_spanner_query_tests() {
 
     assert_eq \
         "Positive integer" \
-        "SELECT * FROM $(spanner_query_source "SELECT Int64Col FROM ScalarTypes WHERE Id = 1")" \
+        "SELECT * FROM $(spanner_query_source 'SELECT Int64Col FROM ScalarTypes WHERE Id = 1')" \
         "42"
 
     assert_eq \
         "Negative integer" \
-        "SELECT * FROM $(spanner_query_source "SELECT Int64Col FROM ScalarTypes WHERE Id = 2")" \
+        "SELECT * FROM $(spanner_query_source 'SELECT Int64Col FROM ScalarTypes WHERE Id = 2')" \
         "-100"
 
     echo ""
@@ -397,12 +398,12 @@ run_spanner_query_tests() {
 
     assert_eq \
         "Bool true" \
-        "SELECT * FROM $(spanner_query_source "SELECT BoolCol FROM ScalarTypes WHERE Id = 1")" \
+        "SELECT * FROM $(spanner_query_source 'SELECT BoolCol FROM ScalarTypes WHERE Id = 1')" \
         "true"
 
     assert_eq \
         "Bool false" \
-        "SELECT * FROM $(spanner_query_source "SELECT BoolCol FROM ScalarTypes WHERE Id = 2")" \
+        "SELECT * FROM $(spanner_query_source 'SELECT BoolCol FROM ScalarTypes WHERE Id = 2')" \
         "false"
 
     echo ""
@@ -412,7 +413,7 @@ run_spanner_query_tests() {
 
     assert_contains \
         "Float64 value (3.14)" \
-        "SELECT * FROM $(spanner_query_source "SELECT Float64Col FROM ScalarTypes WHERE Id = 1")" \
+        "SELECT * FROM $(spanner_query_source 'SELECT Float64Col FROM ScalarTypes WHERE Id = 1')" \
         "3.14"
 
     echo ""
@@ -422,12 +423,12 @@ run_spanner_query_tests() {
 
     assert_eq \
         "Date value" \
-        "SELECT * FROM $(spanner_query_source "SELECT DateCol FROM ScalarTypes WHERE Id = 1")" \
+        "SELECT * FROM $(spanner_query_source 'SELECT DateCol FROM ScalarTypes WHERE Id = 1')" \
         "2024-01-15"
 
     assert_eq \
         "Date Y2K boundary" \
-        "SELECT * FROM $(spanner_query_source "SELECT DateCol FROM ScalarTypes WHERE Id = 2")" \
+        "SELECT * FROM $(spanner_query_source 'SELECT DateCol FROM ScalarTypes WHERE Id = 2')" \
         "1999-12-31"
 
     echo ""
@@ -437,7 +438,7 @@ run_spanner_query_tests() {
 
     assert_contains \
         "Timestamp value" \
-        "SELECT * FROM $(spanner_query_source "SELECT TimestampCol FROM ScalarTypes WHERE Id = 1")" \
+        "SELECT * FROM $(spanner_query_source 'SELECT TimestampCol FROM ScalarTypes WHERE Id = 1')" \
         "2024-06-15"
 
     echo ""
@@ -447,17 +448,17 @@ run_spanner_query_tests() {
 
     assert_contains \
         "Numeric positive" \
-        "SELECT * FROM $(spanner_query_source "SELECT NumCol FROM NumericTypes WHERE Id = 1")" \
+        "SELECT * FROM $(spanner_query_source 'SELECT NumCol FROM NumericTypes WHERE Id = 1')" \
         "123.456789"
 
     assert_contains \
         "Numeric negative" \
-        "SELECT * FROM $(spanner_query_source "SELECT NumCol FROM NumericTypes WHERE Id = 2")" \
+        "SELECT * FROM $(spanner_query_source 'SELECT NumCol FROM NumericTypes WHERE Id = 2')" \
         "-99999.999999999"
 
     assert_eq \
         "Numeric NULL" \
-        "SELECT * FROM $(spanner_query_source "SELECT NumCol IS NULL FROM NumericTypes WHERE Id = 3")" \
+        "SELECT * FROM $(spanner_query_source 'SELECT NumCol IS NULL FROM NumericTypes WHERE Id = 3')" \
         "true"
 
     echo ""
@@ -467,7 +468,7 @@ run_spanner_query_tests() {
 
     assert_contains \
         "JSON value" \
-        "SELECT * FROM $(spanner_query_source "SELECT JsonCol FROM NumericTypes WHERE Id = 1")" \
+        "SELECT * FROM $(spanner_query_source 'SELECT JsonCol FROM NumericTypes WHERE Id = 1')" \
         "key"
 
     echo ""
@@ -477,19 +478,19 @@ run_spanner_query_tests() {
 
     assert_ok \
         "ARRAY<INT64> query succeeds" \
-        "SELECT * FROM $(spanner_query_source "SELECT IntArray FROM ArrayTypes WHERE Id = 1")"
+        "SELECT * FROM $(spanner_query_source 'SELECT IntArray FROM ArrayTypes WHERE Id = 1')"
 
     assert_ok \
         "ARRAY<STRING> query succeeds" \
-        "SELECT * FROM $(spanner_query_source "SELECT StrArray FROM ArrayTypes WHERE Id = 1")"
+        "SELECT * FROM $(spanner_query_source 'SELECT StrArray FROM ArrayTypes WHERE Id = 1')"
 
     assert_ok \
         "Empty ARRAY query succeeds" \
-        "SELECT * FROM $(spanner_query_source "SELECT IntArray FROM ArrayTypes WHERE Id = 2")"
+        "SELECT * FROM $(spanner_query_source 'SELECT IntArray FROM ArrayTypes WHERE Id = 2')"
 
     assert_ok \
         "NULL ARRAY query succeeds" \
-        "SELECT * FROM $(spanner_query_source "SELECT IntArray FROM ArrayTypes WHERE Id = 3")"
+        "SELECT * FROM $(spanner_query_source 'SELECT IntArray FROM ArrayTypes WHERE Id = 3')"
 
     echo ""
 
@@ -498,7 +499,7 @@ run_spanner_query_tests() {
 
     assert_eq \
         "All-null row count" \
-        "SELECT * FROM $(spanner_query_source "SELECT COUNT(*) FROM ScalarTypes WHERE BoolCol IS NULL")" \
+        "SELECT * FROM $(spanner_query_source 'SELECT COUNT(*) FROM ScalarTypes WHERE BoolCol IS NULL')" \
         "1"
 
     echo ""
@@ -508,7 +509,7 @@ run_spanner_query_tests() {
 
     assert_row_count \
         "Multi-column projection" \
-        "SELECT * FROM $(spanner_query_source "SELECT Id, StringCol, Int64Col FROM ScalarTypes ORDER BY Id")" \
+        "SELECT * FROM $(spanner_query_source 'SELECT Id, StringCol, Int64Col FROM ScalarTypes ORDER BY Id')" \
         3
 
     echo ""
@@ -518,12 +519,12 @@ run_spanner_query_tests() {
 
     assert_row_count \
         "DuckDB WHERE on spanner results" \
-        "SELECT * FROM $(spanner_query_source "SELECT Id, StringCol FROM ScalarTypes") WHERE Id > 1" \
+        "SELECT * FROM $(spanner_query_source 'SELECT Id, StringCol FROM ScalarTypes') WHERE Id > 1" \
         2
 
     assert_eq \
         "DuckDB aggregate on spanner results" \
-        "SELECT SUM(Int64Col) FROM $(spanner_query_source "SELECT Int64Col FROM ScalarTypes")" \
+        "SELECT SUM(Int64Col) FROM $(spanner_query_source 'SELECT Int64Col FROM ScalarTypes')" \
         "-58"
 
     echo ""
@@ -533,12 +534,12 @@ run_spanner_query_tests() {
 
     assert_eq \
         "Spanner WHERE clause" \
-        "SELECT * FROM $(spanner_query_source "SELECT StringCol FROM ScalarTypes WHERE Id = 2")" \
+        "SELECT * FROM $(spanner_query_source 'SELECT StringCol FROM ScalarTypes WHERE Id = 2')" \
         "world"
 
     assert_row_count \
         "Spanner WHERE with no matches" \
-        "SELECT * FROM $(spanner_query_source "SELECT * FROM ScalarTypes WHERE Id = 999")" \
+        "SELECT * FROM $(spanner_query_source 'SELECT * FROM ScalarTypes WHERE Id = 999')" \
         0
 
     echo ""
@@ -548,12 +549,12 @@ run_spanner_query_tests() {
 
     assert_row_count \
         "Spanner LIMIT" \
-        "SELECT * FROM $(spanner_query_source "SELECT Id FROM ScalarTypes ORDER BY Id LIMIT 2")" \
+        "SELECT * FROM $(spanner_query_source 'SELECT Id FROM ScalarTypes ORDER BY Id LIMIT 2')" \
         2
 
     assert_eq \
         "Spanner expression" \
-        "SELECT * FROM $(spanner_query_source "SELECT Int64Col * 2 AS doubled FROM ScalarTypes WHERE Id = 1")" \
+        "SELECT * FROM $(spanner_query_source 'SELECT Int64Col * 2 AS doubled FROM ScalarTypes WHERE Id = 1')" \
         "84"
 }
 
@@ -567,12 +568,12 @@ run_spanner_scan_tests() {
 
     assert_row_count \
         "Scan all rows" \
-        "SELECT * FROM $(spanner_scan_source "ScalarTypes")" \
+        "SELECT * FROM $(spanner_scan_source 'ScalarTypes')" \
         3
 
     assert_row_count \
         "Scan empty table" \
-        "SELECT * FROM $(spanner_scan_source "EmptyTable")" \
+        "SELECT * FROM $(spanner_scan_source 'EmptyTable')" \
         0
 
     echo ""
@@ -582,12 +583,12 @@ run_spanner_scan_tests() {
 
     assert_row_count \
         "Scan with column selection" \
-        "SELECT StringCol FROM $(spanner_scan_source "ScalarTypes")" \
+        "SELECT StringCol FROM $(spanner_scan_source 'ScalarTypes')" \
         3
 
     assert_row_count \
         "Scan with two columns" \
-        "SELECT Id, StringCol FROM $(spanner_scan_source "ScalarTypes")" \
+        "SELECT Id, StringCol FROM $(spanner_scan_source 'ScalarTypes')" \
         3
 
     echo ""
@@ -597,12 +598,12 @@ run_spanner_scan_tests() {
 
     assert_row_count \
         "DuckDB WHERE on scan results" \
-        "SELECT * FROM $(spanner_scan_source "ScalarTypes") WHERE Id = 1" \
+        "SELECT * FROM $(spanner_scan_source 'ScalarTypes') WHERE Id = 1" \
         1
 
     assert_eq \
         "Scan with DuckDB aggregate" \
-        "SELECT SUM(Int64Col) FROM $(spanner_scan_source "ScalarTypes")" \
+        "SELECT SUM(Int64Col) FROM $(spanner_scan_source 'ScalarTypes')" \
         "-58"
 
     echo ""
@@ -612,22 +613,22 @@ run_spanner_scan_tests() {
 
     assert_eq \
         "Scan BOOL value" \
-        "SELECT BoolCol FROM $(spanner_scan_source "ScalarTypes") WHERE Id = 1" \
+        "SELECT BoolCol FROM $(spanner_scan_source 'ScalarTypes') WHERE Id = 1" \
         "true"
 
     assert_contains \
         "Scan FLOAT64 value" \
-        "SELECT Float64Col FROM $(spanner_scan_source "ScalarTypes") WHERE Id = 1" \
+        "SELECT Float64Col FROM $(spanner_scan_source 'ScalarTypes') WHERE Id = 1" \
         "3.14"
 
     assert_eq \
         "Scan DATE value" \
-        "SELECT DateCol FROM $(spanner_scan_source "ScalarTypes") WHERE Id = 1" \
+        "SELECT DateCol FROM $(spanner_scan_source 'ScalarTypes') WHERE Id = 1" \
         "2024-01-15"
 
     assert_contains \
         "Scan TIMESTAMP value" \
-        "SELECT TimestampCol FROM $(spanner_scan_source "ScalarTypes") WHERE Id = 1" \
+        "SELECT TimestampCol FROM $(spanner_scan_source 'ScalarTypes') WHERE Id = 1" \
         "2024-06-15"
 
     echo ""
@@ -637,12 +638,12 @@ run_spanner_scan_tests() {
 
     assert_contains \
         "Scan NUMERIC value" \
-        "SELECT NumCol FROM $(spanner_scan_source "NumericTypes") WHERE Id = 1" \
+        "SELECT NumCol FROM $(spanner_scan_source 'NumericTypes') WHERE Id = 1" \
         "123.456789"
 
     assert_contains \
         "Scan JSON value" \
-        "SELECT JsonCol FROM $(spanner_scan_source "NumericTypes") WHERE Id = 1" \
+        "SELECT JsonCol FROM $(spanner_scan_source 'NumericTypes') WHERE Id = 1" \
         "key"
 }
 

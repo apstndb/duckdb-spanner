@@ -25,6 +25,8 @@ use crate::{bind_utils, runtime};
 
 static ADMIN_CLIENT_CACHE: LazyLock<Mutex<HashMap<String, Arc<AdminClient>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+static EMULATOR_OPERATIONS_CHANNEL_CACHE: LazyLock<Mutex<HashMap<String, Channel>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Get or create a Spanner Admin client.
 ///
@@ -510,7 +512,7 @@ async fn list_database_operations(
 ) -> Result<Vec<OperationRow>, SpannerError> {
     // The emulator only implements google.longrunning.Operations/ListOperations,
     // while real Spanner exposes DatabaseAdmin/ListDatabaseOperations with auth.
-    let operations = match endpoint
+    let mut operations = match endpoint
         .map(str::to_owned)
         .or_else(|| std::env::var("SPANNER_EMULATOR_HOST").ok())
     {
@@ -519,6 +521,11 @@ async fn list_database_operations(
         }
         None => list_real_database_operations(database_path, filter).await?,
     };
+
+    // ListDatabaseOperations is instance-scoped, so keep the table function's
+    // per-database contract by trimming unrelated operations client-side.
+    let database_operation_prefix = database_operation_prefix(database_path);
+    operations.retain(|op| op.name.starts_with(&database_operation_prefix));
 
     Ok(operations.into_iter().map(operation_to_row).collect())
 }
@@ -546,17 +553,7 @@ async fn list_emulator_database_operations(
     endpoint: &str,
     filter: Option<&str>,
 ) -> Result<Vec<InternalOperation>, SpannerError> {
-    let url = if endpoint.starts_with("http") {
-        endpoint.to_string()
-    } else {
-        format!("http://{endpoint}")
-    };
-    let channel = Channel::from_shared(url)
-        .map_err(|e| SpannerError::Other(format!("Invalid endpoint: {e}")))?
-        .connect()
-        .await
-        .map_err(|e| SpannerError::Other(format!("Connect error: {e}")))?;
-
+    let channel = get_or_create_emulator_operations_channel(endpoint).await?;
     let mut client = OperationsClient::new(channel);
     let mut all_operations = Vec::new();
     let mut page_token = String::new();
@@ -586,6 +583,45 @@ async fn list_emulator_database_operations(
     Ok(all_operations)
 }
 
+async fn get_or_create_emulator_operations_channel(
+    endpoint: &str,
+) -> Result<Channel, SpannerError> {
+    let cache_key = emulator_endpoint_url(endpoint);
+
+    {
+        let cache = EMULATOR_OPERATIONS_CHANNEL_CACHE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(channel) = cache.get(&cache_key) {
+            return Ok(channel.clone());
+        }
+    }
+
+    let channel = Channel::from_shared(cache_key.clone())
+        .map_err(|e| SpannerError::Other(format!("Invalid endpoint: {e}")))?
+        .connect()
+        .await
+        .map_err(|e| SpannerError::Other(format!("Connect error: {e}")))?;
+
+    let mut cache = EMULATOR_OPERATIONS_CHANNEL_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let entry = cache.entry(cache_key).or_insert_with(|| channel.clone());
+    Ok(entry.clone())
+}
+
+fn emulator_endpoint_url(endpoint: &str) -> String {
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else {
+        format!("http://{endpoint}")
+    }
+}
+
+fn database_operation_prefix(database_path: &str) -> String {
+    format!("{database_path}/operations/")
+}
+
 fn instance_path_from_database_path(database_path: &str) -> Result<&str, SpannerError> {
     database_path
         .rsplit_once("/databases/")
@@ -599,7 +635,9 @@ fn instance_path_from_database_path(database_path: &str) -> Result<&str, Spanner
 
 #[cfg(test)]
 mod tests {
-    use super::instance_path_from_database_path;
+    use google_cloud_googleapis::longrunning::Operation as InternalOperation;
+
+    use super::{database_operation_prefix, instance_path_from_database_path};
 
     #[test]
     fn test_instance_path_from_database_path() {
@@ -608,5 +646,40 @@ mod tests {
             "projects/p/instances/i"
         );
         assert!(instance_path_from_database_path("projects/p/instances/i").is_err());
+    }
+
+    #[test]
+    fn test_database_operation_prefix() {
+        assert_eq!(
+            database_operation_prefix("projects/p/instances/i/databases/d"),
+            "projects/p/instances/i/databases/d/operations/"
+        );
+    }
+
+    #[test]
+    fn test_database_operation_prefix_filters_other_databases() {
+        let database_path = "projects/p/instances/i/databases/d";
+        let prefix = database_operation_prefix(database_path);
+        let operations = vec![
+            InternalOperation {
+                name: format!("{database_path}/operations/op-1"),
+                ..Default::default()
+            },
+            InternalOperation {
+                name: "projects/p/instances/i/databases/other/operations/op-2".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let matching_names: Vec<_> = operations
+            .into_iter()
+            .filter(|op| op.name.starts_with(&prefix))
+            .map(|op| op.name)
+            .collect();
+
+        assert_eq!(
+            matching_names,
+            vec![format!("{database_path}/operations/op-1")]
+        );
     }
 }
