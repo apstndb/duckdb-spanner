@@ -27,7 +27,7 @@ DUCKDB_VERSION ?= $(shell duckdb --version 2>/dev/null | sed -nE 's/^v?([0-9]+\.
 ifeq ($(DUCKDB_VERSION),)
 DUCKDB_VERSION := v1.5.2
 endif
-EXT_VERSION := v0.1.0
+EXT_VERSION := v0.3.0
 SWEEP_DAYS ?= 3
 
 build:

@@ -1,6 +1,6 @@
 [package]
 name = "duckdb-spanner"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "DuckDB extension for querying Google Cloud Spanner databases"
 repository = "https://github.com/apstndb/duckdb-spanner"
