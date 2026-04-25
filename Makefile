@@ -29,7 +29,10 @@ DUCKDB_VERSION := v1.5.2
 endif
 # Keep the existing v-prefixed extension metadata while deriving the numeric
 # version from the crate package section to avoid manual drift.
-EXT_VERSION := $(shell awk -F'"' '/^\[package\]/{in_pkg=1; next} /^\[/{in_pkg=0} in_pkg && /^version = /{print "v"$$2; exit}' Cargo.toml)
+EXT_VERSION ?= $(shell awk -F'"' '/^[[:space:]]*\[package\]/{in_pkg=1; next} /^[[:space:]]*\[/{in_pkg=0} in_pkg && /^[[:space:]]*version[[:space:]]*=[[:space:]]*/{print "v"$$2; exit}' Cargo.toml)
+ifeq ($(strip $(EXT_VERSION)),)
+$(error EXT_VERSION is empty; failed to derive it from Cargo.toml. Set EXT_VERSION explicitly or update the Cargo.toml parsing logic.)
+endif
 SWEEP_DAYS ?= 3
 
 build:
