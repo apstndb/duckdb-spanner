@@ -102,6 +102,8 @@ When using the Spanner emulator, no authentication is required. Either set the `
 export SPANNER_EMULATOR_HOST=localhost:9010
 ```
 
+Passing `endpoint` explicitly switches the client to emulator-style behavior (plaintext, no auth). Use `endpoint` for the emulator or other local test endpoints; for real Spanner, omit it and rely on ADC.
+
 ## Getting Started
 
 ### Configure the Database
@@ -286,13 +288,15 @@ Returns one row with `operation_name` (VARCHAR) and `done` (BOOLEAN).
 
 ### `spanner_operations`
 
-Lists DDL operations for a database via the `google.longrunning.Operations` API.
+Lists DDL operations for a database.
+
+On real Spanner this uses the Database Admin `ListDatabaseOperations` API with normal authenticated admin clients. On the emulator it falls back to the generic `google.longrunning.Operations/ListOperations` API because the emulator does not implement `ListDatabaseOperations`.
 
 ```sql
 SELECT * FROM spanner_operations();
 ```
 
-Returns rows with `operation_name` (VARCHAR), `done` (BOOLEAN), `metadata_type` (VARCHAR), and `error` (VARCHAR).
+Returns rows with `name` (VARCHAR), `done` (BOOLEAN), `metadata_type` (VARCHAR), `error_code` (INTEGER), and `error_message` (VARCHAR).
 
 An optional `filter` parameter can be used:
 
@@ -323,6 +327,8 @@ Options:
 | `batch_size` | VARCHAR | `1000` | Number of rows per commit |
 
 The file path argument specifies the target Spanner table name. Source columns are mapped to Spanner columns by position (column count must match).
+
+Current `COPY TO ... FORMAT spanner` support is scalar-focused. LIST/STRUCT source columns are not yet supported by the copy writer.
 
 ```sql
 -- Write query results to a Spanner table
@@ -440,17 +446,30 @@ Shell tests run SQL queries against a DuckDB CLI with the extension loaded:
 make test
 ```
 
-### Integration Tests
+`make test` builds `spanner.duckdb_extension`, starts or reuses a local emulator container, and exercises the current user-facing SQL macros via DuckDB CLI. It expects Docker, DuckDB CLI, and `curl`.
 
-Integration tests require a Spanner emulator:
+### Rust Integration Tests
+
+Rust integration tests use testcontainers to start the emulator automatically. You only need a running Docker daemon:
 
 ```bash
-# Start the emulator
-make emulator-start
-
-# Run integration tests (uses testcontainers, but the emulator must be available)
 cargo test
 ```
+
+`.cargo/config.toml` sets `RUST_TEST_THREADS=4` to keep Docker/testcontainers resource usage bounded during concurrent test runs.
+
+### Library-Mode Macro Tests
+
+If you register the raw `_raw` table functions manually from Rust and then execute `src/macros.sql` yourself, mirror the integration test setup first:
+
+```sql
+LOAD core_functions;
+LOAD json;
+INSTALL icu;
+LOAD icu;
+```
+
+Those loads are required because the helper macros in `src/macros.sql` depend on `to_json`, `base64`, and `AT TIME ZONE`.
 
 ### Cleaning Stale Build Artifacts
 
