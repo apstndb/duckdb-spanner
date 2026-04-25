@@ -541,6 +541,8 @@ async fn list_real_database_operations(
         page_size: 0,
         page_token: String::new(),
     };
+    // The gcloud-spanner admin helper eagerly follows next_page_token and
+    // returns a flattened Vec<Operation>, so no extra pagination loop is needed here.
     admin
         .database()
         .list_database_operations(req, None)
