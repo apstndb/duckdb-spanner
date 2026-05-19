@@ -52,8 +52,8 @@ impl TimestampBoundConfig {
 /// The pointer is extracted via reinterpret cast because `Value::ptr` is
 /// `pub(crate)`. The static_assert verifies Value is a single-pointer struct.
 ///
-/// TODO: Replace this entire function with `value.is_null()` once
-/// duckdb/duckdb-rs#676 is merged.
+/// As of duckdb-rs 1.10502.0, the vtab `Value` wrapper still has no public
+/// null-check method. Replace this with a safe upstream API once one exists.
 fn value_is_null(value: &duckdb::vtab::Value) -> bool {
     // SAFETY: `duckdb::vtab::Value` wraps a single `duckdb_value` (a pointer) as its
     // only field. We reinterpret the reference to read that pointer.

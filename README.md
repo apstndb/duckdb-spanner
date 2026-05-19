@@ -20,14 +20,35 @@ On macOS, prefer the bottled Homebrew binary:
 brew install cargo-sweep
 ```
 
-## Known Issues
+## Known Issues and Limitations
+
+- The DuckDB Rust binding is pinned to `duckdb = "=1.10502.0"`, which matches DuckDB `v1.5.2`.
+  The upstream Rust extension template still requires the unstable C API (`USE_UNSTABLE_C_API=1` / `C_STRUCT_UNSTABLE`), so loadable extension binaries remain tied to the DuckDB version encoded in the extension metadata.
+  The extension requests at least the DuckDB `v1.5.0` C API at load time because it uses C API functions added in the 1.5 line.
+  Keep `DUCKDB_VERSION` aligned with the DuckDB CLI or runtime you plan to load the extension into.
 
 - This project depends on a patched version of [gcloud-spanner](https://github.com/yoshidan/google-cloud-rust) via `[patch.crates-io]`.
   The upstream `RowIterator::try_recv()` discards metadata and stats when a `PartialResultSet` has empty values, which breaks `columns_metadata()` and `stats()` for `QueryMode::Plan`, empty result sets, and other scenarios.
   See [yoshidan/google-cloud-rust#428](https://github.com/yoshidan/google-cloud-rust/pull/428) for details.
   Additionally, `Client::get_session` and `RowIterator::new` are made public for concurrent partition execution.
 
+- Extension initialization is intentionally manual rather than using `#[duckdb_entrypoint_c_api]`.
+  The extension needs a raw `duckdb_connection` to register session config options and the `COPY TO ... FORMAT spanner` copy function, and duckdb-rs currently exposes those APIs only through `duckdb::ffi`.
+
+- DuckDB `VARIANT` is not used yet.
+  Spanner JSON results currently map to DuckDB `VARCHAR` with the `JSON` alias.
+  DuckDB 1.5 adds `VARIANT`, but duckdb-rs `1.10502.0` does not expose a `VARIANT` logical type or writer API, and changing JSON output to `VARIANT` would be a visible result-type change.
+
+- DuckDB `GEOMETRY` is not used yet.
+  DuckDB 1.5 exposes `GEOMETRY` in the C API, but duckdb-rs `1.10502.0` does not wrap it in `LogicalTypeId`, and this extension has no current Spanner type mapping that requires geometry output.
+
+- Some DuckDB operations still use raw C API escape hatches because safe duckdb-rs wrappers are missing for the exact operation:
+  named-parameter NULL checks (`src/bind_utils.rs`) and fast UTF-8 string vector writes (`src/convert.rs`).
+  Keep the layout checks and local safety comments when touching those paths.
+
 - `database_role` ([fine-grained access control](https://cloud.google.com/spanner/docs/fgac-about)) is not yet supported as a named parameter. The upstream gcloud-spanner `SessionConfig` does not expose `creator_role` for session creation (the underlying `BatchCreateSessionsRequest.session_template` supports it, but the Rust client hardcodes it to `None`).
+
+- `COPY TO ... FORMAT spanner` is scalar-focused. LIST and STRUCT source columns are not yet supported by the copy writer.
 
 - Results are streamed via an internal channel. Memory usage is bounded regardless of result set size.
 

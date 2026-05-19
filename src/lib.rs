@@ -18,6 +18,9 @@ pub use query::SpannerQueryVTab;
 pub use scan::SpannerScanVTab;
 
 #[cfg(feature = "loadable-extension")]
+const MIN_DUCKDB_C_API_VERSION: &str = "v1.5.0";
+
+#[cfg(feature = "loadable-extension")]
 fn extension_entrypoint(con: duckdb::Connection) -> Result<(), Box<dyn std::error::Error>> {
     con.register_table_function::<SpannerQueryVTab>("spanner_query_raw")?;
     con.register_table_function::<SpannerScanVTab>("spanner_scan")?;
@@ -40,7 +43,7 @@ unsafe fn spanner_init_c_api_internal(
 ) -> Result<bool, Box<dyn std::error::Error>> {
     unsafe {
         let have_api_struct =
-            duckdb::ffi::duckdb_rs_extension_api_init(info, access, "v1.2.0")?;
+            duckdb::ffi::duckdb_rs_extension_api_init(info, access, MIN_DUCKDB_C_API_VERSION)?;
         if !have_api_struct {
             return Ok(false);
         }
