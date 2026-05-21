@@ -13,7 +13,7 @@ pub fn spanner_type_to_logical(spanner_type: &Type) -> LogicalTypeHandle {
         TypeCode::Numeric => LogicalTypeHandle::decimal(38, 9),
         TypeCode::String => LogicalTypeHandle::from(LogicalTypeId::Varchar),
         TypeCode::Json => {
-            let lt = LogicalTypeHandle::from(LogicalTypeId::Varchar);
+            let mut lt = LogicalTypeHandle::from(LogicalTypeId::Varchar);
             lt.set_alias("JSON");
             lt
         }

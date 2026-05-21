@@ -214,9 +214,13 @@ impl VTab for SpannerDdlVTab {
                 let col_name = output.flat_vector(0);
                 col_name.insert(0, &r.operation_name);
                 let mut col_done = output.flat_vector(1);
-                col_done.as_mut_slice::<bool>()[0] = r.done;
                 let mut col_duration = output.flat_vector(2);
-                col_duration.as_mut_slice::<f64>()[0] = r.duration_secs;
+                // SAFETY: the bind phase registers these columns as BOOLEAN and DOUBLE,
+                // and index 0 is within the single-row output batch.
+                unsafe {
+                    col_done.as_mut_slice::<bool>()[0] = r.done;
+                    col_duration.as_mut_slice::<f64>()[0] = r.duration_secs;
+                }
                 output.set_len(1);
             }
             None => {
@@ -336,7 +340,11 @@ impl VTab for SpannerDdlAsyncVTab {
                 let col_name = output.flat_vector(0);
                 col_name.insert(0, &r.operation_name);
                 let mut col_done = output.flat_vector(1);
-                col_done.as_mut_slice::<bool>()[0] = r.done;
+                // SAFETY: the bind phase registers this column as BOOLEAN, and index 0
+                // is within the single-row output batch.
+                unsafe {
+                    col_done.as_mut_slice::<bool>()[0] = r.done;
+                }
                 output.set_len(1);
             }
             None => {
@@ -458,11 +466,16 @@ impl VTab for SpannerOperationsVTab {
         let mut col_error_code = output.flat_vector(3);
         let col_error_message = output.flat_vector(4);
 
+        // SAFETY: the bind phase registers these columns as BOOLEAN and INTEGER,
+        // and the loop only writes indices within the drained batch size.
+        let done_values = unsafe { col_done.as_mut_slice::<bool>() };
+        let error_code_values = unsafe { col_error_code.as_mut_slice::<i32>() };
+
         for (i, row) in batch.iter().enumerate() {
             col_name.insert(i, &row.name);
-            col_done.as_mut_slice::<bool>()[i] = row.done;
+            done_values[i] = row.done;
             col_metadata_type.insert(i, &row.metadata_type);
-            col_error_code.as_mut_slice::<i32>()[i] = row.error_code;
+            error_code_values[i] = row.error_code;
             col_error_message.insert(i, &row.error_message);
         }
 
