@@ -23,6 +23,7 @@ use duckdb::ffi;
 use google_cloud_googleapis::spanner::admin::database::v1::DatabaseDialect;
 use google_cloud_googleapis::spanner::v1::mutation;
 use google_cloud_googleapis::spanner::v1::Mutation;
+use google_cloud_googleapis::spanner::v1::Type;
 use google_cloud_spanner::client::Client;
 use prost_types::value::Kind;
 use prost_types::{ListValue, Value};
@@ -66,6 +67,10 @@ struct ColumnMeta {
     decimal_scale: u8,
     /// DECIMAL internal storage type (0 for non-decimal types).
     decimal_internal_type: u32,
+    /// Fixed length for DuckDB ARRAY columns (0 for non-ARRAY types).
+    array_size: usize,
+    /// Child metadata for DuckDB LIST/ARRAY columns.
+    child: Option<Box<ColumnMeta>>,
     /// Target Spanner column type code (populated during GlobalInit).
     spanner_type_code: i32,
 }
@@ -213,26 +218,9 @@ unsafe fn copy_bind_inner(
 
     for i in 0..column_count {
         let logical_type = ffi::duckdb_copy_function_bind_get_column_type(info, i as u64);
-        let type_id = ffi::duckdb_get_type_id(logical_type);
-
-        let (decimal_scale, decimal_internal_type) =
-            if type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL {
-                (
-                    ffi::duckdb_decimal_scale(logical_type),
-                    ffi::duckdb_decimal_internal_type(logical_type),
-                )
-            } else {
-                (0, 0)
-            };
-
+        let column = column_meta_from_logical_type(logical_type)?;
         ffi::duckdb_destroy_logical_type(&mut { logical_type });
-
-        columns.push(ColumnMeta {
-            type_id,
-            decimal_scale,
-            decimal_internal_type,
-            spanner_type_code: 0, // populated during GlobalInit
-        });
+        columns.push(column);
     }
 
     let data = Box::new(CopyBindData {
@@ -304,7 +292,7 @@ unsafe fn copy_global_init_inner(
     // Enrich DuckDB column metadata with Spanner target type codes
     let mut columns = bind_data.columns.clone();
     for (col, schema_col) in columns.iter_mut().zip(schema_columns.iter()) {
-        col.spanner_type_code = schema_col.spanner_type.code;
+        apply_spanner_type(col, &schema_col.spanner_type)?;
     }
 
     let state = Box::new(CopyGlobalState {
@@ -344,23 +332,14 @@ unsafe fn copy_sink_inner(
 
     let col_count = state.columns.len();
 
-    // Pre-fetch vector data/validity pointers (these don't change within a chunk)
     let vectors: Vec<ffi::duckdb_vector> = (0..col_count)
         .map(|i| ffi::duckdb_data_chunk_get_vector(chunk, i as u64))
         .collect();
-    let data_ptrs: Vec<*mut c_void> = vectors.iter().map(|v| ffi::duckdb_vector_get_data(*v)).collect();
-    let validity_ptrs: Vec<*mut u64> =
-        vectors.iter().map(|v| ffi::duckdb_vector_get_validity(*v)).collect();
 
     for row_idx in 0..row_count {
         let mut values = Vec::with_capacity(col_count);
         for col_idx in 0..col_count {
-            let val = read_duckdb_value(
-                data_ptrs[col_idx],
-                validity_ptrs[col_idx],
-                row_idx,
-                &state.columns[col_idx],
-            )?;
+            let val = read_duckdb_value(vectors[col_idx], row_idx, &state.columns[col_idx])?;
             values.push(val);
         }
         state.buffer.push(ListValue { values });
@@ -388,6 +367,81 @@ unsafe fn copy_finalize_inner(
         "[duckdb-spanner] COPY TO '{}': {} rows written",
         state.table_name, state.rows_written
     );
+
+    Ok(())
+}
+
+unsafe fn column_meta_from_logical_type(
+    logical_type: ffi::duckdb_logical_type,
+) -> Result<ColumnMeta, String> {
+    if logical_type.is_null() {
+        return Err("DuckDB returned null logical type for COPY source column".to_string());
+    }
+
+    let type_id = ffi::duckdb_get_type_id(logical_type);
+    let (decimal_scale, decimal_internal_type) = if type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL
+    {
+        (
+            ffi::duckdb_decimal_scale(logical_type),
+            ffi::duckdb_decimal_internal_type(logical_type),
+        )
+    } else {
+        (0, 0)
+    };
+
+    let (array_size, child) = match type_id {
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST => {
+            let child_type = ffi::duckdb_list_type_child_type(logical_type);
+            let child = column_meta_from_logical_type(child_type)?;
+            ffi::duckdb_destroy_logical_type(&mut { child_type });
+            (0, Some(Box::new(child)))
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_ARRAY => {
+            let child_type = ffi::duckdb_array_type_child_type(logical_type);
+            let child = column_meta_from_logical_type(child_type)?;
+            ffi::duckdb_destroy_logical_type(&mut { child_type });
+            (
+                ffi::duckdb_array_type_array_size(logical_type) as usize,
+                Some(Box::new(child)),
+            )
+        }
+        _ => (0, None),
+    };
+
+    Ok(ColumnMeta {
+        type_id,
+        decimal_scale,
+        decimal_internal_type,
+        array_size,
+        child,
+        spanner_type_code: 0,
+    })
+}
+
+fn apply_spanner_type(col: &mut ColumnMeta, spanner_type: &Type) -> Result<(), String> {
+    use google_cloud_googleapis::spanner::v1::TypeCode;
+
+    col.spanner_type_code = spanner_type.code;
+    let source_is_array = col.type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST
+        || col.type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_ARRAY;
+
+    if source_is_array {
+        if spanner_type.code != TypeCode::Array as i32 {
+            return Err(format!(
+                "DuckDB LIST/ARRAY source column requires a Spanner ARRAY target, got TypeCode {}",
+                spanner_type.code
+            ));
+        }
+
+        let child = col.child.as_deref_mut().ok_or_else(|| {
+            "DuckDB LIST/ARRAY source column is missing child metadata".to_string()
+        })?;
+        let elem_type = spanner_type
+            .array_element_type
+            .as_deref()
+            .ok_or_else(|| "Spanner ARRAY target is missing element type metadata".to_string())?;
+        apply_spanner_type(child, elem_type)?;
+    }
 
     Ok(())
 }
@@ -589,11 +643,13 @@ fn build_mutation(
 /// - `validity` may be null (meaning all rows are valid)
 /// - `row_idx` must be within the chunk's row count
 unsafe fn read_duckdb_value(
-    data: *mut c_void,
-    validity: *mut u64,
+    vector: ffi::duckdb_vector,
     row_idx: usize,
     col: &ColumnMeta,
 ) -> Result<Value, String> {
+    let data = ffi::duckdb_vector_get_data(vector);
+    let validity = ffi::duckdb_vector_get_validity(vector);
+
     // NULL check
     if !validity.is_null() && !ffi::duckdb_validity_row_is_valid(validity, row_idx as u64) {
         return Ok(Value {
@@ -726,6 +782,33 @@ unsafe fn read_duckdb_value(
             // Reverse the MSB flip DuckDB applies for sort ordering
             let uuid_bits = raw ^ (1u128 << 127);
             Kind::StringValue(uuid::Uuid::from_u128(uuid_bits).to_string())
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST => {
+            let child = col
+                .child
+                .as_deref()
+                .ok_or_else(|| "DuckDB LIST source column is missing child metadata".to_string())?;
+            let entry = *data.cast::<ffi::duckdb_list_entry>().add(row_idx);
+            let child_vector = ffi::duckdb_list_vector_get_child(vector);
+            let mut values = Vec::with_capacity(entry.length as usize);
+            for child_idx in entry.offset..entry.offset + entry.length {
+                values.push(read_duckdb_value(child_vector, child_idx as usize, child)?);
+            }
+            Kind::ListValue(ListValue { values })
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_ARRAY => {
+            let child = col.child.as_deref().ok_or_else(|| {
+                "DuckDB ARRAY source column is missing child metadata".to_string()
+            })?;
+            let child_vector = ffi::duckdb_array_vector_get_child(vector);
+            let start = row_idx
+                .checked_mul(col.array_size)
+                .ok_or_else(|| "DuckDB ARRAY child offset overflow".to_string())?;
+            let mut values = Vec::with_capacity(col.array_size);
+            for child_idx in start..start + col.array_size {
+                values.push(read_duckdb_value(child_vector, child_idx, child)?);
+            }
+            Kind::ListValue(ListValue { values })
         }
         _ => {
             return Err(format!(

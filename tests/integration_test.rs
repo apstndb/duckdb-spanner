@@ -163,6 +163,27 @@ fn exec_spanner_one(sql: &str) -> google_cloud_spanner::row::Row {
     rows.into_iter().next().unwrap()
 }
 
+fn exec_spanner_on(
+    db: &spanemuboost::SpanEmuDatabase,
+    sql: &str,
+) -> Vec<google_cloud_spanner::row::Row> {
+    test_runtime().block_on(async {
+        let config = ClientConfig {
+            environment: Environment::Emulator(db.emulator_host().to_string()),
+            ..Default::default()
+        };
+        let client = Client::new(db.database_path(), config).await.unwrap();
+        let mut tx = client.single().await.unwrap();
+        let stmt = Statement::new(sql);
+        let mut iter = tx.query(stmt).await.unwrap();
+        let mut rows = Vec::new();
+        while let Some(row) = iter.next().await.unwrap() {
+            rows.push(row);
+        }
+        rows
+    })
+}
+
 // DuckDB VTab helpers
 
 fn create_duckdb_connection() -> Connection {
@@ -1281,6 +1302,12 @@ fn get_pg_copy_db() -> &'static spanemuboost::SpanEmuDatabase {
                         value double precision, \
                         PRIMARY KEY (id)\
                     )".into(),
+                    "CREATE TABLE pgsql_copy_array_target (\
+                        id bigint NOT NULL, \
+                        int_array bigint[], \
+                        str_array character varying[], \
+                        PRIMARY KEY (id)\
+                    )".into(),
                 ],
                 vec![],
             ).await.expect("Failed to create PG COPY database")
@@ -1674,6 +1701,36 @@ fn test_copy_to_with_nulls() {
 }
 
 #[test]
+fn test_copy_to_arrays() {
+    let conn = create_duckdb_connection_with_copy();
+    let db = get_gsql_db();
+
+    let sql = format!(
+        "COPY (SELECT * FROM (VALUES \
+            (CAST(900 AS BIGINT), [CAST(1 AS BIGINT), CAST(2 AS BIGINT), CAST(3 AS BIGINT)], ['x', 'y']), \
+            (CAST(901 AS BIGINT), CAST([] AS BIGINT[]), CAST([] AS VARCHAR[])), \
+            (CAST(902 AS BIGINT), CAST(NULL AS BIGINT[]), CAST(NULL AS VARCHAR[])) \
+        ) AS t(Id, IntArray, StrArray)) \
+        TO 'ArrayTypes' (FORMAT spanner, database_path '{}', endpoint '{}')",
+        db.database_path(),
+        db.emulator_host()
+    );
+    conn.execute_batch(&sql).unwrap();
+
+    let row = exec_spanner_one("SELECT IntArray, StrArray FROM ArrayTypes WHERE Id = 900");
+    assert_eq!(row.column::<Vec<i64>>(0).unwrap(), vec![1, 2, 3]);
+    assert_eq!(row.column::<Vec<String>>(1).unwrap(), vec!["x", "y"]);
+
+    let row = exec_spanner_one("SELECT IntArray, StrArray FROM ArrayTypes WHERE Id = 901");
+    assert!(row.column::<Vec<i64>>(0).unwrap().is_empty());
+    assert!(row.column::<Vec<String>>(1).unwrap().is_empty());
+
+    let row = exec_spanner_one("SELECT IntArray, StrArray FROM ArrayTypes WHERE Id = 902");
+    assert!(row.column::<Option<Vec<i64>>>(0).unwrap().is_none());
+    assert!(row.column::<Option<Vec<String>>>(1).unwrap().is_none());
+}
+
+#[test]
 fn test_copy_to_column_count_mismatch() {
     let conn = create_duckdb_connection_with_copy();
     let db = get_gsql_db();
@@ -1827,4 +1884,41 @@ fn test_pg_copy_to_basic() {
     assert_eq!(rows[0], (100, "alice".into(), 1.5));
     assert_eq!(rows[1], (101, "bob".into(), 2.5));
     assert_eq!(rows[2], (102, "charlie".into(), 3.5));
+}
+
+#[test]
+fn test_pg_copy_to_arrays() {
+    let conn = create_pg_duckdb_connection_with_copy();
+    let db = get_pg_copy_db();
+
+    let sql = format!(
+        "COPY (SELECT * FROM (VALUES \
+            (CAST(200 AS BIGINT), [CAST(10 AS BIGINT), CAST(20 AS BIGINT)], ['pg', 'array']), \
+            (CAST(201 AS BIGINT), CAST([] AS BIGINT[]), CAST([] AS VARCHAR[])), \
+            (CAST(202 AS BIGINT), CAST(NULL AS BIGINT[]), CAST(NULL AS VARCHAR[])) \
+        ) AS t(id, int_array, str_array)) \
+        TO 'pgsql_copy_array_target' (FORMAT spanner, database_path '{}', endpoint '{}')",
+        db.database_path(),
+        db.emulator_host()
+    );
+    conn.execute_batch(&sql).unwrap();
+
+    let rows = exec_spanner_on(
+        db,
+        "SELECT id, int_array, str_array FROM pgsql_copy_array_target WHERE id BETWEEN 200 AND 202 ORDER BY id",
+    );
+
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].column::<i64>(0).unwrap(), 200);
+    assert_eq!(rows[0].column::<Vec<i64>>(1).unwrap(), vec![10, 20]);
+    assert_eq!(
+        rows[0].column::<Vec<String>>(2).unwrap(),
+        vec!["pg", "array"]
+    );
+    assert_eq!(rows[1].column::<i64>(0).unwrap(), 201);
+    assert!(rows[1].column::<Vec<i64>>(1).unwrap().is_empty());
+    assert!(rows[1].column::<Vec<String>>(2).unwrap().is_empty());
+    assert_eq!(rows[2].column::<i64>(0).unwrap(), 202);
+    assert!(rows[2].column::<Option<Vec<i64>>>(1).unwrap().is_none());
+    assert!(rows[2].column::<Option<Vec<String>>>(2).unwrap().is_none());
 }

@@ -49,7 +49,7 @@ brew install cargo-sweep
 
 - `database_role` ([fine-grained access control](https://cloud.google.com/spanner/docs/fgac-about)) is not yet supported as a named parameter. The upstream gcloud-spanner `SessionConfig` does not expose `creator_role` for session creation (the underlying `BatchCreateSessionsRequest.session_template` supports it, but the Rust client hardcodes it to `None`).
 
-- `COPY TO ... FORMAT spanner` is scalar-focused. LIST and STRUCT source columns are not yet supported by the copy writer.
+- `COPY TO ... FORMAT spanner` supports scalar columns and DuckDB LIST/ARRAY source columns mapped to Spanner ARRAY targets. STRUCT source columns are not yet supported by the copy writer.
 
 - Results are streamed via an internal channel. Memory usage is bounded regardless of result set size.
 
@@ -350,7 +350,7 @@ Options:
 
 The file path argument specifies the target Spanner table name. Source columns are mapped to Spanner columns by position (column count must match).
 
-Current `COPY TO ... FORMAT spanner` support is scalar-focused. LIST/STRUCT source columns are not yet supported by the copy writer.
+`COPY TO ... FORMAT spanner` supports scalar columns and DuckDB LIST/ARRAY source columns mapped to Spanner ARRAY targets. STRUCT source columns are not yet supported by the copy writer.
 
 ```sql
 -- Write query results to a Spanner table
