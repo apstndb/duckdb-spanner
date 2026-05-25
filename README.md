@@ -22,7 +22,7 @@ brew install cargo-sweep
 
 ## Known Issues and Limitations
 
-- The DuckDB Rust binding is pinned to `duckdb = "=1.10503.0"`, which matches DuckDB `v1.5.3`.
+- The DuckDB Rust binding is pinned to `duckdb = "=1.10503.1"`, which matches DuckDB `v1.5.3`.
   The upstream Rust extension template still requires the unstable C API (`USE_UNSTABLE_C_API=1` / `C_STRUCT_UNSTABLE`), so loadable extension binaries remain tied to the DuckDB version encoded in the extension metadata.
   The extension requests at least the DuckDB `v1.5.0` C API at load time because it uses C API functions added in the 1.5 line.
   Keep `DUCKDB_VERSION` aligned with the DuckDB CLI or runtime you plan to load the extension into.
@@ -37,11 +37,11 @@ brew install cargo-sweep
 
 - DuckDB `VARIANT` is not used yet.
   Spanner JSON results currently map to DuckDB `VARCHAR` with the `JSON` alias.
-  DuckDB `v1.5.3` and duckdb-rs `1.10503.0` expose `VARIANT` metadata, and upstream DuckDB has C API support for reading `VARIANT`, but duckdb-rs still documents decoding `VARIANT` result columns as unsupported and this extension does not yet have a safe writer path for JSON-to-`VARIANT`.
+  DuckDB `v1.5.3` and duckdb-rs `1.10503.1` expose `VARIANT` metadata, and upstream DuckDB has C API support for reading `VARIANT`, but duckdb-rs still documents decoding `VARIANT` result columns as unsupported and this extension does not yet have a safe writer path for JSON-to-`VARIANT`.
   Changing JSON output to `VARIANT` would also be a visible result-type change.
 
 - DuckDB `GEOMETRY` is not used yet.
-  DuckDB 1.5 exposes `GEOMETRY` in the C API, but duckdb-rs `1.10503.0` does not wrap it in `LogicalTypeId`, and this extension has no current Spanner type mapping that requires geometry output.
+  DuckDB 1.5 exposes `GEOMETRY` in the C API, but duckdb-rs `1.10503.1` does not wrap it in `LogicalTypeId`, and this extension has no current Spanner type mapping that requires geometry output.
 
 - Some DuckDB vector writes still cross unsafe API boundaries:
   fast UTF-8 string vector writes use raw C API escape hatches because safe duckdb-rs wrappers are missing for the exact operation (`src/convert.rs`), and fixed-size vector slices use duckdb-rs `unsafe` APIs (`src/ddl.rs`, `src/convert.rs`).
