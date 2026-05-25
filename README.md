@@ -228,6 +228,15 @@ SELECT * FROM "spanner:Users";
 
 Replacement scans intentionally support only the table name. Use `spanner_scan(...)` directly when you need options such as `index`, timestamp bounds, priority, or Data Boost.
 
+### `spanner_tables`
+
+Lists Spanner base tables from `INFORMATION_SCHEMA.TABLES`.
+It accepts the same database identification parameters and config defaults as `spanner_query` and `spanner_scan`.
+
+```sql
+SELECT * FROM spanner_tables();
+```
+
 ### Config Options
 
 Session-level defaults can be set via `SET` statements. These are used when the corresponding named parameter is not specified.
@@ -244,9 +253,10 @@ Session-level defaults can be set via `SET` statements. These are used when the 
 
 The database is resolved in the following order (first match wins):
 
-1. **`project`/`instance`/`database` named args** (mixed with config fallback) — if any component is specified via named arg or config, all three must resolve or an error is raised
+1. **`project`/`instance`/`database` named args** (mixed with config fallback for omitted components) — if any component is specified via named arg, all three must resolve or an error is raised
 2. **`database_path` named arg** — full resource path
-3. **`spanner_database_path` config** — session-level default
+3. **`spanner_project`/`spanner_instance`/`spanner_database` config** — session-level component defaults
+4. **`spanner_database_path` config** — session-level full resource path default
 
 Named args override config values for each individual component. For example:
 
@@ -562,6 +572,7 @@ This extension registers the following names into the global DuckDB namespace.
 | `spanner_query` | table macro | Wraps `spanner_query_raw` with ergonomic params (see [Table Functions](#table-functions)) |
 | `spanner_query_raw` | table function | Execute Spanner SQL (see [Low-Level Table Function](#spanner_query_raw----low-level-table-function)) |
 | `spanner_scan` | table function | Read a Spanner table (see [Table Functions](#table-functions)) |
+| `spanner_tables` | table function | List Spanner base tables from `INFORMATION_SCHEMA.TABLES` |
 | `"spanner:Table"` | replacement scan | Shorthand for `spanner_scan('Table')` using configured session defaults |
 | `spanner_ddl` | table macro | Execute DDL synchronously (see [`spanner_ddl`](#spanner_ddl)) |
 | `spanner_ddl_async` | table macro | Submit DDL asynchronously (see [`spanner_ddl_async`](#spanner_ddl_async)) |

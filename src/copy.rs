@@ -579,28 +579,23 @@ unsafe fn value_to_string(val: ffi::duckdb_value) -> Option<String> {
 /// Resolve the Spanner database resource path from COPY options and config.
 ///
 /// Resolution order (matching `bind_utils::resolve_database_path`):
-/// 1. project/instance/database (option → config) — if any is present, all three required
+/// 1. project/instance/database options, with config fallback for omitted components
 /// 2. database_path option
-/// 3. spanner_database_path config
-/// 4. error
+/// 3. spanner_project/spanner_instance/spanner_database config
+/// 4. spanner_database_path config
+/// 5. error
 fn resolve_copy_database_path(
     opts: &std::collections::HashMap<String, String>,
     cfg: impl Fn(&str) -> Option<String>,
 ) -> Result<String, String> {
-    let project = opts
-        .get("project")
-        .cloned()
-        .or_else(|| cfg("spanner_project"));
-    let instance = opts
-        .get("instance")
-        .cloned()
-        .or_else(|| cfg("spanner_instance"));
-    let database = opts
-        .get("database")
-        .cloned()
-        .or_else(|| cfg("spanner_database"));
+    let project_opt = opts.get("project").cloned();
+    let instance_opt = opts.get("instance").cloned();
+    let database_opt = opts.get("database").cloned();
 
-    if project.is_some() || instance.is_some() || database.is_some() {
+    if project_opt.is_some() || instance_opt.is_some() || database_opt.is_some() {
+        let project = project_opt.or_else(|| cfg("spanner_project"));
+        let instance = instance_opt.or_else(|| cfg("spanner_instance"));
+        let database = database_opt.or_else(|| cfg("spanner_database"));
         let p = project.ok_or(
             "project is required when instance or database is specified. \
              Use project option or SET spanner_project = '...'")?;
@@ -615,6 +610,23 @@ fn resolve_copy_database_path(
 
     if let Some(path) = opts.get("database_path").cloned() {
         return Ok(path);
+    }
+
+    let project = cfg("spanner_project");
+    let instance = cfg("spanner_instance");
+    let database = cfg("spanner_database");
+
+    if project.is_some() || instance.is_some() || database.is_some() {
+        let p = project.ok_or(
+            "project is required when instance or database is specified. \
+             Use project option or SET spanner_project = '...'")?;
+        let i = instance.ok_or(
+            "instance is required when project or database is specified. \
+             Use instance option or SET spanner_instance = '...'")?;
+        let d = database.ok_or(
+            "database is required when project or instance is specified. \
+             Use database option or SET spanner_database = '...'")?;
+        return Ok(format!("projects/{p}/instances/{i}/databases/{d}"));
     }
 
     if let Some(path) = cfg("spanner_database_path") {

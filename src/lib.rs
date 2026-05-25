@@ -5,6 +5,7 @@ mod convert;
 mod copy;
 mod ddl;
 mod error;
+mod metadata;
 mod params;
 mod query;
 mod replacement;
@@ -16,6 +17,7 @@ mod types;
 pub use config::register_config_options;
 pub use copy::register_copy_function;
 pub use ddl::{SpannerDdlAsyncVTab, SpannerDdlVTab, SpannerOperationsVTab};
+pub use metadata::register_metadata_table_functions;
 pub use query::SpannerQueryVTab;
 pub use replacement::register_replacement_scan;
 pub use scan::SpannerScanVTab;
@@ -68,6 +70,7 @@ unsafe fn spanner_init_c_api_internal(
         }
         config::register_config_options(raw_con);
         copy::register_copy_function(raw_con);
+        metadata::register_metadata_table_functions(raw_con);
         replacement::register_replacement_scan(db);
         duckdb::ffi::duckdb_disconnect(&mut raw_con);
 

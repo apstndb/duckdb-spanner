@@ -85,8 +85,8 @@ pub unsafe fn get_config_string_from_context(
     }
     unsafe {
         let c_name = CString::new(option_name).ok()?;
-        let mut scope = ffi::duckdb_config_option_scope_DUCKDB_CONFIG_OPTION_SCOPE_INVALID;
-        let val = ffi::duckdb_client_context_get_config_option(ctx, c_name.as_ptr(), &mut scope);
+        let val =
+            ffi::duckdb_client_context_get_config_option(ctx, c_name.as_ptr(), ptr::null_mut());
 
         if val.is_null() {
             return None;

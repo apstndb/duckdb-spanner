@@ -146,25 +146,20 @@ pub fn resolve_timestamp_bound(
 /// Resolve the Spanner database resource path from named args and config options.
 ///
 /// Resolution order (named arg overrides config for each component):
-/// 1. project/instance/database (named arg ?? config) — if any component is resolved,
-///    all three must be present or error
+/// 1. project/instance/database named args, with config fallback for omitted components
 /// 2. database_path named arg
-/// 3. spanner_database_path config
-/// 4. error
+/// 3. spanner_project/spanner_instance/spanner_database config
+/// 4. spanner_database_path config
+/// 5. error
 pub fn resolve_database_path(bind: &BindInfo) -> Result<String, Box<dyn std::error::Error>> {
     let arg_project = get_named_string(bind, "project");
     let arg_instance = get_named_string(bind, "instance");
     let arg_database = get_named_string(bind, "database");
 
-    let cfg_project = config::get_config_string(bind, "spanner_project");
-    let cfg_instance = config::get_config_string(bind, "spanner_instance");
-    let cfg_database = config::get_config_string(bind, "spanner_database");
-
-    let project = arg_project.or(cfg_project);
-    let instance = arg_instance.or(cfg_instance);
-    let database = arg_database.or(cfg_database);
-
-    if project.is_some() || instance.is_some() || database.is_some() {
+    if arg_project.is_some() || arg_instance.is_some() || arg_database.is_some() {
+        let project = arg_project.or_else(|| config::get_config_string(bind, "spanner_project"));
+        let instance = arg_instance.or_else(|| config::get_config_string(bind, "spanner_instance"));
+        let database = arg_database.or_else(|| config::get_config_string(bind, "spanner_database"));
         let p = project.ok_or(
             "project is required when instance or database is specified. \
              Use project := '...' or SET spanner_project = '...'")?;
@@ -179,6 +174,23 @@ pub fn resolve_database_path(bind: &BindInfo) -> Result<String, Box<dyn std::err
 
     if let Some(path) = get_named_string(bind, "database_path") {
         return Ok(path);
+    }
+
+    let cfg_project = config::get_config_string(bind, "spanner_project");
+    let cfg_instance = config::get_config_string(bind, "spanner_instance");
+    let cfg_database = config::get_config_string(bind, "spanner_database");
+
+    if cfg_project.is_some() || cfg_instance.is_some() || cfg_database.is_some() {
+        let p = cfg_project.ok_or(
+            "project is required when instance or database is specified. \
+             Use project := '...' or SET spanner_project = '...'")?;
+        let i = cfg_instance.ok_or(
+            "instance is required when project or database is specified. \
+             Use instance := '...' or SET spanner_instance = '...'")?;
+        let d = cfg_database.ok_or(
+            "database is required when project or instance is specified. \
+             Use database := '...' or SET spanner_database = '...'")?;
+        return Ok(format!("projects/{p}/instances/{i}/databases/{d}"));
     }
 
     if let Some(path) = config::get_config_string(bind, "spanner_database_path") {

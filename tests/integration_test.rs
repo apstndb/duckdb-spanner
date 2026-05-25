@@ -4,9 +4,9 @@ use std::sync::{Arc, OnceLock};
 
 use duckdb::Connection;
 use duckdb_spanner::{
-    register_config_options, register_copy_function, register_replacement_scan,
-    SpannerDdlAsyncVTab, SpannerDdlVTab, SpannerOperationsVTab, SpannerQueryVTab,
-    SpannerScanVTab,
+    register_config_options, register_copy_function, register_metadata_table_functions,
+    register_replacement_scan, SpannerDdlAsyncVTab, SpannerDdlVTab, SpannerOperationsVTab,
+    SpannerQueryVTab, SpannerScanVTab,
 };
 use google_cloud_gax::conn::Environment;
 use google_cloud_googleapis::spanner::admin::database::v1::DatabaseDialect;
@@ -255,6 +255,29 @@ fn create_duckdb_connection_with_replacement_scan() -> Connection {
         conn.execute_batch(include_str!("../src/macros.sql"))
             .unwrap();
         conn
+    }
+}
+
+fn create_duckdb_connection_with_metadata_functions() -> Connection {
+    let _ = get_gsql_db();
+    unsafe {
+        let mut db: duckdb::ffi::duckdb_database = std::ptr::null_mut();
+        let mut c_err: *mut std::os::raw::c_char = std::ptr::null_mut();
+        let r = duckdb::ffi::duckdb_open_ext(
+            c":memory:".as_ptr(),
+            &mut db,
+            std::ptr::null_mut(),
+            &mut c_err,
+        );
+        assert_eq!(r, duckdb::ffi::DuckDBSuccess, "duckdb_open_ext failed");
+
+        let mut raw_con: duckdb::ffi::duckdb_connection = std::ptr::null_mut();
+        let rc = duckdb::ffi::duckdb_connect(db, &mut raw_con);
+        assert_eq!(rc, duckdb::ffi::DuckDBSuccess, "duckdb_connect failed");
+        register_metadata_table_functions(raw_con);
+        duckdb::ffi::duckdb_disconnect(&mut raw_con);
+
+        Connection::open_from_raw(db).unwrap()
     }
 }
 
@@ -783,6 +806,21 @@ fn test_replacement_scan_spanner_prefix() {
         )
         .unwrap();
     assert_eq!(val, "hello");
+}
+
+#[test]
+fn test_spanner_tables_c_api() {
+    let conn = create_duckdb_connection_with_metadata_functions();
+    let db = get_gsql_db();
+    let sql = format!(
+        "SELECT table_name FROM spanner_tables(database_path := '{}', endpoint := '{}') \
+         WHERE table_name = 'ScalarTypes'",
+        db.database_path(),
+        db.emulator_host()
+    );
+
+    let table_name: String = conn.query_row(&sql, [], |r| r.get(0)).unwrap();
+    assert_eq!(table_name, "ScalarTypes");
 }
 
 #[test]
