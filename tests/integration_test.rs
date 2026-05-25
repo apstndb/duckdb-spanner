@@ -1308,6 +1308,11 @@ fn get_pg_copy_db() -> &'static spanemuboost::SpanEmuDatabase {
                         str_array character varying[], \
                         PRIMARY KEY (id)\
                     )".into(),
+                    "CREATE TABLE pgsql_copy_json_target (\
+                        id bigint NOT NULL, \
+                        doc jsonb, \
+                        PRIMARY KEY (id)\
+                    )".into(),
                 ],
                 vec![],
             ).await.expect("Failed to create PG COPY database")
@@ -1731,6 +1736,30 @@ fn test_copy_to_arrays() {
 }
 
 #[test]
+fn test_copy_to_struct_json() {
+    let conn = create_duckdb_connection_with_copy();
+    let db = get_gsql_db();
+
+    let sql = format!(
+        "COPY (SELECT \
+            CAST(910 AS BIGINT) AS Id, \
+            CAST(NULL AS DECIMAL(38, 9)) AS NumCol, \
+            struct_pack(name := 'alice', age := CAST(42 AS BIGINT), tags := ['x', 'y']) AS JsonCol \
+        ) TO 'NumericTypes' (FORMAT spanner, database_path '{}', endpoint '{}')",
+        db.database_path(),
+        db.emulator_host()
+    );
+    conn.execute_batch(&sql).unwrap();
+
+    let row = exec_spanner_one("SELECT JsonCol FROM NumericTypes WHERE Id = 910");
+    let json = row.column::<String>(0).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["name"], "alice");
+    assert_eq!(value["age"], 42);
+    assert_eq!(value["tags"], serde_json::json!(["x", "y"]));
+}
+
+#[test]
 fn test_copy_to_column_count_mismatch() {
     let conn = create_duckdb_connection_with_copy();
     let db = get_gsql_db();
@@ -1921,4 +1950,32 @@ fn test_pg_copy_to_arrays() {
     assert_eq!(rows[2].column::<i64>(0).unwrap(), 202);
     assert!(rows[2].column::<Option<Vec<i64>>>(1).unwrap().is_none());
     assert!(rows[2].column::<Option<Vec<String>>>(2).unwrap().is_none());
+}
+
+#[test]
+fn test_pg_copy_to_struct_json() {
+    let conn = create_pg_duckdb_connection_with_copy();
+    let db = get_pg_copy_db();
+
+    let sql = format!(
+        "COPY (SELECT \
+            CAST(300 AS BIGINT) AS id, \
+            struct_pack(label := 'pg', ok := true, nums := [CAST(1 AS BIGINT), CAST(2 AS BIGINT)]) AS doc \
+        ) TO 'pgsql_copy_json_target' (FORMAT spanner, database_path '{}', endpoint '{}')",
+        db.database_path(),
+        db.emulator_host()
+    );
+    conn.execute_batch(&sql).unwrap();
+
+    let rows = exec_spanner_on(
+        db,
+        "SELECT id, doc FROM pgsql_copy_json_target WHERE id = 300",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].column::<i64>(0).unwrap(), 300);
+    let json = rows[0].column::<String>(1).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(value["label"], "pg");
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["nums"], serde_json::json!([1, 2]));
 }

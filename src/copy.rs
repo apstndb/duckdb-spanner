@@ -71,8 +71,16 @@ struct ColumnMeta {
     array_size: usize,
     /// Child metadata for DuckDB LIST/ARRAY columns.
     child: Option<Box<ColumnMeta>>,
+    /// Field metadata for DuckDB STRUCT columns.
+    struct_fields: Vec<StructFieldMeta>,
     /// Target Spanner column type code (populated during GlobalInit).
     spanner_type_code: i32,
+}
+
+#[derive(Clone)]
+struct StructFieldMeta {
+    name: String,
+    column: ColumnMeta,
 }
 
 /// Bind-phase data stored for the lifetime of the COPY operation.
@@ -389,12 +397,12 @@ unsafe fn column_meta_from_logical_type(
         (0, 0)
     };
 
-    let (array_size, child) = match type_id {
+    let (array_size, child, struct_fields) = match type_id {
         ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST => {
             let child_type = ffi::duckdb_list_type_child_type(logical_type);
             let child = column_meta_from_logical_type(child_type)?;
             ffi::duckdb_destroy_logical_type(&mut { child_type });
-            (0, Some(Box::new(child)))
+            (0, Some(Box::new(child)), Vec::new())
         }
         ffi::DUCKDB_TYPE_DUCKDB_TYPE_ARRAY => {
             let child_type = ffi::duckdb_array_type_child_type(logical_type);
@@ -403,9 +411,28 @@ unsafe fn column_meta_from_logical_type(
             (
                 ffi::duckdb_array_type_array_size(logical_type) as usize,
                 Some(Box::new(child)),
+                Vec::new(),
             )
         }
-        _ => (0, None),
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_STRUCT => {
+            let field_count = ffi::duckdb_struct_type_child_count(logical_type) as usize;
+            let mut fields = Vec::with_capacity(field_count);
+            for field_idx in 0..field_count {
+                let name_ptr = ffi::duckdb_struct_type_child_name(logical_type, field_idx as u64);
+                if name_ptr.is_null() {
+                    return Err(format!("DuckDB STRUCT field {field_idx} has no name"));
+                }
+                let name = CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
+                ffi::duckdb_free(name_ptr as *mut _);
+
+                let child_type = ffi::duckdb_struct_type_child_type(logical_type, field_idx as u64);
+                let column = column_meta_from_logical_type(child_type)?;
+                ffi::duckdb_destroy_logical_type(&mut { child_type });
+                fields.push(StructFieldMeta { name, column });
+            }
+            (0, None, fields)
+        }
+        _ => (0, None, Vec::new()),
     };
 
     Ok(ColumnMeta {
@@ -414,6 +441,7 @@ unsafe fn column_meta_from_logical_type(
         decimal_internal_type,
         array_size,
         child,
+        struct_fields,
         spanner_type_code: 0,
     })
 }
@@ -441,6 +469,15 @@ fn apply_spanner_type(col: &mut ColumnMeta, spanner_type: &Type) -> Result<(), S
             .as_deref()
             .ok_or_else(|| "Spanner ARRAY target is missing element type metadata".to_string())?;
         apply_spanner_type(child, elem_type)?;
+    }
+
+    if col.type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_STRUCT
+        && spanner_type.code != TypeCode::Json as i32
+    {
+        return Err(format!(
+            "DuckDB STRUCT source column requires a Spanner JSON target, got TypeCode {}",
+            spanner_type.code
+        ));
     }
 
     Ok(())
@@ -810,6 +847,12 @@ unsafe fn read_duckdb_value(
             }
             Kind::ListValue(ListValue { values })
         }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_STRUCT => {
+            let json = read_duckdb_json_value(vector, row_idx, col)?;
+            let s = serde_json::to_string(&json)
+                .map_err(|e| format!("STRUCT to JSON conversion failed: {e}"))?;
+            Kind::StringValue(s)
+        }
         _ => {
             return Err(format!(
                 "Unsupported DuckDB type {} for COPY TO spanner",
@@ -821,6 +864,188 @@ unsafe fn read_duckdb_value(
     Ok(Value {
         kind: Some(kind),
     })
+}
+
+unsafe fn read_duckdb_json_value(
+    vector: ffi::duckdb_vector,
+    row_idx: usize,
+    col: &ColumnMeta,
+) -> Result<serde_json::Value, String> {
+    let data = ffi::duckdb_vector_get_data(vector);
+    let validity = ffi::duckdb_vector_get_validity(vector);
+
+    if !validity.is_null() && !ffi::duckdb_validity_row_is_valid(validity, row_idx as u64) {
+        return Ok(serde_json::Value::Null);
+    }
+
+    match col.type_id {
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN => {
+            let v = *data.cast::<bool>().add(row_idx);
+            Ok(serde_json::Value::Bool(v))
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_TINYINT => {
+            let v = *data.cast::<i8>().add(row_idx);
+            Ok(serde_json::Value::Number((v as i64).into()))
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT => {
+            let v = *data.cast::<i16>().add(row_idx);
+            Ok(serde_json::Value::Number((v as i64).into()))
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER => {
+            let v = *data.cast::<i32>().add(row_idx);
+            Ok(serde_json::Value::Number((v as i64).into()))
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT => {
+            let v = *data.cast::<i64>().add(row_idx);
+            Ok(serde_json::Value::Number(v.into()))
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_UTINYINT => {
+            let v = *data.cast::<u8>().add(row_idx);
+            Ok(serde_json::Value::Number((v as u64).into()))
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_USMALLINT => {
+            let v = *data.cast::<u16>().add(row_idx);
+            Ok(serde_json::Value::Number((v as u64).into()))
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER => {
+            let v = *data.cast::<u32>().add(row_idx);
+            Ok(serde_json::Value::Number((v as u64).into()))
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT => {
+            let v = *data.cast::<u64>().add(row_idx);
+            Ok(serde_json::Value::Number(v.into()))
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT => {
+            let v = *data.cast::<i128>().add(row_idx);
+            Ok(serde_json::Value::String(v.to_string()))
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_UHUGEINT => {
+            let v = *data.cast::<u128>().add(row_idx);
+            Ok(serde_json::Value::String(v.to_string()))
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_FLOAT => {
+            let v = *data.cast::<f32>().add(row_idx);
+            json_number_or_string(v as f64)
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE => {
+            let v = *data.cast::<f64>().add(row_idx);
+            json_number_or_string(v)
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR => {
+            let str_ptr = data.cast::<ffi::duckdb_string_t>().add(row_idx);
+            Ok(serde_json::Value::String(read_duckdb_string(str_ptr)))
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB => {
+            let str_ptr = data.cast::<ffi::duckdb_string_t>().add(row_idx);
+            let bytes = read_duckdb_bytes(str_ptr);
+            use base64::Engine;
+            Ok(serde_json::Value::String(
+                base64::engine::general_purpose::STANDARD.encode(&bytes),
+            ))
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_DATE => {
+            let days = *data.cast::<i32>().add(row_idx);
+            Ok(serde_json::Value::String(epoch_days_to_date_string(days)?))
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP
+        | ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ => {
+            let micros = *data.cast::<i64>().add(row_idx);
+            Ok(serde_json::Value::String(epoch_micros_to_rfc3339(micros)?))
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_S => {
+            let secs = *data.cast::<i64>().add(row_idx);
+            Ok(serde_json::Value::String(epoch_micros_to_rfc3339(
+                secs * 1_000_000,
+            )?))
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_MS => {
+            let millis = *data.cast::<i64>().add(row_idx);
+            Ok(serde_json::Value::String(epoch_micros_to_rfc3339(
+                millis * 1_000,
+            )?))
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_NS => {
+            let nanos = *data.cast::<i64>().add(row_idx);
+            let ts = time::OffsetDateTime::from_unix_timestamp_nanos(nanos as i128)
+                .map_err(|e| format!("Timestamp overflow: {e}"))?;
+            let s = ts
+                .format(&time::format_description::well_known::Rfc3339)
+                .map_err(|e| format!("Timestamp format error: {e}"))?;
+            Ok(serde_json::Value::String(s))
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL => {
+            let raw_i128 = read_decimal_raw(data, row_idx, col.decimal_internal_type);
+            Ok(serde_json::Value::String(decimal_i128_to_string(
+                raw_i128,
+                col.decimal_scale,
+            )))
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_UUID => {
+            let raw = *data.cast::<u128>().add(row_idx);
+            let uuid_bits = raw ^ (1u128 << 127);
+            Ok(serde_json::Value::String(
+                uuid::Uuid::from_u128(uuid_bits).to_string(),
+            ))
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST => {
+            let child = col
+                .child
+                .as_deref()
+                .ok_or_else(|| "DuckDB LIST source column is missing child metadata".to_string())?;
+            let entry = *data.cast::<ffi::duckdb_list_entry>().add(row_idx);
+            let child_vector = ffi::duckdb_list_vector_get_child(vector);
+            let mut values = Vec::with_capacity(entry.length as usize);
+            for child_idx in entry.offset..entry.offset + entry.length {
+                values.push(read_duckdb_json_value(
+                    child_vector,
+                    child_idx as usize,
+                    child,
+                )?);
+            }
+            Ok(serde_json::Value::Array(values))
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_ARRAY => {
+            let child = col.child.as_deref().ok_or_else(|| {
+                "DuckDB ARRAY source column is missing child metadata".to_string()
+            })?;
+            let child_vector = ffi::duckdb_array_vector_get_child(vector);
+            let start = row_idx
+                .checked_mul(col.array_size)
+                .ok_or_else(|| "DuckDB ARRAY child offset overflow".to_string())?;
+            let mut values = Vec::with_capacity(col.array_size);
+            for child_idx in start..start + col.array_size {
+                values.push(read_duckdb_json_value(child_vector, child_idx, child)?);
+            }
+            Ok(serde_json::Value::Array(values))
+        }
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_STRUCT => {
+            let mut object = serde_json::Map::with_capacity(col.struct_fields.len());
+            for (field_idx, field) in col.struct_fields.iter().enumerate() {
+                let child_vector = ffi::duckdb_struct_vector_get_child(vector, field_idx as u64);
+                let value = read_duckdb_json_value(child_vector, row_idx, &field.column)?;
+                object.insert(field.name.clone(), value);
+            }
+            Ok(serde_json::Value::Object(object))
+        }
+        _ => Err(format!(
+            "Unsupported DuckDB type {} in STRUCT to JSON conversion",
+            col.type_id
+        )),
+    }
+}
+
+fn json_number_or_string(v: f64) -> Result<serde_json::Value, String> {
+    if v.is_finite() {
+        serde_json::Number::from_f64(v)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| format!("Invalid JSON number: {v}"))
+    } else if v.is_nan() {
+        Ok(serde_json::Value::String("NaN".to_string()))
+    } else {
+        Ok(serde_json::Value::String(
+            if v > 0.0 { "Infinity" } else { "-Infinity" }.to_string(),
+        ))
+    }
 }
 
 /// Read a DECIMAL raw value as i128, handling different internal storage types.
