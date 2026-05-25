@@ -22,7 +22,6 @@ static CONFIG_REGISTERED: AtomicBool = AtomicBool::new(false);
 ///
 /// # Safety
 /// `con` must be a valid `duckdb_connection`.
-#[cfg(feature = "loadable-extension")]
 pub unsafe fn register_config_options(con: ffi::duckdb_connection) {
     register_varchar_option(con, "spanner_project", "Default Google Cloud project ID for Spanner");
     register_varchar_option(con, "spanner_instance", "Default Spanner instance ID");
@@ -35,7 +34,6 @@ pub unsafe fn register_config_options(con: ffi::duckdb_connection) {
     register_varchar_option(con, "spanner_endpoint", "Default Spanner gRPC endpoint");
 }
 
-#[cfg(feature = "loadable-extension")]
 unsafe fn register_varchar_option(con: ffi::duckdb_connection, name: &str, description: &str) {
     let option = ffi::duckdb_create_config_option();
 

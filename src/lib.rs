@@ -7,14 +7,17 @@ mod ddl;
 mod error;
 mod params;
 mod query;
+mod replacement;
 mod runtime;
 mod scan;
 mod schema;
 mod types;
 
+pub use config::register_config_options;
 pub use copy::register_copy_function;
 pub use ddl::{SpannerDdlAsyncVTab, SpannerDdlVTab, SpannerOperationsVTab};
 pub use query::SpannerQueryVTab;
+pub use replacement::register_replacement_scan;
 pub use scan::SpannerScanVTab;
 
 #[cfg(feature = "loadable-extension")]
@@ -65,6 +68,7 @@ unsafe fn spanner_init_c_api_internal(
         }
         config::register_config_options(raw_con);
         copy::register_copy_function(raw_con);
+        replacement::register_replacement_scan(db);
         duckdb::ffi::duckdb_disconnect(&mut raw_con);
 
         // Create the Rust Connection wrapper for table function and macro registration.

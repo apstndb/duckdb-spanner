@@ -4,8 +4,9 @@ use std::sync::{Arc, OnceLock};
 
 use duckdb::Connection;
 use duckdb_spanner::{
-    register_copy_function, SpannerDdlAsyncVTab, SpannerDdlVTab, SpannerOperationsVTab,
-    SpannerQueryVTab, SpannerScanVTab,
+    register_config_options, register_copy_function, register_replacement_scan,
+    SpannerDdlAsyncVTab, SpannerDdlVTab, SpannerOperationsVTab, SpannerQueryVTab,
+    SpannerScanVTab,
 };
 use google_cloud_gax::conn::Environment;
 use google_cloud_googleapis::spanner::admin::database::v1::DatabaseDialect;
@@ -211,6 +212,50 @@ fn create_duckdb_connection() -> Connection {
     conn.execute_batch(include_str!("../src/macros.sql"))
         .unwrap();
     conn
+}
+
+fn create_duckdb_connection_with_replacement_scan() -> Connection {
+    let _ = get_gsql_db();
+    unsafe {
+        let mut db: duckdb::ffi::duckdb_database = std::ptr::null_mut();
+        let mut c_err: *mut std::os::raw::c_char = std::ptr::null_mut();
+        let r = duckdb::ffi::duckdb_open_ext(
+            c":memory:".as_ptr(),
+            &mut db,
+            std::ptr::null_mut(),
+            &mut c_err,
+        );
+        assert_eq!(r, duckdb::ffi::DuckDBSuccess, "duckdb_open_ext failed");
+
+        register_replacement_scan(db);
+
+        let mut raw_con: duckdb::ffi::duckdb_connection = std::ptr::null_mut();
+        let rc = duckdb::ffi::duckdb_connect(db, &mut raw_con);
+        assert_eq!(rc, duckdb::ffi::DuckDBSuccess, "duckdb_connect failed");
+        register_config_options(raw_con);
+        duckdb::ffi::duckdb_disconnect(&mut raw_con);
+
+        let conn = Connection::open_from_raw(db).unwrap();
+        conn.register_table_function::<SpannerQueryVTab>("spanner_query_raw")
+            .unwrap();
+        conn.register_table_function::<SpannerScanVTab>("spanner_scan")
+            .unwrap();
+        conn.register_table_function::<SpannerDdlVTab>("spanner_ddl_raw")
+            .unwrap();
+        conn.register_table_function::<SpannerDdlAsyncVTab>("spanner_ddl_async_raw")
+            .unwrap();
+        conn.register_table_function::<SpannerOperationsVTab>("spanner_operations_raw")
+            .unwrap();
+        conn.execute_batch("\
+            LOAD core_functions;\
+            LOAD json;\
+            INSTALL icu;\
+            LOAD icu;\
+        ").unwrap();
+        conn.execute_batch(include_str!("../src/macros.sql"))
+            .unwrap();
+        conn
+    }
 }
 
 fn vtab_query_sql(spanner_sql: &str) -> String {
@@ -704,6 +749,35 @@ fn test_vtab_scan_projection() {
     let val: String = conn
         .query_row(
             &format!("SELECT StringCol FROM ({base}) WHERE Id = 1"),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(val, "hello");
+}
+
+#[test]
+fn test_replacement_scan_spanner_prefix() {
+    let conn = create_duckdb_connection_with_replacement_scan();
+    let db = get_gsql_db();
+
+    conn.execute_batch(&format!(
+        "SET spanner_database_path = '{}'; SET spanner_endpoint = '{}';",
+        db.database_path(),
+        db.emulator_host()
+    ))
+    .unwrap();
+
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM \"spanner:ScalarTypes\"", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 3);
+
+    let val: String = conn
+        .query_row(
+            "SELECT StringCol FROM \"spanner:ScalarTypes\" WHERE Id = 1",
             [],
             |r| r.get(0),
         )

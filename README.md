@@ -217,6 +217,17 @@ Reads all rows from a table using the Spanner Read API.
 SELECT * FROM spanner_scan('Users', index := 'UsersByName');
 ```
 
+### Replacement Scan
+
+When session-level database defaults are configured, quoted table names with the `spanner:` prefix are rewritten to `spanner_scan`.
+
+```sql
+SET spanner_database_path = 'projects/p/instances/i/databases/d';
+SELECT * FROM "spanner:Users";
+```
+
+Replacement scans intentionally support only the table name. Use `spanner_scan(...)` directly when you need options such as `index`, timestamp bounds, priority, or Data Boost.
+
 ### Config Options
 
 Session-level defaults can be set via `SET` statements. These are used when the corresponding named parameter is not specified.
@@ -551,6 +562,7 @@ This extension registers the following names into the global DuckDB namespace.
 | `spanner_query` | table macro | Wraps `spanner_query_raw` with ergonomic params (see [Table Functions](#table-functions)) |
 | `spanner_query_raw` | table function | Execute Spanner SQL (see [Low-Level Table Function](#spanner_query_raw----low-level-table-function)) |
 | `spanner_scan` | table function | Read a Spanner table (see [Table Functions](#table-functions)) |
+| `"spanner:Table"` | replacement scan | Shorthand for `spanner_scan('Table')` using configured session defaults |
 | `spanner_ddl` | table macro | Execute DDL synchronously (see [`spanner_ddl`](#spanner_ddl)) |
 | `spanner_ddl_async` | table macro | Submit DDL asynchronously (see [`spanner_ddl_async`](#spanner_ddl_async)) |
 | `spanner_operations` | table macro | List DDL operations (see [`spanner_operations`](#spanner_operations)) |
