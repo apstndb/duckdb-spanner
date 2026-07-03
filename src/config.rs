@@ -5,18 +5,9 @@
 
 use std::ffi::CString;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use duckdb::ffi;
 use duckdb::vtab::BindInfo;
-
-/// Tracks whether config options have been registered via `register_config_options`.
-///
-/// When the extension is loaded as a library (e.g. integration tests), config options
-/// are not registered. Calling `duckdb_client_context_get_config_option` for an
-/// unregistered option triggers a DuckDB assertion failure (SIGABRT). This flag
-/// prevents that by skipping the lookup entirely when options aren't registered.
-static CONFIG_REGISTERED: AtomicBool = AtomicBool::new(false);
 
 /// Register all spanner_* config options on the given connection.
 ///
@@ -65,13 +56,11 @@ unsafe fn register_varchar_option(con: ffi::duckdb_connection, name: &str, descr
         eprintln!("[duckdb-spanner] Failed to register config option: {name}");
     }
     // duckdb_register_config_option takes ownership; do NOT destroy option here.
-
-    CONFIG_REGISTERED.store(true, Ordering::Release);
 }
 
 /// Read a spanner config option from a raw client context.
 ///
-/// Returns `None` if the option is unset, empty, or config options were never registered.
+/// Returns `None` if the option is unset, empty, or not registered on this database.
 /// Does **not** destroy `ctx` — the caller is responsible for cleanup.
 ///
 /// # Safety
@@ -80,9 +69,6 @@ pub unsafe fn get_config_string_from_context(
     ctx: ffi::duckdb_client_context,
     option_name: &str,
 ) -> Option<String> {
-    if !CONFIG_REGISTERED.load(Ordering::Acquire) {
-        return None;
-    }
     unsafe {
         let c_name = CString::new(option_name).ok()?;
         let val =
@@ -108,11 +94,8 @@ pub unsafe fn get_config_string_from_context(
 
 /// Read a spanner config option from the client context during bind.
 ///
-/// Returns `None` if the option is unset, empty, or config options were never registered.
+/// Returns `None` if the option is unset, empty, or not registered on this database.
 pub fn get_config_string(bind: &BindInfo, option_name: &str) -> Option<String> {
-    if !CONFIG_REGISTERED.load(Ordering::Acquire) {
-        return None;
-    }
     unsafe {
         // Extract raw duckdb_bind_info from BindInfo (single-pointer struct).
         const _: () = assert!(

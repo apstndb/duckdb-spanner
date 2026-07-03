@@ -5,35 +5,62 @@ mod convert;
 mod copy;
 mod ddl;
 mod error;
-mod metadata;
 mod params;
 mod query;
 mod replacement;
 mod runtime;
+mod scalars;
 mod scan;
 mod schema;
+mod tables;
 mod types;
 
 pub use config::register_config_options;
 pub use copy::register_copy_function;
 pub use ddl::{SpannerDdlAsyncVTab, SpannerDdlVTab, SpannerOperationsVTab};
-pub use metadata::register_metadata_table_functions;
 pub use query::SpannerQueryVTab;
 pub use replacement::register_replacement_scan;
 pub use scan::SpannerScanVTab;
+pub use tables::SpannerTablesVTab;
+
+use duckdb::Connection;
+
+/// Register Rust VTabs, scalar functions, and SQL table macros on a connection.
+///
+/// Used by the loadable extension entrypoint and integration tests.
+pub fn register_extension_functions(con: &Connection) -> Result<(), Box<dyn std::error::Error>> {
+    con.register_table_function::<SpannerQueryVTab>("spanner_query_raw")?;
+    con.register_table_function::<SpannerScanVTab>("spanner_scan")?;
+    con.register_table_function::<SpannerDdlVTab>("spanner_ddl_raw")?;
+    con.register_table_function::<SpannerDdlAsyncVTab>("spanner_ddl_async_raw")?;
+    con.register_table_function::<SpannerOperationsVTab>("spanner_operations_raw")?;
+    con.register_table_function::<SpannerTablesVTab>("spanner_tables")?;
+    con.execute_batch(include_str!("macros.sql"))?;
+    Ok(())
+}
+
+/// Register C API extensions that require a raw `duckdb_connection` / `duckdb_database`.
+///
+/// # Safety
+/// `db` and `raw_con` must be valid DuckDB handles.
+pub unsafe fn register_c_api_extensions(
+    db: duckdb::ffi::duckdb_database,
+    raw_con: duckdb::ffi::duckdb_connection,
+) {
+    unsafe {
+        config::register_config_options(raw_con);
+        copy::register_copy_function(raw_con, true);
+        scalars::register_scalars_c_api(raw_con);
+        replacement::register_replacement_scan(db);
+    }
+}
 
 #[cfg(feature = "loadable-extension")]
 const MIN_DUCKDB_C_API_VERSION: &str = "v1.5.0";
 
 #[cfg(feature = "loadable-extension")]
 fn extension_entrypoint(con: duckdb::Connection) -> Result<(), Box<dyn std::error::Error>> {
-    con.register_table_function::<SpannerQueryVTab>("spanner_query_raw")?;
-    con.register_table_function::<SpannerScanVTab>("spanner_scan")?;
-    con.register_table_function::<SpannerDdlVTab>("spanner_ddl_raw")?;
-    con.register_table_function::<SpannerDdlAsyncVTab>("spanner_ddl_async_raw")?;
-    con.register_table_function::<SpannerOperationsVTab>("spanner_operations_raw")?;
-    con.execute_batch(include_str!("macros.sql"))?;
-    Ok(())
+    register_extension_functions(&con)
 }
 
 // ─── Manual C API init (replaces #[duckdb_entrypoint_c_api] macro) ───────────
@@ -68,10 +95,7 @@ unsafe fn spanner_init_c_api_internal(
         if rc != duckdb::ffi::DuckDBSuccess {
             return Err("Failed to create connection for config option registration".into());
         }
-        config::register_config_options(raw_con);
-        copy::register_copy_function(raw_con);
-        metadata::register_metadata_table_functions(raw_con);
-        replacement::register_replacement_scan(db);
+        register_c_api_extensions(db, raw_con);
         duckdb::ffi::duckdb_disconnect(&mut raw_con);
 
         // Create the Rust Connection wrapper for table function and macro registration.

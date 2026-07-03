@@ -1,0 +1,69 @@
+# name: test/sql/spanner_scan.test
+# description: spanner_scan table function (ported from tests/integration.sh)
+# group: [spanner]
+#
+# Prerequisites:
+#   make emulator-start
+#   bash tests/setup_sqllogic_db.sh
+#
+# Uses SPANNER_EMULATOR_HOST (default localhost:9010) for the gRPC endpoint.
+# Assertions use statement ok + IF(..., error(...)) to avoid sqllogictest re-executing lazy Spanner scans.
+
+require spanner
+
+require-env SPANNER_EMULATOR_HOST
+
+statement ok
+SET allow_extensions_metadata_mismatch=true;
+
+statement ok
+SET spanner_database_path = 'projects/test-project/instances/test-instance/databases/test-db';
+
+statement ok
+SET spanner_endpoint = '${SPANNER_EMULATOR_HOST}';
+
+# --- Basic scan ---
+
+statement ok
+SELECT IF(count = 3, 1, error('expected 3 scan rows')) FROM (SELECT COUNT(*)::INT AS count FROM spanner_scan('ScalarTypes'));
+
+statement ok
+SELECT IF(count = 0, 1, error('expected empty scan')) FROM (SELECT COUNT(*)::INT AS count FROM spanner_scan('EmptyTable'));
+
+# --- Projection pushdown ---
+
+statement ok
+SELECT IF(count = 3, 1, error('expected 3 single-column projection rows')) FROM (SELECT COUNT(*)::INT AS count FROM (SELECT StringCol FROM spanner_scan('ScalarTypes')));
+
+statement ok
+SELECT IF(count = 3, 1, error('expected 3 two-column projection rows')) FROM (SELECT COUNT(*)::INT AS count FROM (SELECT Id, StringCol FROM spanner_scan('ScalarTypes')));
+
+# --- DuckDB filtering on scan ---
+
+statement ok
+SELECT IF(count = 1, 1, error('expected 1 row for Id=1')) FROM (SELECT COUNT(*)::INT AS count FROM spanner_scan('ScalarTypes') WHERE Id = 1);
+
+statement ok
+SELECT IF(s = -58, 1, error('expected scan sum -58')) FROM (SELECT SUM(Int64Col)::INT AS s FROM spanner_scan('ScalarTypes'));
+
+# --- Type correctness in scan ---
+
+statement ok
+SELECT IF(BoolCol IS TRUE, 1, error('expected scan bool true')) FROM spanner_scan('ScalarTypes') WHERE Id = 1;
+
+statement ok
+SELECT IF(strpos(Float64Col::VARCHAR, '3.14') > 0, 1, error('expected scan float 3.14')) FROM spanner_scan('ScalarTypes') WHERE Id = 1;
+
+statement ok
+SELECT IF(DateCol = DATE '2024-01-15', 1, error('expected scan date')) FROM spanner_scan('ScalarTypes') WHERE Id = 1;
+
+statement ok
+SELECT IF(strpos(TimestampCol::VARCHAR, '2024-06-15') > 0, 1, error('expected scan timestamp')) FROM spanner_scan('ScalarTypes') WHERE Id = 1;
+
+# --- NUMERIC type in scan ---
+
+statement ok
+SELECT IF(strpos(NumCol::VARCHAR, '123.456789') > 0, 1, error('expected scan numeric')) FROM spanner_scan('NumericTypes') WHERE Id = 1;
+
+statement ok
+SELECT IF(strpos(JsonCol::VARCHAR, 'key') > 0, 1, error('expected scan JSON key')) FROM spanner_scan('NumericTypes') WHERE Id = 1;

@@ -92,6 +92,13 @@ struct CopyBindData {
     columns: Vec<ColumnMeta>,
 }
 
+/// Per-registration state attached to the copy function via `extra_info`.
+struct CopyExtraInfo {
+    /// When false, skip session config lookups during bind (avoids DuckDB SIGABRT
+    /// when spanner_* config options were not registered on this database).
+    config_enabled: bool,
+}
+
 /// Global state created during init and shared across sink calls.
 struct CopyGlobalState {
     client: Arc<Client>,
@@ -108,14 +115,23 @@ struct CopyGlobalState {
 
 /// Register the `spanner` copy function on a raw DuckDB connection.
 ///
+/// Set `config_enabled` when `register_config_options` was also called on the
+/// same database so COPY bind can fall back to `SET spanner_*` session defaults.
+///
 /// # Safety
 /// `con` must be a valid `duckdb_connection`.
-pub unsafe fn register_copy_function(con: ffi::duckdb_connection) {
+pub unsafe fn register_copy_function(con: ffi::duckdb_connection, config_enabled: bool) {
     unsafe {
         let copy_fn = ffi::duckdb_create_copy_function();
 
         let name = c"spanner";
         ffi::duckdb_copy_function_set_name(copy_fn, name.as_ptr());
+        let extra = Box::new(CopyExtraInfo { config_enabled });
+        ffi::duckdb_copy_function_set_extra_info(
+            copy_fn,
+            Box::into_raw(extra) as *mut c_void,
+            Some(drop_box::<CopyExtraInfo>),
+        );
         ffi::duckdb_copy_function_set_bind(copy_fn, Some(copy_bind));
         ffi::duckdb_copy_function_set_global_init(copy_fn, Some(copy_global_init));
         ffi::duckdb_copy_function_set_sink(copy_fn, Some(copy_sink));
@@ -130,6 +146,14 @@ pub unsafe fn register_copy_function(con: ffi::duckdb_connection) {
 }
 
 // ─── Callbacks ──────────────────────────────────────────────────────────────
+
+unsafe fn copy_config_enabled(info: ffi::duckdb_copy_function_bind_info) -> bool {
+    let extra = ffi::duckdb_copy_function_bind_get_extra_info(info) as *const CopyExtraInfo;
+    if extra.is_null() {
+        return false;
+    }
+    (*extra).config_enabled
+}
 
 unsafe extern "C" fn copy_bind(info: ffi::duckdb_copy_function_bind_info) {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
@@ -187,9 +211,10 @@ unsafe fn copy_bind_inner(
     // Get client context for config fallback
     let ctx = ffi::duckdb_copy_function_bind_get_client_context(info);
     let have_ctx = !ctx.is_null();
+    let config_enabled = unsafe { copy_config_enabled(info) };
 
     let cfg = |name: &str| -> Option<String> {
-        if have_ctx {
+        if have_ctx && config_enabled {
             unsafe { config::get_config_string_from_context(ctx, name) }
         } else {
             None

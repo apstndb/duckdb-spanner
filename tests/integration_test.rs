@@ -4,9 +4,7 @@ use std::sync::{Arc, OnceLock};
 
 use duckdb::Connection;
 use duckdb_spanner::{
-    register_config_options, register_copy_function, register_metadata_table_functions,
-    register_replacement_scan, SpannerDdlAsyncVTab, SpannerDdlVTab, SpannerOperationsVTab,
-    SpannerQueryVTab, SpannerScanVTab,
+    register_c_api_extensions, register_copy_function, register_extension_functions,
 };
 use google_cloud_gax::conn::Environment;
 use google_cloud_googleapis::spanner::admin::database::v1::DatabaseDialect;
@@ -185,37 +183,17 @@ fn exec_spanner_on(
     })
 }
 
-// DuckDB VTab helpers
+// DuckDB extension helpers
 
+/// Open an in-memory DuckDB connection with the same registration path as the
+/// loadable extension: C API pieces (config, copy, replacement scan) plus Rust
+/// VTabs, scalars, and SQL table macros.
 fn create_duckdb_connection() -> Connection {
     let _ = get_gsql_db(); // ensure emulator + database are ready
-    let conn = Connection::open_in_memory().unwrap();
-    conn.register_table_function::<SpannerQueryVTab>("spanner_query_raw")
-        .unwrap();
-    conn.register_table_function::<SpannerScanVTab>("spanner_scan")
-        .unwrap();
-    conn.register_table_function::<SpannerDdlVTab>("spanner_ddl_raw")
-        .unwrap();
-    conn.register_table_function::<SpannerDdlAsyncVTab>("spanner_ddl_async_raw")
-        .unwrap();
-    conn.register_table_function::<SpannerOperationsVTab>("spanner_operations_raw")
-        .unwrap();
-    // DuckDB v1.5.0+: core_functions/json are bundled but need explicit load.
-    // ICU is NOT bundled (too large) and must be installed from the extension repo.
-    // ICU is required for TIMESTAMPTZ operations (AT TIME ZONE) used in macros.sql.
-    conn.execute_batch("\
-        LOAD core_functions;\
-        LOAD json;\
-        INSTALL icu;\
-        LOAD icu;\
-    ").unwrap();
-    conn.execute_batch(include_str!("../src/macros.sql"))
-        .unwrap();
-    conn
+    open_extension_connection()
 }
 
-fn create_duckdb_connection_with_replacement_scan() -> Connection {
-    let _ = get_gsql_db();
+fn open_extension_connection() -> Connection {
     unsafe {
         let mut db: duckdb::ffi::duckdb_database = std::ptr::null_mut();
         let mut c_err: *mut std::os::raw::c_char = std::ptr::null_mut();
@@ -227,57 +205,15 @@ fn create_duckdb_connection_with_replacement_scan() -> Connection {
         );
         assert_eq!(r, duckdb::ffi::DuckDBSuccess, "duckdb_open_ext failed");
 
-        register_replacement_scan(db);
-
         let mut raw_con: duckdb::ffi::duckdb_connection = std::ptr::null_mut();
         let rc = duckdb::ffi::duckdb_connect(db, &mut raw_con);
         assert_eq!(rc, duckdb::ffi::DuckDBSuccess, "duckdb_connect failed");
-        register_config_options(raw_con);
+        register_c_api_extensions(db, raw_con);
         duckdb::ffi::duckdb_disconnect(&mut raw_con);
 
         let conn = Connection::open_from_raw(db).unwrap();
-        conn.register_table_function::<SpannerQueryVTab>("spanner_query_raw")
-            .unwrap();
-        conn.register_table_function::<SpannerScanVTab>("spanner_scan")
-            .unwrap();
-        conn.register_table_function::<SpannerDdlVTab>("spanner_ddl_raw")
-            .unwrap();
-        conn.register_table_function::<SpannerDdlAsyncVTab>("spanner_ddl_async_raw")
-            .unwrap();
-        conn.register_table_function::<SpannerOperationsVTab>("spanner_operations_raw")
-            .unwrap();
-        conn.execute_batch("\
-            LOAD core_functions;\
-            LOAD json;\
-            INSTALL icu;\
-            LOAD icu;\
-        ").unwrap();
-        conn.execute_batch(include_str!("../src/macros.sql"))
-            .unwrap();
+        register_extension_functions(&conn).unwrap();
         conn
-    }
-}
-
-fn create_duckdb_connection_with_metadata_functions() -> Connection {
-    let _ = get_gsql_db();
-    unsafe {
-        let mut db: duckdb::ffi::duckdb_database = std::ptr::null_mut();
-        let mut c_err: *mut std::os::raw::c_char = std::ptr::null_mut();
-        let r = duckdb::ffi::duckdb_open_ext(
-            c":memory:".as_ptr(),
-            &mut db,
-            std::ptr::null_mut(),
-            &mut c_err,
-        );
-        assert_eq!(r, duckdb::ffi::DuckDBSuccess, "duckdb_open_ext failed");
-
-        let mut raw_con: duckdb::ffi::duckdb_connection = std::ptr::null_mut();
-        let rc = duckdb::ffi::duckdb_connect(db, &mut raw_con);
-        assert_eq!(rc, duckdb::ffi::DuckDBSuccess, "duckdb_connect failed");
-        register_metadata_table_functions(raw_con);
-        duckdb::ffi::duckdb_disconnect(&mut raw_con);
-
-        Connection::open_from_raw(db).unwrap()
     }
 }
 
@@ -781,7 +717,7 @@ fn test_vtab_scan_projection() {
 
 #[test]
 fn test_replacement_scan_spanner_prefix() {
-    let conn = create_duckdb_connection_with_replacement_scan();
+    let conn = create_duckdb_connection();
     let db = get_gsql_db();
 
     conn.execute_batch(&format!(
@@ -809,8 +745,8 @@ fn test_replacement_scan_spanner_prefix() {
 }
 
 #[test]
-fn test_spanner_tables_c_api() {
-    let conn = create_duckdb_connection_with_metadata_functions();
+fn test_spanner_tables() {
+    let conn = create_duckdb_connection();
     let db = get_gsql_db();
     let sql = format!(
         "SELECT table_name FROM spanner_tables(database_path := '{}', endpoint := '{}') \
@@ -1052,7 +988,7 @@ fn assert_roundtrip(conn: &Connection, param: &str, expected: Expected) {
         Value(t, v) => ("CAST(col AS VARCHAR)", t, v),
         Base64(v) => ("base64(col)", "BLOB", v),
         Timestamp(v) => (
-            "strftime(col AT TIME ZONE 'UTC', '%Y-%m-%dT%H:%M:%SZ')",
+            "strftime(col, '%Y-%m-%dT%H:%M:%SZ')",
             "TIMESTAMP WITH TIME ZONE",
             v,
         ),
@@ -1476,26 +1412,7 @@ fn pg_vtab_scan_sql_with(table: &str, extra_params: &str) -> String {
 
 fn create_pg_duckdb_connection() -> Connection {
     let _ = get_pg_db(); // ensure emulator + PG database are ready
-    let conn = Connection::open_in_memory().unwrap();
-    conn.register_table_function::<SpannerQueryVTab>("spanner_query_raw")
-        .unwrap();
-    conn.register_table_function::<SpannerScanVTab>("spanner_scan")
-        .unwrap();
-    conn.register_table_function::<SpannerDdlVTab>("spanner_ddl_raw")
-        .unwrap();
-    conn.register_table_function::<SpannerDdlAsyncVTab>("spanner_ddl_async_raw")
-        .unwrap();
-    conn.register_table_function::<SpannerOperationsVTab>("spanner_operations_raw")
-        .unwrap();
-    conn.execute_batch("\
-        LOAD core_functions;\
-        LOAD json;\
-        INSTALL icu;\
-        LOAD icu;\
-    ").unwrap();
-    conn.execute_batch(include_str!("../src/macros.sql"))
-        .unwrap();
-    conn
+    open_extension_connection()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1623,49 +1540,11 @@ fn test_pg_vtab_scan_exact_staleness() {
 // COPY TO tests
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Create a DuckDB connection with the copy function registered via C API.
+/// COPY TO tests use the unified extension registration path (copy function
+/// is registered via `register_c_api_extensions`).
 fn create_duckdb_connection_with_copy() -> Connection {
     let _ = get_gsql_db();
-    unsafe {
-        let mut db: duckdb::ffi::duckdb_database = std::ptr::null_mut();
-        let mut c_err: *mut std::os::raw::c_char = std::ptr::null_mut();
-        let r = duckdb::ffi::duckdb_open_ext(
-            c":memory:".as_ptr(),
-            &mut db,
-            std::ptr::null_mut(),
-            &mut c_err,
-        );
-        assert_eq!(r, duckdb::ffi::DuckDBSuccess, "duckdb_open_ext failed");
-
-        // Register copy function on a raw connection
-        let mut raw_con: duckdb::ffi::duckdb_connection = std::ptr::null_mut();
-        let rc = duckdb::ffi::duckdb_connect(db, &mut raw_con);
-        assert_eq!(rc, duckdb::ffi::DuckDBSuccess, "duckdb_connect failed");
-        register_copy_function(raw_con);
-        duckdb::ffi::duckdb_disconnect(&mut raw_con);
-
-        // Wrap in Connection for table functions and macros
-        let conn = Connection::open_from_raw(db).unwrap();
-        conn.register_table_function::<SpannerQueryVTab>("spanner_query_raw")
-            .unwrap();
-        conn.register_table_function::<SpannerScanVTab>("spanner_scan")
-            .unwrap();
-        conn.register_table_function::<SpannerDdlVTab>("spanner_ddl_raw")
-            .unwrap();
-        conn.register_table_function::<SpannerDdlAsyncVTab>("spanner_ddl_async_raw")
-            .unwrap();
-        conn.register_table_function::<SpannerOperationsVTab>("spanner_operations_raw")
-            .unwrap();
-        conn.execute_batch("\
-            LOAD core_functions;\
-            LOAD json;\
-            INSTALL icu;\
-            LOAD icu;\
-        ").unwrap();
-        conn.execute_batch(include_str!("../src/macros.sql"))
-            .unwrap();
-        conn
-    }
+    open_extension_connection()
 }
 
 #[test]
@@ -1681,7 +1560,7 @@ fn test_copy_to_registration() {
         let rc = duckdb::ffi::duckdb_connect(db, &mut con);
         assert_eq!(rc, duckdb::ffi::DuckDBSuccess);
 
-        register_copy_function(con);
+        register_copy_function(con, false);
 
         // Try COPY with invalid database — should fail with Spanner connection error, not crash
         let sql = std::ffi::CString::new(
@@ -1953,47 +1832,9 @@ fn test_pg_ddl_operations() {
 // PostgreSQL dialect — COPY TO tests
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Create a DuckDB connection with copy function registered.
 fn create_pg_duckdb_connection_with_copy() -> Connection {
     let _ = get_pg_copy_db();
-    unsafe {
-        let mut db: duckdb::ffi::duckdb_database = std::ptr::null_mut();
-        let mut c_err: *mut std::os::raw::c_char = std::ptr::null_mut();
-        let r = duckdb::ffi::duckdb_open_ext(
-            c":memory:".as_ptr(),
-            &mut db,
-            std::ptr::null_mut(),
-            &mut c_err,
-        );
-        assert_eq!(r, duckdb::ffi::DuckDBSuccess, "duckdb_open_ext failed");
-
-        let mut raw_con: duckdb::ffi::duckdb_connection = std::ptr::null_mut();
-        let rc = duckdb::ffi::duckdb_connect(db, &mut raw_con);
-        assert_eq!(rc, duckdb::ffi::DuckDBSuccess, "duckdb_connect failed");
-        register_copy_function(raw_con);
-        duckdb::ffi::duckdb_disconnect(&mut raw_con);
-
-        let conn = Connection::open_from_raw(db).unwrap();
-        conn.register_table_function::<SpannerQueryVTab>("spanner_query_raw")
-            .unwrap();
-        conn.register_table_function::<SpannerScanVTab>("spanner_scan")
-            .unwrap();
-        conn.register_table_function::<SpannerDdlVTab>("spanner_ddl_raw")
-            .unwrap();
-        conn.register_table_function::<SpannerDdlAsyncVTab>("spanner_ddl_async_raw")
-            .unwrap();
-        conn.register_table_function::<SpannerOperationsVTab>("spanner_operations_raw")
-            .unwrap();
-        conn.execute_batch("\
-            LOAD core_functions;\
-            LOAD json;\
-            INSTALL icu;\
-            LOAD icu;\
-        ").unwrap();
-        conn.execute_batch(include_str!("../src/macros.sql"))
-            .unwrap();
-        conn
-    }
+    open_extension_connection()
 }
 
 #[test]

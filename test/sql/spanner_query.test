@@ -1,0 +1,137 @@
+# name: test/sql/spanner_query.test
+# description: spanner_query table function (ported from tests/integration.sh)
+# group: [spanner]
+#
+# Prerequisites:
+#   make emulator-start
+#   bash tests/setup_sqllogic_db.sh
+#
+# Uses SPANNER_EMULATOR_HOST (default localhost:9010) for the gRPC endpoint.
+# Assertions use statement ok + IF(..., error(...)) to avoid sqllogictest re-executing lazy Spanner scans.
+
+require spanner
+
+require-env SPANNER_EMULATOR_HOST
+
+statement ok
+SET allow_extensions_metadata_mismatch=true;
+
+statement ok
+SET spanner_database_path = 'projects/test-project/instances/test-instance/databases/test-db';
+
+statement ok
+SET spanner_endpoint = '${SPANNER_EMULATOR_HOST}';
+
+# --- Basic connectivity ---
+
+statement ok
+SELECT IF(count = 3, 1, error('expected 3 rows')) FROM (SELECT COUNT(*)::INT AS count FROM spanner_query('SELECT Id FROM ScalarTypes ORDER BY Id'));
+
+statement ok
+SELECT IF(count = 0, 1, error('expected empty table')) FROM (SELECT COUNT(*)::INT AS count FROM spanner_query('SELECT * FROM EmptyTable'));
+
+# --- STRING type ---
+
+statement ok
+SELECT IF(StringCol = 'hello', 1, error('expected hello')) FROM spanner_query('SELECT StringCol FROM ScalarTypes WHERE Id = 1');
+
+statement ok
+SELECT IF(StringCol IS NULL, 1, error('expected NULL string')) FROM spanner_query('SELECT StringCol FROM ScalarTypes WHERE Id = 3');
+
+# --- INT64 type ---
+
+statement ok
+SELECT IF(Int64Col = 42, 1, error('expected 42')) FROM spanner_query('SELECT Int64Col FROM ScalarTypes WHERE Id = 1');
+
+statement ok
+SELECT IF(Int64Col = -100, 1, error('expected -100')) FROM spanner_query('SELECT Int64Col FROM ScalarTypes WHERE Id = 2');
+
+# --- BOOL type ---
+
+statement ok
+SELECT IF(BoolCol IS TRUE, 1, error('expected true')) FROM spanner_query('SELECT BoolCol FROM ScalarTypes WHERE Id = 1');
+
+statement ok
+SELECT IF(BoolCol IS FALSE, 1, error('expected false')) FROM spanner_query('SELECT BoolCol FROM ScalarTypes WHERE Id = 2');
+
+# --- FLOAT64 type ---
+
+statement ok
+SELECT IF(strpos(Float64Col::VARCHAR, '3.14') > 0, 1, error('expected 3.14')) FROM spanner_query('SELECT Float64Col FROM ScalarTypes WHERE Id = 1');
+
+# --- DATE type ---
+
+statement ok
+SELECT IF(DateCol = DATE '2024-01-15', 1, error('expected 2024-01-15')) FROM spanner_query('SELECT DateCol FROM ScalarTypes WHERE Id = 1');
+
+statement ok
+SELECT IF(DateCol = DATE '1999-12-31', 1, error('expected 1999-12-31')) FROM spanner_query('SELECT DateCol FROM ScalarTypes WHERE Id = 2');
+
+# --- TIMESTAMP type ---
+
+statement ok
+SELECT IF(strpos(TimestampCol::VARCHAR, '2024-06-15') > 0, 1, error('expected 2024-06-15 timestamp')) FROM spanner_query('SELECT TimestampCol FROM ScalarTypes WHERE Id = 1');
+
+# --- NUMERIC type ---
+
+statement ok
+SELECT IF(strpos(NumCol::VARCHAR, '123.456789') > 0, 1, error('expected numeric 123.456789')) FROM spanner_query('SELECT NumCol FROM NumericTypes WHERE Id = 1');
+
+statement ok
+SELECT IF(strpos(NumCol::VARCHAR, '-99999.999999999') > 0, 1, error('expected numeric -99999.999999999')) FROM spanner_query('SELECT NumCol FROM NumericTypes WHERE Id = 2');
+
+statement ok
+SELECT IF(NumCol IS NULL, 1, error('expected NULL numeric')) FROM spanner_query('SELECT NumCol FROM NumericTypes WHERE Id = 3');
+
+# --- JSON type ---
+
+statement ok
+SELECT IF(strpos(JsonCol::VARCHAR, 'key') > 0, 1, error('expected JSON key')) FROM spanner_query('SELECT JsonCol FROM NumericTypes WHERE Id = 1');
+
+# --- ARRAY type ---
+
+statement ok
+SELECT * FROM spanner_query('SELECT IntArray FROM ArrayTypes WHERE Id = 1');
+
+statement ok
+SELECT * FROM spanner_query('SELECT StrArray FROM ArrayTypes WHERE Id = 1');
+
+statement ok
+SELECT * FROM spanner_query('SELECT IntArray FROM ArrayTypes WHERE Id = 2');
+
+statement ok
+SELECT * FROM spanner_query('SELECT IntArray FROM ArrayTypes WHERE Id = 3');
+
+# --- NULL handling ---
+
+statement ok
+SELECT IF(count = 1, 1, error('expected 1 all-null row')) FROM (SELECT COUNT(*)::INT AS count FROM spanner_query('SELECT COUNT(*) FROM ScalarTypes WHERE BoolCol IS NULL'));
+
+# --- Multi-column queries ---
+
+statement ok
+SELECT IF(count = 3, 1, error('expected 3 multi-column rows')) FROM (SELECT COUNT(*)::INT AS count FROM spanner_query('SELECT Id, StringCol, Int64Col FROM ScalarTypes ORDER BY Id'));
+
+# --- DuckDB-side operations ---
+
+statement ok
+SELECT IF(count = 2, 1, error('expected 2 rows after DuckDB filter')) FROM (SELECT COUNT(*)::INT AS count FROM spanner_query('SELECT Id, StringCol FROM ScalarTypes') WHERE Id > 1);
+
+statement ok
+SELECT IF(s = -58, 1, error('expected sum -58')) FROM (SELECT SUM(Int64Col)::INT AS s FROM spanner_query('SELECT Int64Col FROM ScalarTypes'));
+
+# --- Spanner-side filtering ---
+
+statement ok
+SELECT IF(StringCol = 'world', 1, error('expected world')) FROM spanner_query('SELECT StringCol FROM ScalarTypes WHERE Id = 2');
+
+statement ok
+SELECT IF(count = 0, 1, error('expected 0 rows for Id=999')) FROM (SELECT COUNT(*)::INT AS count FROM spanner_query('SELECT * FROM ScalarTypes WHERE Id = 999'));
+
+# --- Complex Spanner SQL ---
+
+statement ok
+SELECT IF(count = 2, 1, error('expected LIMIT 2')) FROM (SELECT COUNT(*)::INT AS count FROM spanner_query('SELECT Id FROM ScalarTypes ORDER BY Id LIMIT 2'));
+
+statement ok
+SELECT IF(doubled = 84, 1, error('expected doubled=84')) FROM spanner_query('SELECT Int64Col * 2 AS doubled FROM ScalarTypes WHERE Id = 1');

@@ -1,0 +1,23 @@
+# name: test/sql/spanner_smoke.test
+# description: smoke test for spanner extension load
+# group: [spanner]
+
+# Before we load the extension, scalars are unavailable
+statement error
+SELECT spanner_value(1::BIGINT);
+----
+Catalog Error
+
+# Load extension via --external-extension (see Makefile TEST_RUNNER_RELEASE)
+require spanner
+
+query I
+SELECT 1;
+----
+1
+
+# Scalar registered at init; no Spanner connection required
+query I
+SELECT interval_to_iso8601(INTERVAL '0 seconds');
+----
+PT0S

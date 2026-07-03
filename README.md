@@ -22,7 +22,7 @@ brew install cargo-sweep
 
 ## Known Issues and Limitations
 
-- The DuckDB Rust binding is pinned to `duckdb = "=1.10503.1"`, which matches DuckDB `v1.5.3`.
+- The DuckDB Rust binding is pinned to `duckdb = "=1.10504.0"`, which matches DuckDB `v1.5.4`.
   The upstream Rust extension template still requires the unstable C API (`USE_UNSTABLE_C_API=1` / `C_STRUCT_UNSTABLE`), so loadable extension binaries remain tied to the DuckDB version encoded in the extension metadata.
   The extension requests at least the DuckDB `v1.5.0` C API at load time because it uses C API functions added in the 1.5 line.
   Keep `DUCKDB_VERSION` aligned with the DuckDB CLI or runtime you plan to load the extension into.
@@ -37,11 +37,11 @@ brew install cargo-sweep
 
 - DuckDB `VARIANT` is not used yet.
   Spanner JSON results currently map to DuckDB `VARCHAR` with the `JSON` alias.
-  DuckDB `v1.5.3` and duckdb-rs `1.10503.1` expose `VARIANT` metadata, and upstream DuckDB has C API support for reading `VARIANT`, but duckdb-rs still documents decoding `VARIANT` result columns as unsupported and this extension does not yet have a safe writer path for JSON-to-`VARIANT`.
+  DuckDB `v1.5.4` and duckdb-rs `1.10504.0` expose `VARIANT` metadata, and upstream DuckDB has C API support for reading `VARIANT`, but duckdb-rs still documents decoding `VARIANT` result columns as unsupported and this extension does not yet have a safe writer path for JSON-to-`VARIANT`.
   Changing JSON output to `VARIANT` would also be a visible result-type change.
 
 - DuckDB `GEOMETRY` is not used yet.
-  DuckDB 1.5 exposes `GEOMETRY` in the C API, but duckdb-rs `1.10503.1` does not wrap it in `LogicalTypeId`, and this extension has no current Spanner type mapping that requires geometry output.
+  DuckDB 1.5 exposes `GEOMETRY` in the C API, and duckdb-rs `1.10504.0` now wraps it in `LogicalTypeId`, but this extension has no current Spanner type mapping that requires geometry output.
 
 - Some DuckDB vector writes still cross unsafe API boundaries:
   fast UTF-8 string vector writes use raw C API escape hatches because safe duckdb-rs wrappers are missing for the exact operation (`src/convert.rs`), and fixed-size vector slices use duckdb-rs `unsafe` APIs (`src/ddl.rs`, `src/convert.rs`).
@@ -481,15 +481,27 @@ STRUCT parameters are not supported.
 
 ## Testing
 
-### Shell Tests
+### SQLLogicTest (primary)
 
-Shell tests run SQL queries against a DuckDB CLI with the extension loaded:
+Extension CI SQLLogicTest files live in `test/sql/`. `make test` (alias for `make test_release`) builds the loadable extension, starts or reuses the Spanner emulator, seeds the test database (`tests/setup_sqllogic_db.sh`), and runs all `test/sql/*.test` files.
 
 ```bash
-make test
+make configure          # once: venv + duckdb_sqllogictest-python
+make release test_release
+make test               # alias for test_release
 ```
 
-`make test` builds `spanner.duckdb_extension`, starts or reuses a local emulator container, and exercises the current user-facing SQL macros via DuckDB CLI. It expects Docker, DuckDB CLI, and `curl`.
+Requires Docker (Colima on macOS). Emulator tests use `SPANNER_EMULATOR_HOST` (default `localhost:9010`).
+
+### Shell integration tests
+
+The legacy shell harness (`tests/integration.sh`) remains available and mirrors the `spanner_query` / `spanner_scan` coverage in `test/sql/`:
+
+```bash
+make test-integration
+```
+
+Requires Docker, DuckDB CLI, and `curl`.
 
 ### Rust Integration Tests
 
@@ -501,18 +513,9 @@ cargo test
 
 `.cargo/config.toml` sets `RUST_TEST_THREADS=4` to keep Docker/testcontainers resource usage bounded during concurrent test runs.
 
-### Library-Mode Macro Tests
+### Library-Mode Tests
 
-If you register the raw `_raw` table functions manually from Rust and then execute `src/macros.sql` yourself, mirror the integration test setup first:
-
-```sql
-LOAD core_functions;
-LOAD json;
-INSTALL icu;
-LOAD icu;
-```
-
-Those loads are required because the helper macros in `src/macros.sql` depend on `to_json`, `base64`, and `AT TIME ZONE`.
+Rust integration tests call `register_c_api_extensions` (config, copy, scalars with null-input handling, replacement scan) and `register_extension_functions` (VTabs and SQL macros), mirroring the loadable extension init path.
 
 ### Cleaning Stale Build Artifacts
 
@@ -578,14 +581,10 @@ This extension registers the following names into the global DuckDB namespace.
 | `spanner_ddl_async` | table macro | Submit DDL asynchronously (see [`spanner_ddl_async`](#spanner_ddl_async)) |
 | `spanner_operations` | table macro | List DDL operations (see [`spanner_operations`](#spanner_operations)) |
 | `spanner` | copy function | Write to Spanner via `COPY TO` (see [`COPY TO`](#copy-to-write-to-spanner)) |
-| `spanner_value(val)` | scalar macro | Auto-detect Spanner type from DuckDB type (see [Query Parameters](#query-parameters)) |
-| `spanner_typed(val, type_name)` | scalar macro | Explicit Spanner type wrapper (see [Query Parameters](#query-parameters)) |
-| `spanner_params(s)` | scalar macro | Convert a STRUCT to a JSON params string for `spanner_query_raw` |
-| `interval_to_iso8601(i)` | scalar macro | Convert a DuckDB INTERVAL to an ISO 8601 duration string (e.g., `'P1Y3M'`, `'PT2H30M'`) |
-| `_spanner_type_name(t)` | scalar macro | Internal: map a DuckDB type name (scalar or array) to a Spanner type name |
-| `_spanner_scalar_type_name(t)` | scalar macro | Internal: scalar-only type name mapping used by `_spanner_type_name` |
-
-Names prefixed with `_` are internal implementation details and may change without notice.
+| `spanner_value(val)` | scalar function | Auto-detect Spanner type from DuckDB type (see [Query Parameters](#query-parameters)) |
+| `spanner_typed(val, type_name)` | scalar function | Explicit Spanner type wrapper (see [Query Parameters](#query-parameters)) |
+| `spanner_params(s)` | scalar function | Convert a STRUCT to a JSON params string for `spanner_query_raw` |
+| `interval_to_iso8601(i)` | scalar function | Convert a DuckDB INTERVAL to an ISO 8601 duration string (e.g., `'P1Y3M'`, `'PT2H30M'`) |
 
 **Config options** (see [Config Options](#config-options)):
 
