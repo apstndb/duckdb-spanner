@@ -514,7 +514,7 @@ fn write_raw_scalar_to_flat(
                     .map_err(|e| {
                         SpannerError::Conversion(format!("TIMESTAMP parse error: {e}"))
                     })?;
-                let micros = ts.unix_timestamp() * 1_000_000 + (ts.nanosecond() / 1_000) as i64;
+                let micros = (ts.unix_timestamp_nanos() / 1_000) as i64;
                 unsafe { *vector.as_mut_ptr::<i64>().add(idx) = micros }
             } else {
                 vector.set_null(idx);
