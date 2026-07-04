@@ -5,6 +5,9 @@ use crate::error::SpannerError;
 
 static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
+// DuckDB's C extension API has no unload hook, so the Tokio runtime and cached Spanner
+// clients are intentionally leaked for the process lifetime.
+
 fn get_or_init_runtime() -> Result<&'static Runtime, SpannerError> {
     if let Some(rt) = TOKIO_RUNTIME.get() {
         return Ok(rt);
