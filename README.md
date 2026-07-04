@@ -57,6 +57,8 @@ brew install cargo-sweep
 
 - `COPY TO ... FORMAT spanner` commits each `batch_size` chunk independently; a mid-COPY failure leaves earlier batches committed. Use idempotent write modes (e.g. `insert_or_update`) when retrying.
 
+- Named parameters with empty string values (`project := ''`) are treated as absent (see `bind_utils::get_named_string`). `database_path` cannot be combined with `project`/`instance`/`database` named parameters.
+
 ## Installation
 
 ### Build from Source
