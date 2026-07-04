@@ -53,6 +53,7 @@ brew install cargo-sweep
 - Results are streamed via an internal channel. Memory usage is bounded regardless of result set size.
 
 - `use_parallelism` enables the [partitioned API](https://cloud.google.com/spanner/docs/reads#read_data_in_parallel) (required for Data Boost). Partitions are executed concurrently, each with its own session from the pool.
+  If partitioned execution fails **before any row is delivered**, the extension logs a warning and falls back to a single non-partitioned query/read (without Data Boost). If rows were already streamed, the error is propagated instead of falling back (to avoid duplicate rows).
 
 ## Installation
 
