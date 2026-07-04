@@ -155,17 +155,23 @@ impl VScalar for SpannerValueScalar {
 
         if logical_type.id() == LogicalTypeId::Interval {
             let vec = input.flat_vector(0);
-            let intervals =
-                unsafe { vec.as_slice_with_len::<duckdb_interval>(len) };
             let mut strings = Vec::with_capacity(len);
-            for interval in intervals {
-                let iso = duckdb_interval_to_iso8601(
-                    interval.months,
-                    interval.days,
-                    interval.micros,
-                );
-                let obj = json!({"value": iso, "type": "INTERVAL"});
-                strings.push(serde_json::to_string(&obj)?);
+            for row in 0..len {
+                if vec.row_is_null(row as u64) {
+                    let obj = json!({"value": null, "type": "INTERVAL"});
+                    strings.push(serde_json::to_string(&obj)?);
+                } else {
+                    let interval = unsafe {
+                        vec.as_slice_with_len::<duckdb_interval>(row + 1)[row]
+                    };
+                    let iso = duckdb_interval_to_iso8601(
+                        interval.months,
+                        interval.days,
+                        interval.micros,
+                    );
+                    let obj = json!({"value": iso, "type": "INTERVAL"});
+                    strings.push(serde_json::to_string(&obj)?);
+                }
             }
             return write_string_array(&strings, output);
         }
@@ -194,37 +200,56 @@ impl VScalar for SpannerTypedScalar {
         if value_type.id() == LogicalTypeId::Interval {
             let value_vec = input.flat_vector(0);
             let type_vec = input.flat_vector(1);
-            let intervals =
-                unsafe { value_vec.as_slice_with_len::<duckdb_interval>(len) };
             let mut strings = Vec::with_capacity(len);
-            for (i, interval) in intervals.iter().enumerate() {
-                let typ = read_varchar_at(&type_vec, i)?;
-                let iso = duckdb_interval_to_iso8601(
-                    interval.months,
-                    interval.days,
-                    interval.micros,
-                );
-                let obj = json!({"value": iso, "type": typ});
-                strings.push(serde_json::to_string(&obj)?);
+            for row in 0..len {
+                let typ = if type_vec.row_is_null(row as u64) {
+                    "INTERVAL".to_string()
+                } else {
+                    read_varchar_at(&type_vec, row)?
+                };
+                if value_vec.row_is_null(row as u64) {
+                    let obj = json!({"value": null, "type": typ});
+                    strings.push(serde_json::to_string(&obj)?);
+                } else {
+                    let interval = unsafe {
+                        value_vec.as_slice_with_len::<duckdb_interval>(row + 1)[row]
+                    };
+                    let iso = duckdb_interval_to_iso8601(
+                        interval.months,
+                        interval.days,
+                        interval.micros,
+                    );
+                    let obj = json!({"value": iso, "type": typ});
+                    strings.push(serde_json::to_string(&obj)?);
+                }
             }
             return write_string_array(&strings, output);
         }
 
-        let mut types = Vec::with_capacity(len);
+        let mut types: Vec<Option<String>> = Vec::with_capacity(len);
         {
             let type_vec = input.flat_vector(1);
             for row in 0..len {
-                types.push(read_varchar_at(&type_vec, row)?);
+                if type_vec.row_is_null(row as u64) {
+                    types.push(None);
+                } else {
+                    types.push(Some(read_varchar_at(&type_vec, row)?));
+                }
             }
         }
-        let mut strings = Vec::with_capacity(len);
+        let mut strings: Vec<Option<String>> = Vec::with_capacity(len);
         for (row, typ) in types.into_iter().enumerate() {
+            let Some(typ) = typ else {
+                strings.push(None);
+                continue;
+            };
             let value = vector_to_json_value(input, 0, row, &value_type)?;
             let obj = json!({"value": value, "type": typ});
-            strings.push(serde_json::to_string(&obj)?);
+            strings.push(Some(serde_json::to_string(&obj)?));
         }
 
-        write_string_array(&strings, output)
+        let array: std::sync::Arc<dyn Array> = std::sync::Arc::new(StringArray::from(strings));
+        write_arrow_array_to_vector(&array, output)
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
@@ -271,18 +296,22 @@ impl VScalar for IntervalToIso8601Scalar {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let len = input.len();
         let vec = input.flat_vector(0);
-        let intervals = unsafe { vec.as_slice_with_len::<duckdb_interval>(len) };
-
-        let mut strings = Vec::with_capacity(len);
-        for interval in intervals {
-            strings.push(duckdb_interval_to_iso8601(
-                interval.months,
-                interval.days,
-                interval.micros,
-            ));
+        let mut values: Vec<Option<String>> = Vec::with_capacity(len);
+        for row in 0..len {
+            if vec.row_is_null(row as u64) {
+                values.push(None);
+            } else {
+                let interval = unsafe { vec.as_slice_with_len::<duckdb_interval>(row + 1)[row] };
+                values.push(Some(duckdb_interval_to_iso8601(
+                    interval.months,
+                    interval.days,
+                    interval.micros,
+                )));
+            }
         }
-
-        write_string_array(&strings, output)
+        let array: std::sync::Arc<dyn Array> =
+            std::sync::Arc::new(StringArray::from(values));
+        write_arrow_array_to_vector(&array, output)
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
@@ -807,6 +836,28 @@ mod tests {
     #[test]
     fn test_interval_zero() {
         assert_eq!(duckdb_interval_to_iso8601(0, 0, 0), "PT0S");
+    }
+
+    #[test]
+    fn test_spanner_value_null_interval() {
+        let conn = open_test_connection();
+
+        let json: String = conn
+            .query_row("SELECT spanner_value(NULL::INTERVAL)", [], |r| r.get(0))
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["type"], "INTERVAL");
+        assert!(parsed["value"].is_null());
+    }
+
+    #[test]
+    fn test_interval_to_iso8601_null() {
+        let conn = open_test_connection();
+
+        let result: Option<String> = conn
+            .query_row("SELECT interval_to_iso8601(NULL::INTERVAL)", [], |r| r.get(0))
+            .unwrap();
+        assert!(result.is_none());
     }
 
     #[test]
