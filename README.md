@@ -28,9 +28,8 @@ brew install cargo-sweep
   Keep `DUCKDB_VERSION` aligned with the DuckDB CLI or runtime you plan to load the extension into.
 
 - This project depends on a patched version of [gcloud-spanner](https://github.com/yoshidan/google-cloud-rust) via `[patch.crates-io]`.
-  The upstream `RowIterator::try_recv()` discards metadata and stats when a `PartialResultSet` has empty values, which breaks `columns_metadata()` and `stats()` for `QueryMode::Plan`, empty result sets, and other scenarios.
-  See [yoshidan/google-cloud-rust#428](https://github.com/yoshidan/google-cloud-rust/pull/428) for details.
-  Additionally, `Client::get_session` and `RowIterator::new` are made public for concurrent partition execution.
+  `Client::get_session` and `RowIterator::new` are made public for concurrent partition execution.
+  Upstream [yoshidan/google-cloud-rust#428](https://github.com/yoshidan/google-cloud-rust/pull/428) (metadata on empty PartialResultSets) is merged in gcloud-spanner 1.8+; rebasing the fork onto 1.8.x is planned.
 
 - Extension initialization is intentionally manual rather than using `#[duckdb_entrypoint_c_api]`.
   The extension needs a raw `duckdb_connection` to register session config options and the `COPY TO ... FORMAT spanner` copy function, and duckdb-rs currently exposes those APIs only through `duckdb::ffi`.
