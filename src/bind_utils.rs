@@ -158,6 +158,16 @@ pub fn resolve_database_path(bind: &BindInfo) -> Result<String, Box<dyn std::err
     let arg_project = get_named_string(bind, "project");
     let arg_instance = get_named_string(bind, "instance");
     let arg_database = get_named_string(bind, "database");
+    let arg_database_path = get_named_string(bind, "database_path");
+
+    if arg_database_path.is_some()
+        && (arg_project.is_some() || arg_instance.is_some() || arg_database.is_some())
+    {
+        return Err(
+            "cannot combine database_path with project, instance, or database named parameters"
+                .into(),
+        );
+    }
 
     if arg_project.is_some() || arg_instance.is_some() || arg_database.is_some() {
         let project = arg_project.or_else(|| config::get_config_string(bind, "spanner_project"));
