@@ -42,3 +42,23 @@ jobs:
       exclude_archs: 'linux_amd64_musl;wasm_mvp;wasm_eh;wasm_threads'
       # macOS/windows runners lack a Spanner emulator; tests run in emulator-tests below.
       skip_tests: true
+
+  emulator-tests:
+    name: Emulator integration tests
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Start Spanner emulator
+        run: make emulator-start
+
+      - name: SQLLogicTest (make test_release)
+        run: make configure release test_release
+
+      - name: Rust integration tests
+        run: cargo test
