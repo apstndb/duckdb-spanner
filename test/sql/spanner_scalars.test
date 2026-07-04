@@ -1,0 +1,50 @@
+# name: test/sql/spanner_scalars.test
+# description: scalar functions (spanner_value, spanner_typed, spanner_params, interval_to_iso8601)
+# group: [spanner]
+
+require spanner
+
+# --- interval_to_iso8601 (no Spanner connection) ---
+
+query T
+SELECT interval_to_iso8601(INTERVAL '1 day');
+----
+P1D
+
+query T
+SELECT interval_to_iso8601(INTERVAL '2 hours 30 minutes');
+----
+PT2H30M
+
+# --- spanner_value JSON encoding (no Spanner connection) ---
+
+statement ok
+SELECT IF(
+	strpos(spanner_value(42::BIGINT), '"type":"INT64"') > 0
+	AND strpos(spanner_value(42::BIGINT), '42') > 0,
+	1,
+	error('expected INT64 spanner_value JSON')
+);
+
+statement ok
+SELECT IF(
+	strpos(spanner_value(NULL::BIGINT), '"type":"INT64"') > 0
+	AND strpos(spanner_value(NULL::BIGINT), 'null') > 0,
+	1,
+	error('expected null INT64 spanner_value JSON')
+);
+
+statement ok
+SELECT IF(
+	strpos(spanner_typed(42, 'INT64'), '"type":"INT64"') > 0,
+	1,
+	error('expected spanner_typed INT64 JSON')
+);
+
+statement ok
+SELECT IF(
+	strpos(spanner_params({'age': spanner_value(25::BIGINT), 'name': 'Alice'}), 'Alice') > 0
+	AND strpos(spanner_params({'age': spanner_value(25::BIGINT), 'name': 'Alice'}), 'INT64') > 0,
+	1,
+	error('expected spanner_params JSON')
+);

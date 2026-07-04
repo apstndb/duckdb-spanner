@@ -1,0 +1,26 @@
+# name: test/sql/spanner_replacement_scan.test
+# description: spanner: replacement scan prefix
+# group: [spanner]
+#
+# Prerequisites:
+#   make emulator-start
+#   bash tests/setup_sqllogic_db.sh
+
+require spanner
+
+require-env SPANNER_EMULATOR_HOST
+
+statement ok
+SET allow_extensions_metadata_mismatch=true;
+
+statement ok
+SET spanner_database_path = 'projects/test-project/instances/test-instance/databases/test-db';
+
+statement ok
+SET spanner_endpoint = '${SPANNER_EMULATOR_HOST}';
+
+statement ok
+SELECT IF(count = 3, 1, error('expected 3 replacement-scan rows')) FROM (SELECT COUNT(*)::INT AS count FROM "spanner:ScalarTypes");
+
+statement ok
+SELECT IF(StringCol = 'hello', 1, error('expected hello via replacement scan')) FROM "spanner:ScalarTypes" WHERE Id = 1;

@@ -1,0 +1,42 @@
+# name: test/sql/spanner_ddl.test
+# description: spanner_ddl and spanner_ddl_async on isolated test-ddl-db
+# group: [spanner]
+#
+# Prerequisites:
+#   make emulator-start
+#   bash tests/setup_sqllogic_db.sh
+
+require spanner
+
+require-env SPANNER_EMULATOR_HOST
+
+statement ok
+SET allow_extensions_metadata_mismatch=true;
+
+statement ok
+SET spanner_database_path = 'projects/test-project/instances/test-instance/databases/test-ddl-db';
+
+statement ok
+SET spanner_endpoint = '${SPANNER_EMULATOR_HOST}';
+
+# --- sync DDL: create, verify, drop ---
+
+statement ok
+SELECT IF(done IS TRUE, 1, error('sync DDL should complete')) FROM spanner_ddl('CREATE TABLE SqllogicDdlTest (Id INT64 NOT NULL, Name STRING(MAX)) PRIMARY KEY (Id)');
+
+statement ok
+SELECT IF(count = 0, 1, error('expected empty new table')) FROM (SELECT COUNT(*)::INT AS count FROM spanner_query('SELECT * FROM SqllogicDdlTest'));
+
+statement ok
+SELECT IF(done IS TRUE, 1, error('drop table DDL should complete')) FROM spanner_ddl('DROP TABLE SqllogicDdlTest');
+
+# --- async DDL: create and verify ---
+
+statement ok
+SELECT IF(operation_name IS NOT NULL, 1, error('async DDL should return operation_name')) FROM spanner_ddl_async('CREATE TABLE SqllogicDdlAsync (Id INT64 NOT NULL, Data BYTES(MAX)) PRIMARY KEY (Id)');
+
+statement ok
+SELECT IF(count = 0, 1, error('expected empty async table')) FROM (SELECT COUNT(*)::INT AS count FROM spanner_query('SELECT * FROM SqllogicDdlAsync'));
+
+statement ok
+SELECT IF(done IS TRUE, 1, error('async drop should complete')) FROM spanner_ddl('DROP TABLE SqllogicDdlAsync');

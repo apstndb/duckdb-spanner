@@ -56,7 +56,9 @@ curl -sf -X POST \
 			"CREATE TABLE EmptyTable (Id INT64 NOT NULL, Name STRING(MAX)) PRIMARY KEY (Id)",
 			"CREATE TABLE NullableTypes (Id INT64 NOT NULL, Val STRING(MAX)) PRIMARY KEY (Id)",
 			"CREATE TABLE NumericTypes (Id INT64 NOT NULL, NumCol NUMERIC, JsonCol JSON) PRIMARY KEY (Id)",
-			"CREATE TABLE ArrayTypes (Id INT64 NOT NULL, IntArray ARRAY<INT64>, StrArray ARRAY<STRING(MAX)>) PRIMARY KEY (Id)"
+			"CREATE TABLE ArrayTypes (Id INT64 NOT NULL, IntArray ARRAY<INT64>, StrArray ARRAY<STRING(MAX)>) PRIMARY KEY (Id)",
+			"CREATE TABLE CopyTarget (Id INT64 NOT NULL, Name STRING(MAX), Value FLOAT64) PRIMARY KEY (Id)",
+			"CREATE TABLE CopyTypes (Id INT64 NOT NULL, BoolCol BOOL, Int64Col INT64, Float64Col FLOAT64, StringCol STRING(MAX), DateCol DATE, TimestampCol TIMESTAMP) PRIMARY KEY (Id)"
 		]
 	}' >/dev/null 2>&1
 
@@ -137,4 +139,18 @@ curl -sf -X POST "${EMULATOR_REST}/v1/${session}:commit" \
 
 curl -sf -X DELETE "${EMULATOR_REST}/v1/${session}" >/dev/null 2>&1 || true
 
+# Empty database for DDL SQLLogicTest (isolated from read/copy tables)
+DATABASE_DDL="test-ddl-db"
+curl -sf -X DELETE \
+	"${EMULATOR_REST}/v1/projects/${PROJECT}/instances/${INSTANCE}/databases/${DATABASE_DDL}" \
+	>/dev/null 2>&1 || true
+
+curl -sf -X POST \
+	"${EMULATOR_REST}/v1/projects/${PROJECT}/instances/${INSTANCE}/databases" \
+	-H "Content-Type: application/json" \
+	-d '{
+		"createStatement": "CREATE DATABASE `test-ddl-db`"
+	}' >/dev/null 2>&1
+
 echo "SQLLogicTest database ready at ${EMULATOR_HOST} (${PROJECT}/${INSTANCE}/${DATABASE})"
+echo "DDL test database ready at ${EMULATOR_HOST} (${PROJECT}/${INSTANCE}/${DATABASE_DDL})"

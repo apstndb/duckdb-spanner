@@ -24,7 +24,7 @@ make test_debug                # debug build + tests
 
 On macOS with Colima, set `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock` if Docker is not on the default socket.
 
-Tests live in `test/sql/` (SQLLogicTest format): `spanner_smoke.test`, `spanner_query.test`, `spanner_scan.test`. The runner loads the built extension via `--external-extension build/release/spanner.duckdb_extension`. Use `require spanner` in tests to load it. Emulator tests use `SPANNER_EMULATOR_HOST` (default `localhost:9010`) and `SET allow_extensions_metadata_mismatch=true` when loading via `--external-extension`.
+Tests live in `test/sql/` (SQLLogicTest format): `spanner_smoke.test`, `spanner_query.test`, `spanner_scan.test`, `spanner_scalars.test`, `spanner_params.test`, `spanner_tables.test`, `spanner_replacement_scan.test`, `spanner_ddl.test`, `spanner_copy.test`. The runner loads the built extension via `--external-extension build/release/spanner.duckdb_extension`. Use `require spanner` in tests to load it. Emulator tests use `SPANNER_EMULATOR_HOST` (default `localhost:9010`) and `SET allow_extensions_metadata_mismatch=true` when loading via `--external-extension`.
 
 **Run emulator-backed tests serially.** Only one of `make test_release` or `make test-integration` should hit the shared Spanner emulator at a time; concurrent runs cause flaky `Session not found` errors. For a clean slate: `make emulator-stop && make emulator-start`.
 

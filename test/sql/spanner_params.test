@@ -1,0 +1,29 @@
+# name: test/sql/spanner_params.test
+# description: spanner_query params round-trip via spanner_value
+# group: [spanner]
+#
+# Prerequisites:
+#   make emulator-start
+#   bash tests/setup_sqllogic_db.sh
+
+require spanner
+
+require-env SPANNER_EMULATOR_HOST
+
+statement ok
+SET allow_extensions_metadata_mismatch=true;
+
+statement ok
+SET spanner_database_path = 'projects/test-project/instances/test-instance/databases/test-db';
+
+statement ok
+SET spanner_endpoint = '${SPANNER_EMULATOR_HOST}';
+
+statement ok
+SELECT IF(Int64Col = 42, 1, error('expected param round-trip 42')) FROM spanner_query('SELECT @v AS Int64Col', params := {'v': spanner_value(42::BIGINT)});
+
+statement ok
+SELECT IF(StringCol = 'hello', 1, error('expected param round-trip hello')) FROM spanner_query('SELECT @name AS StringCol', params := {'name': spanner_value('hello')});
+
+statement ok
+SELECT IF(count = 1, 1, error('expected one filtered row')) FROM (SELECT COUNT(*)::INT AS count FROM spanner_query('SELECT Id FROM ScalarTypes WHERE Id = @id', params := {'id': spanner_value(1::BIGINT)}));

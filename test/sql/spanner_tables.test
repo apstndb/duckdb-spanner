@@ -1,0 +1,29 @@
+# name: test/sql/spanner_tables.test
+# description: spanner_tables metadata table function
+# group: [spanner]
+#
+# Prerequisites:
+#   make emulator-start
+#   bash tests/setup_sqllogic_db.sh
+
+require spanner
+
+require-env SPANNER_EMULATOR_HOST
+
+statement ok
+SET allow_extensions_metadata_mismatch=true;
+
+statement ok
+SET spanner_database_path = 'projects/test-project/instances/test-instance/databases/test-db';
+
+statement ok
+SET spanner_endpoint = '${SPANNER_EMULATOR_HOST}';
+
+statement ok
+SELECT IF(table_name = 'ScalarTypes', 1, error('expected ScalarTypes')) FROM spanner_tables() WHERE table_name = 'ScalarTypes';
+
+statement ok
+SELECT IF(table_name = 'EmptyTable', 1, error('expected EmptyTable')) FROM spanner_tables() WHERE table_name = 'EmptyTable';
+
+statement ok
+SELECT IF(count >= 5, 1, error('expected at least 5 base tables')) FROM (SELECT COUNT(*)::INT AS count FROM spanner_tables());
