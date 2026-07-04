@@ -614,13 +614,13 @@ fn try_parse_spanner_interval(s: &str) -> Option<DuckDBInterval> {
         return None;
     }
 
-    // Parse "years-months"
-    let ym: Vec<&str> = parts[0].split('-').collect();
-    if ym.len() != 2 {
+    // Parse "years-months" (separator is the last '-', so "-1-2" => years=-1, months=2)
+    let sep = parts[0].rfind('-')?;
+    if sep == 0 {
         return None;
     }
-    let years: i32 = ym[0].parse().ok()?;
-    let months: i32 = ym[1].parse().ok()?;
+    let years: i32 = parts[0][..sep].parse().ok()?;
+    let months: i32 = parts[0][sep + 1..].parse().ok()?;
 
     // Parse days
     let days: i32 = parts[1].parse().ok()?;
@@ -715,4 +715,33 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, SpannerError> {
 /// Hint for child vector capacity. DuckDB's vector standard size.
 fn rows_capacity_hint() -> usize {
     2048
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::format_description::well_known::Rfc3339;
+    use time::OffsetDateTime;
+
+    #[test]
+    fn pre_epoch_timestamp_fractional_seconds() {
+        let s = "1969-12-31T23:59:59.5Z";
+        let ts = OffsetDateTime::parse(s, &Rfc3339).unwrap();
+        let micros = (ts.unix_timestamp_nanos() / 1_000) as i64;
+        assert_eq!(micros, -500_000);
+    }
+
+    #[test]
+    fn spanner_negative_year_month_interval() {
+        let interval = try_parse_spanner_interval("P-1-2 0 0:0:0").expect("parse");
+        assert_eq!(interval.months, -10); // -1 year, +2 months
+        assert_eq!(interval.days, 0);
+        assert_eq!(interval.micros, 0);
+    }
+
+    #[test]
+    fn iso8601_negative_interval_round_trip() {
+        let interval = parse_iso8601_interval("PT-1H-30M").expect("parse");
+        assert_eq!(interval.micros, -90 * 60 * 1_000_000);
+    }
 }
