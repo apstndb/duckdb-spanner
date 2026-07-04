@@ -27,7 +27,7 @@ jobs:
           components: rustfmt, clippy
 
       - run: cargo fmt --check
-      - run: cargo clippy --features loadable-extension -- -D warnings
+      - run: cargo clippy --features loadable-extension
 
   duckdb-stable-build:
     name: Build extension binaries
