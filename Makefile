@@ -29,10 +29,8 @@ DUCKDB_VERSION := v1.5.4
 endif
 # Keep the existing v-prefixed extension metadata while deriving the numeric
 # version from the crate package section to avoid manual drift.
-EXT_VERSION ?= $(shell awk -F'"' '/^[[:space:]]*\[package\]/{in_pkg=1; next} /^[[:space:]]*\[/{in_pkg=0} in_pkg && /^[[:space:]]*version[[:space:]]*=[[:space:]]*"/{print "v"$$2; exit}' Cargo.toml)
-ifeq ($(strip $(EXT_VERSION)),)
-$(error EXT_VERSION is empty; failed to derive it from Cargo.toml. Set EXT_VERSION explicitly or update the Cargo.toml parsing logic.)
-endif
+# Derive from Cargo.toml with grep/sed (portable on Windows CI; awk `[` breaks mawk).
+EXT_VERSION ?= $(shell grep -E '^[[:space:]]*version[[:space:]]*=' Cargo.toml | head -1 | sed 's/.*"\([^"]*\)".*/v\1/')
 SWEEP_DAYS ?= 3
 
 build:
@@ -45,6 +43,9 @@ build-release:
 	cargo build --features loadable-extension --release
 
 extension: build-release
+ifeq ($(strip $(EXT_VERSION)),)
+	$(error EXT_VERSION is empty; failed to derive it from Cargo.toml. Set EXT_VERSION explicitly.)
+endif
 	@cp $(RAW_LIB) spanner_raw.$(LIB_EXT)
 	@python3 $(METADATA_SCRIPT) \
 		-l spanner_raw.$(LIB_EXT) \
