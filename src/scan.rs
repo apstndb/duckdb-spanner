@@ -18,7 +18,6 @@ use crate::{client, convert, runtime, schema, types};
 
 const BATCH_SIZE: usize = 2048;
 
-#[repr(C)]
 pub struct ScanBindData {
     database: String,
     table: String,
