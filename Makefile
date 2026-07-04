@@ -113,6 +113,8 @@ clean_all: clean clean_build clean_configure clean_rust
 EXTENSION_NAME=spanner
 USE_UNSTABLE_C_API=1
 TARGET_DUCKDB_VERSION=v1.5.4
+# Keep extension-ci-tools metadata in sync with Cargo.toml (not stale git short hash).
+EXTENSION_VERSION ?= $(patsubst v%,%,$(EXT_VERSION))
 
 include extension-ci-tools/makefiles/c_api_extensions/base.Makefile
 
@@ -130,6 +132,10 @@ else
 endif
 
 include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
+
+# Always refresh extension version from Cargo.toml (avoid stale git-hash file).
+extension_version:
+	@echo "$(EXTENSION_VERSION)" > configure/extension_version.txt
 
 # duckdb-spanner gates loadable-extension behind a crate feature (integration tests use rlib mode).
 build_extension_library_debug: check_configure
