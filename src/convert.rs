@@ -41,7 +41,7 @@ unsafe fn unsafe_assign_string(vector: &mut FlatVector<'_>, idx: usize, s: &str)
     ffi::duckdb_unsafe_vector_assign_string_element_len(
         raw_vector,
         idx as u64,
-        s.as_ptr() as *const i8,
+        s.as_ptr() as *const _,
         s.len() as u64,
     );
 }
