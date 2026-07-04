@@ -1,4 +1,5 @@
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
@@ -107,6 +108,7 @@ impl VTab for SpannerQueryVTab {
         let priority = bind_data.priority;
 
         runtime::spawn(async move {
+            let rows_delivered = Arc::new(AtomicBool::new(false));
             let result: Result<(), SpannerError> = async {
                 let client =
                     client::get_or_create_client(&database, endpoint.as_deref()).await?;
@@ -128,13 +130,15 @@ impl VTab for SpannerQueryVTab {
                         priority,
                         use_data_boost,
                         partition_options,
+                        rows_delivered.clone(),
                     )
                     .await
                     {
                         Ok(()) => return Ok(()),
-                        Err(e) => {
+                        Err(e) if !rows_delivered.load(Ordering::SeqCst) => {
                             eprintln!("[duckdb-spanner] Partitioned query failed: {e}, falling back to single query");
                         }
+                        Err(e) => return Err(e),
                     }
                 }
 
@@ -279,6 +283,7 @@ async fn stream_partitioned_query(
     priority: Option<Priority>,
     data_boost_enabled: bool,
     partition_options: Option<PartitionOptions>,
+    rows_delivered: Arc<AtomicBool>,
 ) -> Result<(), SpannerError> {
     let call_options = CallOptions {
         priority,
@@ -321,12 +326,14 @@ async fn stream_partitioned_query(
     for partition in partitions {
         let tx = tx.clone();
         let client = client.clone();
+        let rows_delivered = rows_delivered.clone();
         handles.push(tokio::spawn(async move {
             let mut session = client.get_session().await.map_err(|e| SpannerError::Other(e.to_string()))?;
             let mut iter = RowIterator::new(&mut *session, partition.reader, None, false)
                 .await
                 .map_err(SpannerError::Grpc)?;
             while let Some(row) = iter.next().await.map_err(SpannerError::Grpc)? {
+                rows_delivered.store(true, Ordering::SeqCst);
                 if tx.send(Ok(row)).await.is_err() {
                     return Ok(()); // receiver dropped
                 }
@@ -335,11 +342,35 @@ async fn stream_partitioned_query(
         }));
     }
 
-    for handle in handles {
-        match handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(e) => return Err(SpannerError::Other(format!("Task join error: {e}"))),
+    let mut remaining = handles;
+    while !remaining.is_empty() {
+        let mut progressed = false;
+        let mut i = 0;
+        while i < remaining.len() {
+            if remaining[i].is_finished() {
+                let handle = remaining.remove(i);
+                progressed = true;
+                match handle.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        for h in remaining {
+                            h.abort();
+                        }
+                        return Err(e);
+                    }
+                    Err(e) => {
+                        for h in remaining {
+                            h.abort();
+                        }
+                        return Err(SpannerError::Other(format!("Task join error: {e}")));
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+        if !progressed {
+            tokio::task::yield_now().await;
         }
     }
     Ok(())
