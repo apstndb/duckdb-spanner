@@ -45,8 +45,8 @@ curl -sf -X DELETE \
 	"${EMULATOR_REST}/v1/projects/${PROJECT}/instances/${INSTANCE}/databases/${DATABASE}" \
 	>/dev/null 2>&1 || true
 
-# Create database with test tables
-curl -sf -X POST \
+# Create database with test tables (fail fast — swallowed errors cause confusing test failures)
+if ! curl -sf -X POST \
 	"${EMULATOR_REST}/v1/projects/${PROJECT}/instances/${INSTANCE}/databases" \
 	-H "Content-Type: application/json" \
 	-d '{
@@ -60,7 +60,10 @@ curl -sf -X POST \
 			"CREATE TABLE CopyTarget (Id INT64 NOT NULL, Name STRING(MAX), Value FLOAT64) PRIMARY KEY (Id)",
 			"CREATE TABLE CopyTypes (Id INT64 NOT NULL, BoolCol BOOL, Int64Col INT64, Float64Col FLOAT64, StringCol STRING(MAX), DateCol DATE, TimestampCol TIMESTAMP) PRIMARY KEY (Id)"
 		]
-	}' >/dev/null 2>&1
+	}' >/dev/null 2>&1; then
+	echo "ERROR: failed to create database ${DATABASE}" >&2
+	exit 1
+fi
 
 sleep 1
 
