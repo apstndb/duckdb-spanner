@@ -42,7 +42,10 @@ impl TimestampBoundConfig {
     }
 }
 
-/// Get a named VARCHAR parameter, returning None if absent, NULL, or empty.
+/// Get a named string parameter, returning None if absent, NULL, or empty string.
+///
+/// Empty strings are treated as absent so macro-generated `NULL` literals (`''`) do not
+/// override config fallbacks. An explicit `project := ''` is therefore ignored.
 pub fn get_named_string(bind: &BindInfo, name: &str) -> Option<String> {
     bind.get_named_parameter(name)
         .filter(|v| !v.is_null())
