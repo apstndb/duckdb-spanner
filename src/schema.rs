@@ -106,15 +106,15 @@ pub async fn discover_table_schema(
 
     let mut columns = Vec::new();
     while let Some(row) = iter.next().await.map_err(SpannerError::Grpc)? {
-        let table_schema: String = row.column(0)?;
+        let _table_schema: String = row.column(0)?;
         let name: String = row.column(1)?;
         let spanner_type_str: String = row.column(2)?;
 
-        // Use dialect-appropriate type parser
-        let spanner_type = if table_schema == "public" {
-            types::parse_pg_spanner_type(&spanner_type_str)
-        } else {
-            types::parse_spanner_type(&spanner_type_str)
+        // Use the detected database dialect, not TABLE_SCHEMA (PG tables in named
+        // schemas such as myschema.Users still use PostgreSQL type strings).
+        let spanner_type = match dialect {
+            DatabaseDialect::Postgresql => types::parse_pg_spanner_type(&spanner_type_str),
+            _ => types::parse_spanner_type(&spanner_type_str),
         };
 
         columns.push(ColumnInfo { name, spanner_type });
