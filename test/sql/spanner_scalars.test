@@ -21,6 +21,18 @@ SELECT interval_to_iso8601(NULL::INTERVAL);
 ----
 NULL
 
+query T
+SELECT interval_to_iso8601(INTERVAL '-90 minutes');
+----
+PT-2H30M
+
+query T
+SELECT interval_to_iso8601(INTERVAL '1 day') FROM range(3);
+----
+P1D
+P1D
+P1D
+
 statement ok
 SELECT IF(
 	strpos(spanner_value(NULL::INTERVAL), '"type":"INTERVAL"') > 0

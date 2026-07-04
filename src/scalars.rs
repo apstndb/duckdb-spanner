@@ -750,9 +750,9 @@ pub fn duckdb_interval_to_iso8601(months: i32, days: i32, micros: i64) -> String
     let years = months.div_euclid(12);
     let months = months.rem_euclid(12);
 
-    let hours = micros / 3_600_000_000;
+    let hours = micros.div_euclid(3_600_000_000);
     let rem = micros.rem_euclid(3_600_000_000);
-    let minutes = rem / 60_000_000;
+    let minutes = rem.div_euclid(60_000_000);
     let rem = rem.rem_euclid(60_000_000);
     let seconds = rem / 1_000_000;
     let frac_micros = rem.rem_euclid(1_000_000);
@@ -836,6 +836,12 @@ mod tests {
     #[test]
     fn test_interval_zero() {
         assert_eq!(duckdb_interval_to_iso8601(0, 0, 0), "PT0S");
+    }
+
+    #[test]
+    fn test_interval_negative_hours() {
+        // -90 minutes decomposes as -2h + 30m under euclidean component semantics
+        assert_eq!(duckdb_interval_to_iso8601(0, 0, -90 * 60 * 1_000_000), "PT-2H30M");
     }
 
     #[test]
