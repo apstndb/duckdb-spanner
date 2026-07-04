@@ -500,9 +500,15 @@ fn flat_vector_to_json_value(
         }
         LogicalTypeId::Integer => Ok(json!(unsafe { vec.as_slice_with_len::<i32>(row + 1)[row] })),
         LogicalTypeId::Bigint => Ok(json!(unsafe { vec.as_slice_with_len::<i64>(row + 1)[row] })),
-        LogicalTypeId::UTinyint | LogicalTypeId::USmallint | LogicalTypeId::UInteger => Ok(json!(
-            unsafe { vec.as_slice_with_len::<u32>(row + 1)[row] } as i64
-        )),
+        LogicalTypeId::UTinyint => {
+            Ok(json!(unsafe { vec.as_slice_with_len::<u8>(row + 1)[row] } as i64))
+        }
+        LogicalTypeId::USmallint => {
+            Ok(json!(unsafe { vec.as_slice_with_len::<u16>(row + 1)[row] } as i64))
+        }
+        LogicalTypeId::UInteger => {
+            Ok(json!(unsafe { vec.as_slice_with_len::<u32>(row + 1)[row] } as i64))
+        }
         LogicalTypeId::UBigint => Ok(Value::String(
             unsafe { vec.as_slice_with_len::<u64>(row + 1)[row] }.to_string(),
         )),
@@ -801,6 +807,18 @@ mod tests {
     #[test]
     fn test_interval_zero() {
         assert_eq!(duckdb_interval_to_iso8601(0, 0, 0), "PT0S");
+    }
+
+    #[test]
+    fn test_spanner_value_utinyint() {
+        let conn = open_test_connection();
+
+        let json: String = conn
+            .query_row("SELECT spanner_value(42::UTINYINT)", [], |r| r.get(0))
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["type"], "INT64");
+        assert_eq!(parsed["value"], 42);
     }
 
     #[test]
