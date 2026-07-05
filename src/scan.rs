@@ -368,13 +368,22 @@ async fn stream_partitioned_read(
 
     // Execute partitions concurrently, each with its own session from the pool.
     // Partitions embed the transaction selector, so any session can execute them
-    // against the same consistent snapshot.
+    // against the same consistent snapshot. Concurrency is capped by a semaphore
+    // sized to the shared runtime's worker threads so we don't oversubscribe it
+    // (max_parallelism above only bounds partition *creation*, not execution).
+    let permits = runtime::worker_threads().min(partitions.len().max(1));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(permits));
     let mut handles = Vec::with_capacity(partitions.len());
     for partition in partitions {
         let tx = tx.clone();
         let client = client.clone();
         let rows_delivered = rows_delivered.clone();
+        let semaphore = semaphore.clone();
         handles.push(tokio::spawn(async move {
+            let _permit = semaphore
+                .acquire()
+                .await
+                .map_err(|e| SpannerError::Other(format!("Semaphore closed: {e}")))?;
             let mut session = client
                 .get_session()
                 .await
