@@ -315,17 +315,34 @@ At most one timestamp bound parameter can be specified. If none is set, Spanner 
 
 ### `spanner_ddl`
 
-Executes a DDL statement synchronously and waits for completion.
+Executes one or more DDL statements synchronously and waits for completion.
 
 ```sql
 SELECT * FROM spanner_ddl('CREATE TABLE Users (Id INT64 NOT NULL, Name STRING(MAX)) PRIMARY KEY (Id)');
 ```
 
+To batch multiple statements into a single `UpdateDatabaseDdl` request (as Spanner
+natively supports), separate them with `;` within the same TEXT argument:
+
+```sql
+SELECT * FROM spanner_ddl('
+    ALTER TABLE Users ADD COLUMN Email STRING(MAX);
+    ALTER TABLE Users ADD COLUMN Age INT64;
+');
+```
+
+All statements in the batch are sent as a single longrunning operation and
+succeed or fail atomically. Splitting is a naive `;` split (trailing/empty
+segments are dropped), so it does not understand `;` inside string literals —
+avoid semicolons inside DDL string literals (e.g. `DEFAULT` expressions) when
+batching.
+
 Returns one row with `operation_name` (VARCHAR), `done` (BOOLEAN), and `duration_secs` (DOUBLE).
 
 ### `spanner_ddl_async`
 
-Submits a DDL statement and returns immediately without waiting for completion.
+Submits one or more DDL statements (same `;`-separated batching as `spanner_ddl`)
+and returns immediately without waiting for completion.
 
 ```sql
 SELECT * FROM spanner_ddl_async('CREATE INDEX UsersByName ON Users(Name)');
@@ -343,7 +360,7 @@ On real Spanner this uses the Database Admin `ListDatabaseOperations` API with n
 SELECT * FROM spanner_operations();
 ```
 
-Returns rows with `name` (VARCHAR), `done` (BOOLEAN), `metadata_type` (VARCHAR), `error_code` (INTEGER), and `error_message` (VARCHAR).
+Returns rows with `name` (VARCHAR), `done` (BOOLEAN), `metadata_type` (VARCHAR), `error_code` (INTEGER), and `error_message` (VARCHAR). `error_code`/`error_message` are NULL unless the operation finished with an error.
 
 An optional `filter` parameter can be used:
 

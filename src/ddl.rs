@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
@@ -102,6 +103,36 @@ fn database_named_parameters() -> Vec<(String, LogicalTypeHandle)> {
     ]
 }
 
+/// Split a single `spanner_ddl`/`spanner_ddl_async` TEXT argument into a batch of
+/// DDL statements.
+///
+/// DuckDB table functions only accept scalar positional parameters here (no
+/// `LIST(VARCHAR)` support in `bind_utils`), so batching is exposed by letting
+/// callers pass multiple `;`-separated statements in the one TEXT argument,
+/// e.g. `spanner_ddl('ALTER TABLE T ADD COLUMN A INT64; ALTER TABLE T ADD COLUMN B INT64')`.
+/// All statements are sent to Spanner as a single `UpdateDatabaseDdl` request
+/// (matching Spanner's native batch semantics: one longrunning operation covers
+/// the whole batch, and it fails atomically if any statement is invalid).
+///
+/// Trailing/empty segments (from a trailing `;` or blank statements) are
+/// dropped. This is a naive split on `;` and does not understand string
+/// literals, so a `;` inside a DDL string literal (e.g. a `DEFAULT` value)
+/// would be mis-split; this is rare in DDL and is documented in the README.
+fn split_ddl_statements(sql: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let statements: Vec<String> = sql
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    if statements.is_empty() {
+        return Err("spanner_ddl requires at least one non-empty DDL statement".into());
+    }
+
+    Ok(statements)
+}
+
 // ---------------------------------------------------------------------------
 // SpannerDdlVTab — synchronous DDL execution
 // ---------------------------------------------------------------------------
@@ -109,14 +140,23 @@ fn database_named_parameters() -> Vec<(String, LogicalTypeHandle)> {
 #[repr(C)]
 pub struct DdlBindData {
     database_path: String,
-    sql: String,
+    statements: Vec<String>,
     endpoint: Option<String>,
+    // DuckDB may call init() more than once for the same bound table function
+    // (e.g. when the query is re-planned/re-initialized across execution
+    // phases). Since sending the DDL batch to Spanner is a side effect, a
+    // second execution must not resend it. `executed` is a one-shot guard:
+    // only the init() call that flips it false->true actually issues the
+    // request; later calls just reuse `cached_result`.
+    executed: Arc<AtomicBool>,
+    cached_result: Arc<Mutex<Option<DdlResult>>>,
 }
 
 pub struct DdlInitData {
     result: Mutex<Option<DdlResult>>,
 }
 
+#[derive(Clone)]
 struct DdlResult {
     operation_name: String,
     done: bool,
@@ -131,6 +171,7 @@ impl VTab for SpannerDdlVTab {
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
         let sql = bind.get_parameter(0).to_string();
+        let statements = split_ddl_statements(&sql)?;
         let database_path = bind_utils::resolve_database_path(bind)?;
         let endpoint = bind_utils::resolve_endpoint(bind);
 
@@ -146,54 +187,75 @@ impl VTab for SpannerDdlVTab {
 
         Ok(DdlBindData {
             database_path,
-            sql,
+            statements,
             endpoint,
+            executed: Arc::new(AtomicBool::new(false)),
+            cached_result: Arc::new(Mutex::new(None)),
         })
     }
 
     fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
         let bind_data = unsafe { &*init.get_bind_data::<DdlBindData>() };
 
-        let database_path = bind_data.database_path.clone();
-        let sql = bind_data.sql.clone();
-        let endpoint = bind_data.endpoint.clone();
+        // Only the first init() call executes the DDL batch; see the comment
+        // on `DdlBindData::executed`.
+        if bind_data
+            .executed
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            let database_path = bind_data.database_path.clone();
+            let statements = bind_data.statements.clone();
+            let endpoint = bind_data.endpoint.clone();
 
-        let result = runtime::block_on(async {
-            let admin = get_or_create_admin_client(endpoint.as_deref()).await?;
+            let result = runtime::block_on(async {
+                let admin = get_or_create_admin_client(endpoint.as_deref()).await?;
 
-            let req = UpdateDatabaseDdlRequest {
-                database: database_path,
-                statements: vec![sql],
-                operation_id: String::new(),
-                proto_descriptors: vec![],
-                ..Default::default()
-            };
+                let req = UpdateDatabaseDdlRequest {
+                    database: database_path,
+                    statements,
+                    operation_id: String::new(),
+                    proto_descriptors: vec![],
+                    ..Default::default()
+                };
 
-            let start = Instant::now();
-            let mut op = admin
-                .database()
-                .update_database_ddl(req, None)
-                .await
-                .map_err(SpannerError::Grpc)?;
+                let start = Instant::now();
+                let mut op = admin
+                    .database()
+                    .update_database_ddl(req, None)
+                    .await
+                    .map_err(SpannerError::Grpc)?;
 
-            let operation_name = op.name().to_string();
+                let operation_name = op.name().to_string();
 
-            // Wait for completion
-            op.wait(None).await.map_err(SpannerError::Grpc)?;
+                // Wait for completion
+                op.wait(None).await.map_err(SpannerError::Grpc)?;
 
-            let duration_secs = start.elapsed().as_secs_f64();
+                let duration_secs = start.elapsed().as_secs_f64();
 
-            Ok::<DdlResult, SpannerError>(DdlResult {
-                operation_name,
-                done: true,
-                duration_secs,
-            })
-        })??;
+                Ok::<DdlResult, SpannerError>(DdlResult {
+                    operation_name,
+                    done: true,
+                    duration_secs,
+                })
+            })??;
+
+            *bind_data
+                .cached_result
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(result);
+        }
 
         init.set_max_threads(1);
 
+        let result = bind_data
+            .cached_result
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+
         Ok(DdlInitData {
-            result: Mutex::new(Some(result)),
+            result: Mutex::new(result),
         })
     }
 
@@ -249,14 +311,19 @@ impl VTab for SpannerDdlVTab {
 #[repr(C)]
 pub struct DdlAsyncBindData {
     database_path: String,
-    sql: String,
+    statements: Vec<String>,
     endpoint: Option<String>,
+    // See the comment on `DdlBindData::executed`: guards against DuckDB
+    // re-invoking init() and resending the DDL batch a second time.
+    executed: Arc<AtomicBool>,
+    cached_result: Arc<Mutex<Option<DdlAsyncResult>>>,
 }
 
 pub struct DdlAsyncInitData {
     result: Mutex<Option<DdlAsyncResult>>,
 }
 
+#[derive(Clone)]
 struct DdlAsyncResult {
     operation_name: String,
     done: bool,
@@ -270,6 +337,7 @@ impl VTab for SpannerDdlAsyncVTab {
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
         let sql = bind.get_parameter(0).to_string();
+        let statements = split_ddl_statements(&sql)?;
         let database_path = bind_utils::resolve_database_path(bind)?;
         let endpoint = bind_utils::resolve_endpoint(bind);
 
@@ -281,45 +349,66 @@ impl VTab for SpannerDdlAsyncVTab {
 
         Ok(DdlAsyncBindData {
             database_path,
-            sql,
+            statements,
             endpoint,
+            executed: Arc::new(AtomicBool::new(false)),
+            cached_result: Arc::new(Mutex::new(None)),
         })
     }
 
     fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
         let bind_data = unsafe { &*init.get_bind_data::<DdlAsyncBindData>() };
 
-        let database_path = bind_data.database_path.clone();
-        let sql = bind_data.sql.clone();
-        let endpoint = bind_data.endpoint.clone();
+        // Only the first init() call executes the DDL batch; see the comment
+        // on `DdlBindData::executed`.
+        if bind_data
+            .executed
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            let database_path = bind_data.database_path.clone();
+            let statements = bind_data.statements.clone();
+            let endpoint = bind_data.endpoint.clone();
 
-        let result = runtime::block_on(async {
-            let admin = get_or_create_admin_client(endpoint.as_deref()).await?;
+            let result = runtime::block_on(async {
+                let admin = get_or_create_admin_client(endpoint.as_deref()).await?;
 
-            let req = UpdateDatabaseDdlRequest {
-                database: database_path,
-                statements: vec![sql],
-                operation_id: String::new(),
-                proto_descriptors: vec![],
-                ..Default::default()
-            };
+                let req = UpdateDatabaseDdlRequest {
+                    database: database_path,
+                    statements,
+                    operation_id: String::new(),
+                    proto_descriptors: vec![],
+                    ..Default::default()
+                };
 
-            let op = admin
-                .database()
-                .update_database_ddl(req, None)
-                .await
-                .map_err(SpannerError::Grpc)?;
+                let op = admin
+                    .database()
+                    .update_database_ddl(req, None)
+                    .await
+                    .map_err(SpannerError::Grpc)?;
 
-            Ok::<DdlAsyncResult, SpannerError>(DdlAsyncResult {
-                operation_name: op.name().to_string(),
-                done: op.done(),
-            })
-        })??;
+                Ok::<DdlAsyncResult, SpannerError>(DdlAsyncResult {
+                    operation_name: op.name().to_string(),
+                    done: op.done(),
+                })
+            })??;
+
+            *bind_data
+                .cached_result
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(result);
+        }
 
         init.set_max_threads(1);
 
+        let result = bind_data
+            .cached_result
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+
         Ok(DdlAsyncInitData {
-            result: Mutex::new(Some(result)),
+            result: Mutex::new(result),
         })
     }
 
@@ -385,8 +474,10 @@ struct OperationRow {
     name: String,
     done: bool,
     metadata_type: String,
-    error_code: i32,
-    error_message: String,
+    // NULL (not 0 / "") when the operation has no error, i.e. it either
+    // hasn't finished yet or finished successfully.
+    error_code: Option<i32>,
+    error_message: Option<String>,
 }
 
 pub struct SpannerOperationsVTab;
@@ -464,19 +555,26 @@ impl VTab for SpannerOperationsVTab {
         let mut col_done = output.flat_vector(1);
         let col_metadata_type = output.flat_vector(2);
         let mut col_error_code = output.flat_vector(3);
-        let col_error_message = output.flat_vector(4);
+        let mut col_error_message = output.flat_vector(4);
 
-        // SAFETY: the bind phase registers these columns as BOOLEAN and INTEGER,
-        // and the loop only writes indices within the drained batch size.
+        // SAFETY: the bind phase registers `done` as BOOLEAN, and the loop
+        // only writes indices within the drained batch size.
         let done_values = unsafe { col_done.as_mut_slice::<bool>() };
-        let error_code_values = unsafe { col_error_code.as_mut_slice::<i32>() };
 
         for (i, row) in batch.iter().enumerate() {
             col_name.insert(i, &row.name);
             done_values[i] = row.done;
             col_metadata_type.insert(i, &row.metadata_type);
-            error_code_values[i] = row.error_code;
-            col_error_message.insert(i, &row.error_message);
+            match row.error_code {
+                // SAFETY: the bind phase registers `error_code` as INTEGER, and
+                // `i` is within the drained batch size.
+                Some(code) => unsafe { *col_error_code.as_mut_ptr::<i32>().add(i) = code },
+                None => col_error_code.set_null(i),
+            }
+            match &row.error_message {
+                Some(msg) => col_error_message.insert(i, msg),
+                None => col_error_message.set_null(i),
+            }
         }
 
         output.set_len(batch.len());
@@ -505,8 +603,8 @@ fn operation_to_row(op: InternalOperation) -> OperationRow {
         .unwrap_or_default();
 
     let (error_code, error_message) = match &op.result {
-        Some(operation::Result::Error(status)) => (status.code, status.message.clone()),
-        _ => (0, String::new()),
+        Some(operation::Result::Error(status)) => (Some(status.code), Some(status.message.clone())),
+        _ => (None, None),
     };
 
     OperationRow {
@@ -652,7 +750,45 @@ fn instance_path_from_database_path(database_path: &str) -> Result<&str, Spanner
 mod tests {
     use google_cloud_googleapis::longrunning::Operation as InternalOperation;
 
-    use super::{database_operation_prefix, instance_path_from_database_path};
+    use super::{database_operation_prefix, instance_path_from_database_path, split_ddl_statements};
+
+    #[test]
+    fn test_split_ddl_statements_single() {
+        assert_eq!(
+            split_ddl_statements("CREATE TABLE T (Id INT64) PRIMARY KEY (Id)").unwrap(),
+            vec!["CREATE TABLE T (Id INT64) PRIMARY KEY (Id)".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_split_ddl_statements_batch() {
+        let sql = "ALTER TABLE T ADD COLUMN A INT64; ALTER TABLE T ADD COLUMN B INT64";
+        assert_eq!(
+            split_ddl_statements(sql).unwrap(),
+            vec![
+                "ALTER TABLE T ADD COLUMN A INT64".to_string(),
+                "ALTER TABLE T ADD COLUMN B INT64".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_split_ddl_statements_trailing_semicolon_and_whitespace() {
+        let sql = "  ALTER TABLE T ADD COLUMN A INT64;\nALTER TABLE T ADD COLUMN B INT64;  ;\n";
+        assert_eq!(
+            split_ddl_statements(sql).unwrap(),
+            vec![
+                "ALTER TABLE T ADD COLUMN A INT64".to_string(),
+                "ALTER TABLE T ADD COLUMN B INT64".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_split_ddl_statements_empty_input_errors() {
+        assert!(split_ddl_statements("").is_err());
+        assert!(split_ddl_statements("   ;  ; ").is_err());
+    }
 
     #[test]
     fn test_instance_path_from_database_path() {
