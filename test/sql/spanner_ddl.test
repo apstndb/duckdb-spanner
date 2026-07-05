@@ -40,3 +40,18 @@ SELECT IF(count = 0, 1, error('expected empty async table')) FROM (SELECT COUNT(
 
 statement ok
 SELECT IF(done IS TRUE, 1, error('async drop should complete')) FROM spanner_ddl('DROP TABLE SqllogicDdlAsync');
+
+# --- sync DDL: batched statements (';'-separated) sent as one UpdateDatabaseDdl request ---
+
+statement ok
+SELECT IF(done IS TRUE, 1, error('batched DDL should complete')) FROM spanner_ddl('
+    CREATE TABLE SqllogicDdlBatch (Id INT64 NOT NULL) PRIMARY KEY (Id);
+    ALTER TABLE SqllogicDdlBatch ADD COLUMN Name STRING(MAX);
+    ALTER TABLE SqllogicDdlBatch ADD COLUMN Data BYTES(MAX);
+');
+
+statement ok
+SELECT IF(count = 0, 1, error('expected empty batch-created table')) FROM (SELECT COUNT(*)::INT AS count FROM spanner_query('SELECT Id, Name, Data FROM SqllogicDdlBatch'));
+
+statement ok
+SELECT IF(done IS TRUE, 1, error('batch drop should complete')) FROM spanner_ddl('DROP TABLE SqllogicDdlBatch');
