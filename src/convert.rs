@@ -165,8 +165,9 @@ fn write_scalar_column(
         match row.column::<Option<RawValue>>(spanner_col_idx)? {
             None => vector.set_null(i),
             Some(RawValue(val)) => {
-                let context = format!("column '{column_name}', row {i}");
-                write_raw_scalar_to_flat(&mut vector, i, &val, type_code, &context)?;
+                write_raw_scalar_to_flat(&mut vector, i, &val, type_code, &|| {
+                    format!("column '{column_name}', row {i}")
+                })?;
             }
         }
     }
@@ -242,14 +243,9 @@ fn write_array_column(
             let mut flat_idx = 0usize;
             for values in raw_values.iter().flatten() {
                 for val in values {
-                    let context = format!("column '{column_name}', array element {flat_idx}");
-                    write_raw_struct_value(
-                        &mut child_struct,
-                        flat_idx,
-                        val,
-                        struct_type,
-                        &context,
-                    )?;
+                    write_raw_struct_value(&mut child_struct, flat_idx, val, struct_type, &|| {
+                        format!("column '{column_name}', array element {flat_idx}")
+                    })?;
                     flat_idx += 1;
                 }
             }
@@ -276,14 +272,9 @@ fn write_array_column(
             let mut flat_idx = 0usize;
             for values in raw_values.iter().flatten() {
                 for val in values {
-                    let context = format!("column '{column_name}', array element {flat_idx}");
-                    write_raw_list_value(
-                        &mut child_list,
-                        flat_idx,
-                        val,
-                        inner_elem_type,
-                        &context,
-                    )?;
+                    write_raw_list_value(&mut child_list, flat_idx, val, inner_elem_type, &|| {
+                        format!("column '{column_name}', array element {flat_idx}")
+                    })?;
                     flat_idx += 1;
                 }
             }
@@ -307,8 +298,9 @@ fn write_array_column(
             let mut flat_idx = 0usize;
             for values in raw_values.iter().flatten() {
                 for val in values {
-                    let context = format!("column '{column_name}', array element {flat_idx}");
-                    write_raw_scalar_to_flat(&mut child, flat_idx, val, elem_type_code, &context)?;
+                    write_raw_scalar_to_flat(&mut child, flat_idx, val, elem_type_code, &|| {
+                        format!("column '{column_name}', array element {flat_idx}")
+                    })?;
                     flat_idx += 1;
                 }
             }
@@ -337,8 +329,9 @@ fn write_struct_column(
         match row.column::<Option<RawValue>>(spanner_col_idx)? {
             None => struct_vector.set_null(i),
             Some(RawValue(val)) => {
-                let context = format!("column '{column_name}', row {i}");
-                write_raw_struct_value(&mut struct_vector, i, &val, struct_type, &context)?;
+                write_raw_struct_value(&mut struct_vector, i, &val, struct_type, &|| {
+                    format!("column '{column_name}', row {i}")
+                })?;
             }
         }
     }
@@ -347,13 +340,15 @@ fn write_struct_column(
 
 /// Write a single raw proto Value as a struct into a StructVector at the given row index.
 ///
-/// `context` describes the enclosing location (column/row/array element) for error messages.
+/// `context` lazily describes the enclosing location (column/row/array element) for
+/// error messages; it is only invoked on a type mismatch, keeping the hot path free
+/// of per-row string allocation.
 fn write_raw_struct_value(
     struct_vector: &mut StructVector<'_>,
     row_idx: usize,
     value: &prost_types::Value,
     struct_type: &google_cloud_googleapis::spanner::v1::StructType,
-    context: &str,
+    context: &dyn Fn() -> String,
 ) -> Result<(), SpannerError> {
     let values = match &value.kind {
         Some(Kind::ListValue(list)) => &list.values,
@@ -365,7 +360,7 @@ fn write_raw_struct_value(
             return Err(type_mismatch_error(
                 "STRUCT (ListValue)",
                 &value.kind,
-                context,
+                &context(),
             ));
         }
     };
@@ -376,7 +371,7 @@ fn write_raw_struct_value(
             .as_ref()
             .ok_or_else(|| SpannerError::Conversion("STRUCT field without type".to_string()))?;
         let field_type_code = TypeCode::try_from(field_type.code).unwrap_or(TypeCode::Unspecified);
-        let field_context = format!("{context}, field '{}'", field.name);
+        let field_context = || format!("{}, field '{}'", context(), field.name);
 
         let field_value = values.get(field_idx);
 
@@ -430,13 +425,14 @@ fn write_raw_struct_value(
 
 /// Write a single raw proto Value as a list entry into a ListVector at the given row index.
 ///
-/// `context` describes the enclosing location (column/row/field) for error messages.
+/// `context` lazily describes the enclosing location (column/row/field) for error
+/// messages; it is only invoked on a type mismatch.
 fn write_raw_list_value(
     list_vector: &mut ListVector<'_>,
     row_idx: usize,
     value: &prost_types::Value,
     element_type: &Type,
-    context: &str,
+    context: &dyn Fn() -> String,
 ) -> Result<(), SpannerError> {
     let values = match &value.kind {
         Some(Kind::ListValue(list)) => &list.values,
@@ -449,7 +445,7 @@ fn write_raw_list_value(
             return Err(type_mismatch_error(
                 "ARRAY (ListValue)",
                 &value.kind,
-                context,
+                &context(),
             ));
         }
     };
@@ -468,7 +464,7 @@ fn write_raw_list_value(
             list_vector.set_len(new_len);
             let mut child_struct = list_vector.struct_child(new_len);
             for (j, val) in values.iter().enumerate() {
-                let elem_context = format!("{context}, array element {j}");
+                let elem_context = || format!("{}, array element {j}", context());
                 write_raw_struct_value(
                     &mut child_struct,
                     current_len + j,
@@ -483,7 +479,7 @@ fn write_raw_list_value(
             list_vector.set_len(new_len);
             let mut child = list_vector.child(new_len);
             for (j, val) in values.iter().enumerate() {
-                let elem_context = format!("{context}, array element {j}");
+                let elem_context = || format!("{}, array element {j}", context());
                 write_raw_scalar_to_flat(
                     &mut child,
                     current_len + j,
@@ -515,7 +511,7 @@ fn write_raw_scalar_to_flat(
     idx: usize,
     value: &prost_types::Value,
     type_code: TypeCode,
-    context: &str,
+    context: &dyn Fn() -> String,
 ) -> Result<(), SpannerError> {
     match &value.kind {
         // Kind::NullValue is a legitimate NULL regardless of expected type — never an error.
@@ -534,7 +530,7 @@ fn write_raw_scalar_to_flat(
                 return Err(type_mismatch_error(
                     "BOOL (BoolValue)",
                     &value.kind,
-                    context,
+                    &context(),
                 ));
             }
         }
@@ -548,7 +544,7 @@ fn write_raw_scalar_to_flat(
                 return Err(type_mismatch_error(
                     "INT64 (StringValue)",
                     &value.kind,
-                    context,
+                    &context(),
                 ));
             }
         }
@@ -565,7 +561,7 @@ fn write_raw_scalar_to_flat(
                 return Err(type_mismatch_error(
                     "FLOAT32 (NumberValue or StringValue)",
                     &value.kind,
-                    context,
+                    &context(),
                 ));
             }
         }
@@ -581,7 +577,7 @@ fn write_raw_scalar_to_flat(
                 return Err(type_mismatch_error(
                     "FLOAT64 (NumberValue or StringValue)",
                     &value.kind,
-                    context,
+                    &context(),
                 ));
             }
         }
@@ -603,7 +599,7 @@ fn write_raw_scalar_to_flat(
                 return Err(type_mismatch_error(
                     "NUMERIC (StringValue)",
                     &value.kind,
-                    context,
+                    &context(),
                 ));
             }
         }
@@ -615,7 +611,7 @@ fn write_raw_scalar_to_flat(
                 return Err(type_mismatch_error(
                     "STRING/JSON (StringValue)",
                     &value.kind,
-                    context,
+                    &context(),
                 ));
             }
         }
@@ -627,7 +623,7 @@ fn write_raw_scalar_to_flat(
                 return Err(type_mismatch_error(
                     "BYTES/PROTO (StringValue, base64)",
                     &value.kind,
-                    context,
+                    &context(),
                 ));
             }
         }
@@ -642,7 +638,7 @@ fn write_raw_scalar_to_flat(
                 return Err(type_mismatch_error(
                     "DATE (StringValue)",
                     &value.kind,
-                    context,
+                    &context(),
                 ));
             }
         }
@@ -658,7 +654,7 @@ fn write_raw_scalar_to_flat(
                 return Err(type_mismatch_error(
                     "TIMESTAMP (StringValue)",
                     &value.kind,
-                    context,
+                    &context(),
                 ));
             }
         }
@@ -676,7 +672,7 @@ fn write_raw_scalar_to_flat(
                 return Err(type_mismatch_error(
                     "UUID (StringValue)",
                     &value.kind,
-                    context,
+                    &context(),
                 ));
             }
         }
@@ -688,7 +684,7 @@ fn write_raw_scalar_to_flat(
                 return Err(type_mismatch_error(
                     "INTERVAL (StringValue)",
                     &value.kind,
-                    context,
+                    &context(),
                 ));
             }
         }
@@ -701,7 +697,7 @@ fn write_raw_scalar_to_flat(
                 return Err(type_mismatch_error(
                     "STRING (StringValue, fallback for unrecognized type code)",
                     &value.kind,
-                    context,
+                    &context(),
                 ));
             }
         }
