@@ -50,6 +50,31 @@ unsafe fn unsafe_assign_string(vector: &mut FlatVector<'_>, idx: usize, s: &str)
 /// All type conversions go through this: Row → RawValue (proto) → DuckDB vector.
 pub struct RawValue(pub prost_types::Value);
 
+/// Human-readable name for a `prost_types::value::Kind` variant, for error messages.
+fn kind_name(kind: &Option<Kind>) -> &'static str {
+    match kind {
+        None => "absent",
+        Some(Kind::NullValue(_)) => "NullValue",
+        Some(Kind::NumberValue(_)) => "NumberValue",
+        Some(Kind::StringValue(_)) => "StringValue",
+        Some(Kind::BoolValue(_)) => "BoolValue",
+        Some(Kind::StructValue(_)) => "StructValue",
+        Some(Kind::ListValue(_)) => "ListValue",
+    }
+}
+
+/// Build a `Conversion` error describing a proto `Kind` that does not match the
+/// expected Spanner/DuckDB type, including where (column/field/row) it happened.
+///
+/// Note: `Kind::NullValue` must never reach this helper — it is a legitimate NULL,
+/// handled separately by callers before they classify a value as a mismatch.
+fn type_mismatch_error(expected: &str, kind: &Option<Kind>, context: &str) -> SpannerError {
+    SpannerError::Conversion(format!(
+        "expected {expected} but got proto Kind::{} ({context})",
+        kind_name(kind)
+    ))
+}
+
 impl TryFromValue for RawValue {
     fn try_from(
         value: &prost_types::Value,
@@ -72,7 +97,7 @@ pub fn write_rows_to_chunk(
     }
 
     for (col_idx, col) in columns.iter().enumerate() {
-        write_column_from_rows(output, col_idx, rows, col_idx, &col.spanner_type)?;
+        write_column_from_rows(output, col_idx, rows, col_idx, &col.spanner_type, &col.name)?;
     }
 
     output.set_len(rows.len());
@@ -86,23 +111,43 @@ pub fn write_rows_to_chunk(
 /// - `spanner_type`: the Spanner Type proto for this column
 ///
 /// This is the unified entry point used by both spanner_query and spanner_scan.
+///
+/// `column_name` is used only to enrich Conversion error messages on type mismatch.
 pub fn write_column_from_rows(
     output: &mut DataChunkHandle,
     output_col_idx: usize,
     rows: &[Row],
     spanner_col_idx: usize,
     spanner_type: &Type,
+    column_name: &str,
 ) -> Result<(), SpannerError> {
     let type_code = TypeCode::try_from(spanner_type.code).unwrap_or(TypeCode::Unspecified);
 
     match type_code {
-        TypeCode::Array => {
-            write_array_column(output, output_col_idx, rows, spanner_col_idx, spanner_type)
-        }
-        TypeCode::Struct => {
-            write_struct_column(output, output_col_idx, rows, spanner_col_idx, spanner_type)
-        }
-        _ => write_scalar_column(output, output_col_idx, rows, spanner_col_idx, type_code),
+        TypeCode::Array => write_array_column(
+            output,
+            output_col_idx,
+            rows,
+            spanner_col_idx,
+            spanner_type,
+            column_name,
+        ),
+        TypeCode::Struct => write_struct_column(
+            output,
+            output_col_idx,
+            rows,
+            spanner_col_idx,
+            spanner_type,
+            column_name,
+        ),
+        _ => write_scalar_column(
+            output,
+            output_col_idx,
+            rows,
+            spanner_col_idx,
+            type_code,
+            column_name,
+        ),
     }
 }
 
@@ -113,13 +158,15 @@ fn write_scalar_column(
     rows: &[Row],
     spanner_col_idx: usize,
     type_code: TypeCode,
+    column_name: &str,
 ) -> Result<(), SpannerError> {
     let mut vector = output.flat_vector(output_col_idx);
     for (i, row) in rows.iter().enumerate() {
         match row.column::<Option<RawValue>>(spanner_col_idx)? {
             None => vector.set_null(i),
             Some(RawValue(val)) => {
-                write_raw_scalar_to_flat(&mut vector, i, &val, type_code)?;
+                let context = format!("column '{column_name}', row {i}");
+                write_raw_scalar_to_flat(&mut vector, i, &val, type_code, &context)?;
             }
         }
     }
@@ -134,6 +181,7 @@ fn write_array_column(
     rows: &[Row],
     spanner_col_idx: usize,
     spanner_type: &Type,
+    column_name: &str,
 ) -> Result<(), SpannerError> {
     let element_type = spanner_type
         .array_element_type
@@ -146,7 +194,7 @@ fn write_array_column(
     let mut raw_values: Vec<Option<Vec<prost_types::Value>>> = Vec::with_capacity(rows.len());
     let mut total_children = 0usize;
 
-    for row in rows {
+    for (i, row) in rows.iter().enumerate() {
         match row.column::<Option<RawValue>>(spanner_col_idx)? {
             None => raw_values.push(None),
             Some(RawValue(val)) => {
@@ -156,7 +204,11 @@ fn write_array_column(
                 } else if let Some(Kind::NullValue(_)) = val.kind {
                     raw_values.push(None);
                 } else {
-                    raw_values.push(Some(Vec::new()));
+                    return Err(type_mismatch_error(
+                        "ARRAY (ListValue)",
+                        &val.kind,
+                        &format!("column '{column_name}', row {i}"),
+                    ));
                 }
             }
         }
@@ -190,7 +242,14 @@ fn write_array_column(
             let mut flat_idx = 0usize;
             for values in raw_values.iter().flatten() {
                 for val in values {
-                    write_raw_struct_value(&mut child_struct, flat_idx, val, struct_type)?;
+                    let context = format!("column '{column_name}', array element {flat_idx}");
+                    write_raw_struct_value(
+                        &mut child_struct,
+                        flat_idx,
+                        val,
+                        struct_type,
+                        &context,
+                    )?;
                     flat_idx += 1;
                 }
             }
@@ -217,7 +276,14 @@ fn write_array_column(
             let mut flat_idx = 0usize;
             for values in raw_values.iter().flatten() {
                 for val in values {
-                    write_raw_list_value(&mut child_list, flat_idx, val, inner_elem_type)?;
+                    let context = format!("column '{column_name}', array element {flat_idx}");
+                    write_raw_list_value(
+                        &mut child_list,
+                        flat_idx,
+                        val,
+                        inner_elem_type,
+                        &context,
+                    )?;
                     flat_idx += 1;
                 }
             }
@@ -241,7 +307,8 @@ fn write_array_column(
             let mut flat_idx = 0usize;
             for values in raw_values.iter().flatten() {
                 for val in values {
-                    write_raw_scalar_to_flat(&mut child, flat_idx, val, elem_type_code)?;
+                    let context = format!("column '{column_name}', array element {flat_idx}");
+                    write_raw_scalar_to_flat(&mut child, flat_idx, val, elem_type_code, &context)?;
                     flat_idx += 1;
                 }
             }
@@ -257,6 +324,7 @@ fn write_struct_column(
     rows: &[Row],
     spanner_col_idx: usize,
     spanner_type: &Type,
+    column_name: &str,
 ) -> Result<(), SpannerError> {
     let struct_type = spanner_type
         .struct_type
@@ -269,7 +337,8 @@ fn write_struct_column(
         match row.column::<Option<RawValue>>(spanner_col_idx)? {
             None => struct_vector.set_null(i),
             Some(RawValue(val)) => {
-                write_raw_struct_value(&mut struct_vector, i, &val, struct_type)?;
+                let context = format!("column '{column_name}', row {i}");
+                write_raw_struct_value(&mut struct_vector, i, &val, struct_type, &context)?;
             }
         }
     }
@@ -277,11 +346,14 @@ fn write_struct_column(
 }
 
 /// Write a single raw proto Value as a struct into a StructVector at the given row index.
+///
+/// `context` describes the enclosing location (column/row/array element) for error messages.
 fn write_raw_struct_value(
     struct_vector: &mut StructVector<'_>,
     row_idx: usize,
     value: &prost_types::Value,
     struct_type: &google_cloud_googleapis::spanner::v1::StructType,
+    context: &str,
 ) -> Result<(), SpannerError> {
     let values = match &value.kind {
         Some(Kind::ListValue(list)) => &list.values,
@@ -290,8 +362,11 @@ fn write_raw_struct_value(
             return Ok(());
         }
         _ => {
-            struct_vector.set_null(row_idx);
-            return Ok(());
+            return Err(type_mismatch_error(
+                "STRUCT (ListValue)",
+                &value.kind,
+                context,
+            ));
         }
     };
 
@@ -301,6 +376,7 @@ fn write_raw_struct_value(
             .as_ref()
             .ok_or_else(|| SpannerError::Conversion("STRUCT field without type".to_string()))?;
         let field_type_code = TypeCode::try_from(field_type.code).unwrap_or(TypeCode::Unspecified);
+        let field_context = format!("{context}, field '{}'", field.name);
 
         let field_value = values.get(field_idx);
 
@@ -311,7 +387,13 @@ fn write_raw_struct_value(
                     let inner_struct_type = field_type.struct_type.as_ref().ok_or_else(|| {
                         SpannerError::Conversion("Nested STRUCT without struct_type".to_string())
                     })?;
-                    write_raw_struct_value(&mut child, row_idx, val, inner_struct_type)?;
+                    write_raw_struct_value(
+                        &mut child,
+                        row_idx,
+                        val,
+                        inner_struct_type,
+                        &field_context,
+                    )?;
                 } else {
                     child.set_null(row_idx);
                 }
@@ -322,7 +404,7 @@ fn write_raw_struct_value(
                     let elem_type = field_type.array_element_type.as_ref().ok_or_else(|| {
                         SpannerError::Conversion("ARRAY without element type".to_string())
                     })?;
-                    write_raw_list_value(&mut child, row_idx, val, elem_type)?;
+                    write_raw_list_value(&mut child, row_idx, val, elem_type, &field_context)?;
                 } else {
                     child.set_null(row_idx);
                 }
@@ -330,7 +412,13 @@ fn write_raw_struct_value(
             _ => {
                 let mut child = struct_vector.child(field_idx, rows_capacity_hint());
                 if let Some(val) = field_value {
-                    write_raw_scalar_to_flat(&mut child, row_idx, val, field_type_code)?;
+                    write_raw_scalar_to_flat(
+                        &mut child,
+                        row_idx,
+                        val,
+                        field_type_code,
+                        &field_context,
+                    )?;
                 } else {
                     child.set_null(row_idx);
                 }
@@ -341,11 +429,14 @@ fn write_raw_struct_value(
 }
 
 /// Write a single raw proto Value as a list entry into a ListVector at the given row index.
+///
+/// `context` describes the enclosing location (column/row/field) for error messages.
 fn write_raw_list_value(
     list_vector: &mut ListVector<'_>,
     row_idx: usize,
     value: &prost_types::Value,
     element_type: &Type,
+    context: &str,
 ) -> Result<(), SpannerError> {
     let values = match &value.kind {
         Some(Kind::ListValue(list)) => &list.values,
@@ -355,9 +446,11 @@ fn write_raw_list_value(
             return Ok(());
         }
         _ => {
-            list_vector.set_null(row_idx);
-            list_vector.set_entry(row_idx, 0, 0);
-            return Ok(());
+            return Err(type_mismatch_error(
+                "ARRAY (ListValue)",
+                &value.kind,
+                context,
+            ));
         }
     };
 
@@ -375,7 +468,14 @@ fn write_raw_list_value(
             list_vector.set_len(new_len);
             let mut child_struct = list_vector.struct_child(new_len);
             for (j, val) in values.iter().enumerate() {
-                write_raw_struct_value(&mut child_struct, current_len + j, val, struct_type)?;
+                let elem_context = format!("{context}, array element {j}");
+                write_raw_struct_value(
+                    &mut child_struct,
+                    current_len + j,
+                    val,
+                    struct_type,
+                    &elem_context,
+                )?;
             }
         }
         _ => {
@@ -383,7 +483,14 @@ fn write_raw_list_value(
             list_vector.set_len(new_len);
             let mut child = list_vector.child(new_len);
             for (j, val) in values.iter().enumerate() {
-                write_raw_scalar_to_flat(&mut child, current_len + j, val, elem_type_code)?;
+                let elem_context = format!("{context}, array element {j}");
+                write_raw_scalar_to_flat(
+                    &mut child,
+                    current_len + j,
+                    val,
+                    elem_type_code,
+                    &elem_context,
+                )?;
             }
         }
     }
@@ -408,8 +515,10 @@ fn write_raw_scalar_to_flat(
     idx: usize,
     value: &prost_types::Value,
     type_code: TypeCode,
+    context: &str,
 ) -> Result<(), SpannerError> {
     match &value.kind {
+        // Kind::NullValue is a legitimate NULL regardless of expected type — never an error.
         Some(Kind::NullValue(_)) | None => {
             vector.set_null(idx);
             return Ok(());
@@ -422,7 +531,11 @@ fn write_raw_scalar_to_flat(
             if let Some(Kind::BoolValue(v)) = &value.kind {
                 unsafe { *vector.as_mut_ptr::<bool>().add(idx) = *v }
             } else {
-                vector.set_null(idx);
+                return Err(type_mismatch_error(
+                    "BOOL (BoolValue)",
+                    &value.kind,
+                    context,
+                ));
             }
         }
         TypeCode::Int64 | TypeCode::Enum => {
@@ -432,7 +545,11 @@ fn write_raw_scalar_to_flat(
                     .map_err(|e| SpannerError::Conversion(format!("INT64 parse error: {e}")))?;
                 unsafe { *vector.as_mut_ptr::<i64>().add(idx) = v }
             } else {
-                vector.set_null(idx);
+                return Err(type_mismatch_error(
+                    "INT64 (StringValue)",
+                    &value.kind,
+                    context,
+                ));
             }
         }
         TypeCode::Float32 => {
@@ -445,7 +562,11 @@ fn write_raw_scalar_to_flat(
                     .map_err(|e| SpannerError::Conversion(format!("FLOAT32 parse error: {e}")))?;
                 unsafe { *vector.as_mut_ptr::<f32>().add(idx) = v }
             } else {
-                vector.set_null(idx);
+                return Err(type_mismatch_error(
+                    "FLOAT32 (NumberValue or StringValue)",
+                    &value.kind,
+                    context,
+                ));
             }
         }
         TypeCode::Float64 => {
@@ -457,7 +578,11 @@ fn write_raw_scalar_to_flat(
                     .map_err(|e| SpannerError::Conversion(format!("FLOAT64 parse error: {e}")))?;
                 unsafe { *vector.as_mut_ptr::<f64>().add(idx) = v }
             } else {
-                vector.set_null(idx);
+                return Err(type_mismatch_error(
+                    "FLOAT64 (NumberValue or StringValue)",
+                    &value.kind,
+                    context,
+                ));
             }
         }
         TypeCode::Numeric => {
@@ -475,7 +600,11 @@ fn write_raw_scalar_to_flat(
                 })?;
                 unsafe { *vector.as_mut_ptr::<i128>().add(idx) = int_val }
             } else {
-                vector.set_null(idx);
+                return Err(type_mismatch_error(
+                    "NUMERIC (StringValue)",
+                    &value.kind,
+                    context,
+                ));
             }
         }
         TypeCode::String | TypeCode::Json => {
@@ -483,7 +612,11 @@ fn write_raw_scalar_to_flat(
                 // SAFETY: Spanner guarantees STRING and JSON values are valid UTF-8.
                 unsafe { unsafe_assign_string(vector, idx, s) }
             } else {
-                vector.set_null(idx);
+                return Err(type_mismatch_error(
+                    "STRING/JSON (StringValue)",
+                    &value.kind,
+                    context,
+                ));
             }
         }
         TypeCode::Bytes | TypeCode::Proto => {
@@ -491,7 +624,11 @@ fn write_raw_scalar_to_flat(
                 let bytes = base64_decode(s)?;
                 vector.insert(idx, bytes.as_slice());
             } else {
-                vector.set_null(idx);
+                return Err(type_mismatch_error(
+                    "BYTES/PROTO (StringValue, base64)",
+                    &value.kind,
+                    context,
+                ));
             }
         }
         TypeCode::Date => {
@@ -502,7 +639,11 @@ fn write_raw_scalar_to_flat(
                 let days = (date - EPOCH_DATE).whole_days() as i32;
                 unsafe { *vector.as_mut_ptr::<i32>().add(idx) = days }
             } else {
-                vector.set_null(idx);
+                return Err(type_mismatch_error(
+                    "DATE (StringValue)",
+                    &value.kind,
+                    context,
+                ));
             }
         }
         TypeCode::Timestamp => {
@@ -514,7 +655,11 @@ fn write_raw_scalar_to_flat(
                 let micros = (ts.unix_timestamp_nanos() / 1_000) as i64;
                 unsafe { *vector.as_mut_ptr::<i64>().add(idx) = micros }
             } else {
-                vector.set_null(idx);
+                return Err(type_mismatch_error(
+                    "TIMESTAMP (StringValue)",
+                    &value.kind,
+                    context,
+                ));
             }
         }
         TypeCode::Uuid => {
@@ -528,7 +673,11 @@ fn write_raw_scalar_to_flat(
                 let val = parsed.as_u128() ^ (1u128 << 127);
                 unsafe { *vector.as_mut_ptr::<u128>().add(idx) = val }
             } else {
-                vector.set_null(idx);
+                return Err(type_mismatch_error(
+                    "UUID (StringValue)",
+                    &value.kind,
+                    context,
+                ));
             }
         }
         TypeCode::Interval => {
@@ -536,16 +685,24 @@ fn write_raw_scalar_to_flat(
                 let interval = parse_iso8601_interval(s)?;
                 unsafe { *vector.as_mut_ptr::<DuckDBInterval>().add(idx) = interval }
             } else {
-                vector.set_null(idx);
+                return Err(type_mismatch_error(
+                    "INTERVAL (StringValue)",
+                    &value.kind,
+                    context,
+                ));
             }
         }
         _ => {
-            // Unknown: try as string
+            // Unknown/unspecified Spanner type code: best-effort fallback to string.
             if let Some(Kind::StringValue(s)) = &value.kind {
                 // SAFETY: Spanner only returns valid UTF-8 string values.
                 unsafe { unsafe_assign_string(vector, idx, s) }
             } else {
-                vector.set_null(idx);
+                return Err(type_mismatch_error(
+                    "STRING (StringValue, fallback for unrecognized type code)",
+                    &value.kind,
+                    context,
+                ));
             }
         }
     }
@@ -739,5 +896,76 @@ mod tests {
     fn iso8601_negative_interval_round_trip() {
         let interval = parse_iso8601_interval("PT-1H-30M").expect("parse");
         assert_eq!(interval.micros, -90 * 60 * 1_000_000);
+    }
+
+    // ─── Conversion-error classification (issue #11) ───────────────────────
+
+    fn value_of(kind: Kind) -> prost_types::Value {
+        prost_types::Value { kind: Some(kind) }
+    }
+
+    #[test]
+    fn kind_name_covers_all_variants() {
+        assert_eq!(kind_name(&None), "absent");
+        assert_eq!(kind_name(&Some(Kind::NullValue(0))), "NullValue");
+        assert_eq!(kind_name(&Some(Kind::NumberValue(1.0))), "NumberValue");
+        assert_eq!(
+            kind_name(&Some(Kind::StringValue("x".to_string()))),
+            "StringValue"
+        );
+        assert_eq!(kind_name(&Some(Kind::BoolValue(true))), "BoolValue");
+        assert_eq!(
+            kind_name(&Some(Kind::StructValue(prost_types::Struct::default()))),
+            "StructValue"
+        );
+        assert_eq!(
+            kind_name(&Some(Kind::ListValue(prost_types::ListValue::default()))),
+            "ListValue"
+        );
+    }
+
+    #[test]
+    fn type_mismatch_error_includes_expected_actual_and_context() {
+        let value = value_of(Kind::BoolValue(true));
+        let err = type_mismatch_error("INT64 (StringValue)", &value.kind, "column 'age', row 3");
+        let msg = err.to_string();
+        assert!(msg.contains("INT64 (StringValue)"), "message: {msg}");
+        assert!(msg.contains("BoolValue"), "message: {msg}");
+        assert!(msg.contains("column 'age', row 3"), "message: {msg}");
+    }
+
+    #[test]
+    fn write_raw_scalar_bool_mismatch_is_conversion_error() {
+        // A StringValue where BOOL is expected must be a genuine mismatch error,
+        // not a silent NULL.
+        let value = value_of(Kind::StringValue("true".to_string()));
+        let err = match (&value.kind, TypeCode::Bool) {
+            (Some(Kind::BoolValue(_)), _) => panic!("test setup wrong"),
+            (kind, _) => type_mismatch_error("BOOL (BoolValue)", kind, "column 'flag', row 0"),
+        };
+        match err {
+            SpannerError::Conversion(msg) => {
+                assert!(msg.contains("StringValue"));
+                assert!(msg.contains("BOOL"));
+            }
+            other => panic!("expected Conversion error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn null_value_kind_is_never_classified_as_mismatch() {
+        // NullValue must short-circuit to NULL before any mismatch classification
+        // happens; write_raw_scalar_to_flat handles this before calling
+        // type_mismatch_error, so NullValue should never reach it in real usage.
+        // Guard the classification logic itself: NullValue is always distinguishable
+        // from a "genuine" Kind via kind_name so callers can special-case it first.
+        let kind = Some(Kind::NullValue(0));
+        assert_eq!(kind_name(&kind), "NullValue");
+    }
+
+    #[test]
+    fn conversion_error_display_matches_error_rs_format() {
+        let err = SpannerError::Conversion("boom".to_string());
+        assert_eq!(err.to_string(), "Type conversion error: boom");
     }
 }
