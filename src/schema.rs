@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
+
 use google_cloud_googleapis::spanner::admin::database::v1::DatabaseDialect;
 use google_cloud_googleapis::spanner::v1::execute_sql_request::QueryMode;
 use google_cloud_googleapis::spanner::v1::Type;
@@ -7,6 +10,15 @@ use google_cloud_spanner::transaction::QueryOptions;
 
 use crate::error::SpannerError;
 use crate::types;
+
+/// Cache of detected dialects, keyed by the same `(database, endpoint)` key
+/// used by the client cache in `client.rs` (see `client::cache_key`).
+///
+/// `detect_dialect` issues a query, so callers that run it on every bind
+/// (`spanner_scan`, `COPY TO ... (FORMAT spanner)`) look here first to avoid
+/// a redundant round-trip against the same database.
+static DIALECT_CACHE: LazyLock<Mutex<HashMap<String, DatabaseDialect>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Column metadata discovered from Spanner schema.
 #[derive(Debug, Clone)]
@@ -24,11 +36,90 @@ pub fn parse_dialect(s: &str) -> Result<DatabaseDialect, Box<dyn std::error::Err
     }
 }
 
-/// Detect the database dialect by querying INFORMATION_SCHEMA.SCHEMATA.
+/// Detect the database dialect.
 ///
-/// PostgreSQL-dialect databases have a 'public' schema; GoogleSQL databases do not.
-/// This query uses no parameters, so it works in both dialects.
-pub async fn detect_dialect(client: &Client) -> Result<DatabaseDialect, SpannerError> {
+/// Primary: query `INFORMATION_SCHEMA.DATABASE_OPTIONS` for the
+/// `database_dialect` option, whose value is `GOOGLE_STANDARD_SQL` or
+/// `POSTGRESQL`. The query uses only uppercase, unquoted identifiers, which
+/// resolve correctly in both dialects (PostgreSQL-dialect Spanner databases
+/// fold unquoted identifiers to lowercase, matching the lowercase
+/// `information_schema` views), so a single query form works regardless of
+/// the (as yet unknown) dialect.
+///
+/// Fallback: if that query errors (e.g. an older emulator that doesn't
+/// support `DATABASE_OPTIONS`), fall back to the previous heuristic of
+/// checking for a `public` schema in `INFORMATION_SCHEMA.SCHEMATA`. This
+/// heuristic can misdetect a GoogleSQL database with a user-created `public`
+/// schema, so it's only used as a last resort.
+///
+/// Results are cached per `(database, endpoint)` key (see `client::cache_key`)
+/// since callers such as `spanner_scan` and `COPY TO ... (FORMAT spanner)`
+/// invoke this on every bind.
+pub async fn detect_dialect(
+    client: &Client,
+    database: &str,
+    endpoint: Option<&str>,
+) -> Result<DatabaseDialect, SpannerError> {
+    let key = crate::client::cache_key(database, endpoint);
+    if let Some(dialect) = DIALECT_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+    {
+        return Ok(*dialect);
+    }
+
+    let dialect = match detect_dialect_via_database_options(client).await {
+        Ok(dialect) => dialect,
+        Err(_) => detect_dialect_via_public_schema(client).await?,
+    };
+
+    DIALECT_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, dialect);
+
+    Ok(dialect)
+}
+
+/// Query `INFORMATION_SCHEMA.DATABASE_OPTIONS` for the `database_dialect` option.
+async fn detect_dialect_via_database_options(
+    client: &Client,
+) -> Result<DatabaseDialect, SpannerError> {
+    let stmt = Statement::new(
+        "SELECT OPTION_VALUE FROM INFORMATION_SCHEMA.DATABASE_OPTIONS \
+         WHERE OPTION_NAME = 'database_dialect'",
+    );
+    let mut tx = client.single().await?;
+    let mut iter = tx.query(stmt).await.map_err(SpannerError::Grpc)?;
+    match iter.next().await.map_err(SpannerError::Grpc)? {
+        Some(row) => {
+            let value: String = row.column(0)?;
+            parse_database_dialect_option(&value)
+        }
+        None => Err(SpannerError::Other(
+            "No database_dialect row in INFORMATION_SCHEMA.DATABASE_OPTIONS".to_string(),
+        )),
+    }
+}
+
+/// Parse the `OPTION_VALUE` returned for the `database_dialect` row of
+/// `INFORMATION_SCHEMA.DATABASE_OPTIONS`.
+fn parse_database_dialect_option(value: &str) -> Result<DatabaseDialect, SpannerError> {
+    match value {
+        "POSTGRESQL" => Ok(DatabaseDialect::Postgresql),
+        "GOOGLE_STANDARD_SQL" => Ok(DatabaseDialect::GoogleStandardSql),
+        other => Err(SpannerError::Other(format!(
+            "Unrecognized database_dialect option value: {other}"
+        ))),
+    }
+}
+
+/// Fallback heuristic: PostgreSQL-dialect databases have a 'public' schema;
+/// GoogleSQL databases do not (unless the user created one, in which case
+/// this misdetects -- see `detect_dialect_via_database_options` above, which
+/// is tried first).
+async fn detect_dialect_via_public_schema(client: &Client) -> Result<DatabaseDialect, SpannerError> {
     let stmt = Statement::new(
         "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = 'public'",
     );
@@ -78,8 +169,9 @@ pub async fn discover_query_schema(
 
 /// Discover table schema from INFORMATION_SCHEMA.COLUMNS.
 ///
-/// If `dialect` is `Unspecified`, auto-detects by querying INFORMATION_SCHEMA.SCHEMATA first
-/// (one extra round-trip). Specify `GoogleStandardSql` or `Postgresql` to skip detection.
+/// If `dialect` is `Unspecified`, auto-detects via `detect_dialect` (one extra
+/// round-trip, cached per `(database, endpoint)`). Specify `GoogleStandardSql`
+/// or `Postgresql` to skip detection.
 ///
 /// The `table` parameter can be:
 /// - `"MyTable"` — resolves to the default schema ('' for GoogleSQL, 'public' for PG)
@@ -88,9 +180,11 @@ pub async fn discover_table_schema(
     client: &Client,
     table: &str,
     dialect: DatabaseDialect,
+    database: &str,
+    endpoint: Option<&str>,
 ) -> Result<Vec<ColumnInfo>, SpannerError> {
     let dialect = if dialect == DatabaseDialect::Unspecified {
-        detect_dialect(client).await?
+        detect_dialect(client, database, endpoint).await?
     } else {
         dialect
     };
@@ -187,5 +281,72 @@ fn split_schema_table(qualified_name: &str) -> (&str, &str) {
     match qualified_name.rsplit_once('.') {
         Some((schema, table)) => (schema, table),
         None => ("", qualified_name),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_database_dialect_option_recognizes_known_values() {
+        assert_eq!(
+            parse_database_dialect_option("GOOGLE_STANDARD_SQL").unwrap(),
+            DatabaseDialect::GoogleStandardSql
+        );
+        assert_eq!(
+            parse_database_dialect_option("POSTGRESQL").unwrap(),
+            DatabaseDialect::Postgresql
+        );
+    }
+
+    #[test]
+    fn parse_database_dialect_option_rejects_unknown_values() {
+        assert!(parse_database_dialect_option("").is_err());
+        assert!(parse_database_dialect_option("something_else").is_err());
+    }
+
+    #[test]
+    fn parse_dialect_accepts_case_insensitive_names() {
+        assert_eq!(
+            parse_dialect("GoogleSQL").unwrap(),
+            DatabaseDialect::GoogleStandardSql
+        );
+        assert_eq!(
+            parse_dialect("PostgreSQL").unwrap(),
+            DatabaseDialect::Postgresql
+        );
+        assert!(parse_dialect("mysql").is_err());
+    }
+
+    #[test]
+    fn split_schema_table_handles_qualified_and_bare_names() {
+        assert_eq!(split_schema_table("MyTable"), ("", "MyTable"));
+        assert_eq!(
+            split_schema_table("myschema.MyTable"),
+            ("myschema", "MyTable")
+        );
+    }
+
+    #[test]
+    fn dialect_cache_is_keyed_like_client_cache() {
+        // Sanity check that the same (database, endpoint) pair used to key
+        // the client cache also keys the dialect cache, so a cached client
+        // and its cached dialect stay associated.
+        let key_a = crate::client::cache_key("db1", Some("localhost:9010"));
+        let key_b = crate::client::cache_key("db1", Some("localhost:9010"));
+        assert_eq!(key_a, key_b);
+
+        let key_c = crate::client::cache_key("db2", Some("localhost:9010"));
+        assert_ne!(key_a, key_c);
+
+        DIALECT_CACHE
+            .lock()
+            .unwrap()
+            .insert(key_a.clone(), DatabaseDialect::Postgresql);
+        assert_eq!(
+            DIALECT_CACHE.lock().unwrap().get(&key_b),
+            Some(&DatabaseDialect::Postgresql)
+        );
     }
 }
