@@ -373,7 +373,7 @@ Options:
 | `mode` | VARCHAR | `insert_or_update` | Mutation mode: `insert`, `update`, `insert_or_update`, or `replace` |
 | `batch_size` | VARCHAR | `1000` | Number of rows per commit |
 
-The file path argument specifies the target Spanner table name. Source columns are mapped to Spanner columns by position (column count must match).
+The file path argument specifies the target Spanner table name. Source columns are mapped to the table's **writable** Spanner columns by position. Generated columns (`INFORMATION_SCHEMA.IS_GENERATED != 'NEVER'`) are computed by Spanner and reject writes, so they are excluded from the target column list — the source column count must match the number of non-generated columns, not the total column count.
 
 `COPY TO ... FORMAT spanner` supports scalar columns, DuckDB LIST/ARRAY source columns mapped to Spanner ARRAY targets, and DuckDB STRUCT source columns mapped to Spanner JSON targets.
 

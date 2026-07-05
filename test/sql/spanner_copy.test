@@ -45,3 +45,22 @@ COPY (SELECT CAST(902 AS BIGINT) AS Id, 'insert_mode' AS Name, CAST(9.9 AS DOUBL
 
 statement ok
 SELECT IF(Name = 'insert_mode', 1, error('expected insert_mode row')) FROM spanner_query('SELECT Name FROM CopyTarget WHERE Id = 902');
+
+# --- generated columns are excluded from the writable target list ---
+# CopyGenerated has a generated column (Doubled) sitting between the writable
+# columns (Id, Amount, Label). COPY must map the 3 source columns positionally
+# onto the 3 writable columns, skipping Doubled, which Spanner computes itself.
+
+statement ok
+COPY (SELECT CAST(910 AS BIGINT) AS Id, CAST(21 AS BIGINT) AS Amount, 'gen_label' AS Label) TO 'CopyGenerated' (FORMAT spanner);
+
+statement ok
+SELECT IF(Amount = 21 AND Doubled = 42 AND Label = 'gen_label', 1, error('expected generated column computed and writable columns aligned')) FROM spanner_query('SELECT Amount, Doubled, Label FROM CopyGenerated WHERE Id = 910');
+
+# Supplying a value for the generated column (4 source columns vs 3 writable)
+# must fail with a clear count-mismatch error rather than silently corrupting data.
+
+statement error
+COPY (SELECT CAST(911 AS BIGINT) AS Id, CAST(5 AS BIGINT) AS Amount, CAST(999 AS BIGINT) AS Doubled, 'x' AS Label) TO 'CopyGenerated' (FORMAT spanner);
+----
+Column count mismatch
