@@ -118,9 +118,11 @@ EXTENSION_VERSION ?= $(patsubst v%,%,$(EXT_VERSION))
 
 include extension-ci-tools/makefiles/c_api_extensions/base.Makefile
 
-# Cargo package name (duckdb-spanner) differs from extension name (spanner).
+# Cargo package name (duckdb-spanner) differs from extension name (spanner), so
+# the cdylib artifact keeps the crate name: libduckdb_spanner.so/.dylib on
+# Linux/Darwin and duckdb_spanner.dll on Windows (no lib prefix, hyphen -> underscore).
 ifeq ($(OS),Windows_NT)
-	EXTENSION_LIB_FILENAME=$(EXTENSION_NAME).dll
+	EXTENSION_LIB_FILENAME=duckdb_spanner.dll
 else
 	CI_UNAME_S := $(shell uname -s)
 	ifeq ($(CI_UNAME_S),Linux)
