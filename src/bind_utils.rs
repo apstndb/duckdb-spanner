@@ -26,12 +26,10 @@ impl TimestampBoundConfig {
             Self::MaxStaleness { secs } => {
                 TimestampBound::max_staleness(std::time::Duration::from_secs(*secs))
             }
-            Self::ReadTimestamp { seconds, nanos } => {
-                TimestampBound::read_timestamp(Timestamp {
-                    seconds: *seconds,
-                    nanos: *nanos,
-                })
-            }
+            Self::ReadTimestamp { seconds, nanos } => TimestampBound::read_timestamp(Timestamp {
+                seconds: *seconds,
+                nanos: *nanos,
+            }),
             Self::MinReadTimestamp { seconds, nanos } => {
                 TimestampBound::min_read_timestamp(Timestamp {
                     seconds: *seconds,
@@ -74,10 +72,7 @@ pub fn parse_priority(s: &str) -> Result<Priority, Box<dyn std::error::Error>> {
         "low" => Ok(Priority::Low),
         "medium" => Ok(Priority::Medium),
         "high" => Ok(Priority::High),
-        _ => Err(format!(
-            "Invalid priority '{s}': must be 'low', 'medium', or 'high'"
-        )
-        .into()),
+        _ => Err(format!("Invalid priority '{s}': must be 'low', 'medium', or 'high'").into()),
     }
 }
 
@@ -108,11 +103,9 @@ pub fn resolve_timestamp_bound(
     .count();
 
     if count > 1 {
-        return Err(
-            "At most one timestamp bound parameter can be specified \
+        return Err("At most one timestamp bound parameter can be specified \
              (exact_staleness_secs, max_staleness_secs, read_timestamp, min_read_timestamp)"
-                .into(),
-        );
+            .into());
     }
 
     if let Some(secs) = exact_staleness_secs {
@@ -140,7 +133,10 @@ pub fn resolve_timestamp_bound(
 
     if let Some(ts) = min_read_timestamp {
         let (seconds, nanos) = parse_rfc3339_timestamp(ts)?;
-        return Ok(Some(TimestampBoundConfig::MinReadTimestamp { seconds, nanos }));
+        return Ok(Some(TimestampBoundConfig::MinReadTimestamp {
+            seconds,
+            nanos,
+        }));
     }
 
     Ok(None)
@@ -175,13 +171,16 @@ pub fn resolve_database_path(bind: &BindInfo) -> Result<String, Box<dyn std::err
         let database = arg_database.or_else(|| config::get_config_string(bind, "spanner_database"));
         let p = project.ok_or(
             "project is required when instance or database is specified. \
-             Use project := '...' or SET spanner_project = '...'")?;
+             Use project := '...' or SET spanner_project = '...'",
+        )?;
         let i = instance.ok_or(
             "instance is required when project or database is specified. \
-             Use instance := '...' or SET spanner_instance = '...'")?;
+             Use instance := '...' or SET spanner_instance = '...'",
+        )?;
         let d = database.ok_or(
             "database is required when project or instance is specified. \
-             Use database := '...' or SET spanner_database = '...'")?;
+             Use database := '...' or SET spanner_database = '...'",
+        )?;
         return Ok(format!("projects/{p}/instances/{i}/databases/{d}"));
     }
 
@@ -196,13 +195,16 @@ pub fn resolve_database_path(bind: &BindInfo) -> Result<String, Box<dyn std::err
     if cfg_project.is_some() || cfg_instance.is_some() || cfg_database.is_some() {
         let p = cfg_project.ok_or(
             "project is required when instance or database is specified. \
-             Use project := '...' or SET spanner_project = '...'")?;
+             Use project := '...' or SET spanner_project = '...'",
+        )?;
         let i = cfg_instance.ok_or(
             "instance is required when project or database is specified. \
-             Use instance := '...' or SET spanner_instance = '...'")?;
+             Use instance := '...' or SET spanner_instance = '...'",
+        )?;
         let d = cfg_database.ok_or(
             "database is required when project or instance is specified. \
-             Use database := '...' or SET spanner_database = '...'")?;
+             Use database := '...' or SET spanner_database = '...'",
+        )?;
         return Ok(format!("projects/{p}/instances/{i}/databases/{d}"));
     }
 

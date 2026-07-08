@@ -225,7 +225,12 @@ impl VTab for SpannerScanVTab {
         // Write projected columns using the unified conversion.
         // Spanner Read API returns columns in the order we requested (projected order),
         // so spanner_col_idx = i and output_col_idx = i.
-        write_projected_rows(output, &batch, &bind_data.columns, &init_data.projected_columns)?;
+        write_projected_rows(
+            output,
+            &batch,
+            &bind_data.columns,
+            &init_data.projected_columns,
+        )?;
         Ok(())
     }
 
@@ -370,7 +375,10 @@ async fn stream_partitioned_read(
         let client = client.clone();
         let rows_delivered = rows_delivered.clone();
         handles.push(tokio::spawn(async move {
-            let mut session = client.get_session().await.map_err(|e| SpannerError::Other(e.to_string()))?;
+            let mut session = client
+                .get_session()
+                .await
+                .map_err(|e| SpannerError::Other(e.to_string()))?;
             let mut iter = RowIterator::new(&mut *session, partition.reader, None, false)
                 .await
                 .map_err(SpannerError::Grpc)?;

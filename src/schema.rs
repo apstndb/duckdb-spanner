@@ -20,10 +20,7 @@ pub fn parse_dialect(s: &str) -> Result<DatabaseDialect, Box<dyn std::error::Err
     match s.to_ascii_lowercase().as_str() {
         "googlesql" => Ok(DatabaseDialect::GoogleStandardSql),
         "postgresql" => Ok(DatabaseDialect::Postgresql),
-        _ => Err(format!(
-            "Invalid dialect '{s}': must be 'googlesql' or 'postgresql'"
-        )
-        .into()),
+        _ => Err(format!("Invalid dialect '{s}': must be 'googlesql' or 'postgresql'").into()),
     }
 }
 
@@ -135,11 +132,7 @@ pub async fn discover_table_schema(
 /// Build an INFORMATION_SCHEMA.COLUMNS query with dialect-appropriate parameter syntax.
 ///
 /// GoogleSQL uses `@param`; PostgreSQL uses `$N` with param names `pN`.
-fn build_columns_query(
-    dialect: DatabaseDialect,
-    schema_name: &str,
-    table_name: &str,
-) -> Statement {
+fn build_columns_query(dialect: DatabaseDialect, schema_name: &str, table_name: &str) -> Statement {
     if schema_name.is_empty() {
         let (sql, table_param) = match dialect {
             DatabaseDialect::Postgresql => (

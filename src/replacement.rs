@@ -27,9 +27,7 @@ unsafe extern "C" fn replacement_scan(
     table_name: *const std::os::raw::c_char,
     _data: *mut c_void,
 ) {
-    let result = std::panic::catch_unwind(|| unsafe {
-        replacement_scan_inner(info, table_name)
-    });
+    let result = std::panic::catch_unwind(|| unsafe { replacement_scan_inner(info, table_name) });
 
     if result.is_err() {
         unsafe { set_replacement_error(info, "panic in spanner replacement scan") };

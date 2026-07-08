@@ -80,19 +80,14 @@ impl ToKind for Float32Param {
 /// Typed values use `parse_spanner_type` for the `"type"` field.
 /// Supported: all scalar types + ARRAY\<scalar\>.
 /// STRUCT parameters are not supported (requires gcloud-spanner upstream changes).
-pub fn create_statement(
-    sql: &str,
-    params_json: Option<&str>,
-) -> Result<Statement, SpannerError> {
+pub fn create_statement(sql: &str, params_json: Option<&str>) -> Result<Statement, SpannerError> {
     let params_json = match params_json {
         Some(s) if !s.is_empty() => s,
         _ => return Ok(Statement::new(sql)),
     };
 
-    let params: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(params_json).map_err(|e| {
-            SpannerError::Other(format!("Failed to parse params JSON: {e}"))
-        })?;
+    let params: serde_json::Map<String, serde_json::Value> = serde_json::from_str(params_json)
+        .map_err(|e| SpannerError::Other(format!("Failed to parse params JSON: {e}")))?;
 
     let mut stmt = Statement::new(sql);
 
@@ -162,14 +157,11 @@ fn add_typed_param(
     key: &str,
     obj: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), SpannerError> {
-    let type_str = obj
-        .get("type")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            SpannerError::Other(format!(
-                "\"type\" field for parameter '{key}' must be a string"
-            ))
-        })?;
+    let type_str = obj.get("type").and_then(|v| v.as_str()).ok_or_else(|| {
+        SpannerError::Other(format!(
+            "\"type\" field for parameter '{key}' must be a string"
+        ))
+    })?;
 
     let spanner_type = types::parse_spanner_type(type_str);
     let type_code = TypeCode::try_from(spanner_type.code).unwrap_or(TypeCode::Unspecified);
@@ -208,19 +200,27 @@ fn add_scalar_param(
 
     match type_code {
         TypeCode::Bool => {
-            let b = value.as_bool().ok_or_else(|| param_err(key, "BOOL", value))?;
+            let b = value
+                .as_bool()
+                .ok_or_else(|| param_err(key, "BOOL", value))?;
             stmt.add_param(key, &b);
         }
         TypeCode::Int64 => {
-            let i = value.as_i64().ok_or_else(|| param_err(key, "INT64", value))?;
+            let i = value
+                .as_i64()
+                .ok_or_else(|| param_err(key, "INT64", value))?;
             stmt.add_param(key, &i);
         }
         TypeCode::Float32 => {
-            let f = value.as_f64().ok_or_else(|| param_err(key, "FLOAT32", value))?;
+            let f = value
+                .as_f64()
+                .ok_or_else(|| param_err(key, "FLOAT32", value))?;
             stmt.add_param(key, &Float32Param(Some(f as f32)));
         }
         TypeCode::Float64 => {
-            let f = value.as_f64().ok_or_else(|| param_err(key, "FLOAT64", value))?;
+            let f = value
+                .as_f64()
+                .ok_or_else(|| param_err(key, "FLOAT64", value))?;
             stmt.add_param(key, &f);
         }
         TypeCode::String => {
@@ -276,7 +276,11 @@ fn add_scalar_param(
 
 /// Bind a typed NULL scalar. Dispatches to the correct wrapper type so that
 /// `param_types` gets the right TypeCode.
-fn add_null_scalar(stmt: &mut Statement, key: &str, type_code: TypeCode) -> Result<(), SpannerError> {
+fn add_null_scalar(
+    stmt: &mut Statement,
+    key: &str,
+    type_code: TypeCode,
+) -> Result<(), SpannerError> {
     match type_code {
         TypeCode::Bool => stmt.add_param(key, &Option::<bool>::None),
         TypeCode::Int64 => stmt.add_param(key, &Option::<i64>::None),
@@ -352,9 +356,7 @@ fn add_array_param(
             stmt.add_param(key, &v);
         }
         TypeCode::String => {
-            let v = parse_array(key, arr, |_, v| {
-                Ok(json_to_string_coerce(v))
-            })?;
+            let v = parse_array(key, arr, |_, v| Ok(json_to_string_coerce(v)))?;
             stmt.add_param(key, &v);
         }
         TypeCode::Bytes => {
@@ -532,38 +534,22 @@ mod tests {
 
     #[test]
     fn test_typed_null_float32() {
-        create_statement(
-            "SELECT @x",
-            Some(r#"{"x": {"type": "FLOAT32"}}"#),
-        )
-        .unwrap();
+        create_statement("SELECT @x", Some(r#"{"x": {"type": "FLOAT32"}}"#)).unwrap();
     }
 
     #[test]
     fn test_typed_null_date() {
-        create_statement(
-            "SELECT @x",
-            Some(r#"{"x": {"type": "DATE"}}"#),
-        )
-        .unwrap();
+        create_statement("SELECT @x", Some(r#"{"x": {"type": "DATE"}}"#)).unwrap();
     }
 
     #[test]
     fn test_typed_null_json() {
-        create_statement(
-            "SELECT @x",
-            Some(r#"{"x": {"type": "JSON"}}"#),
-        )
-        .unwrap();
+        create_statement("SELECT @x", Some(r#"{"x": {"type": "JSON"}}"#)).unwrap();
     }
 
     #[test]
     fn test_typed_null_uuid() {
-        create_statement(
-            "SELECT @x",
-            Some(r#"{"x": {"type": "UUID"}}"#),
-        )
-        .unwrap();
+        create_statement("SELECT @x", Some(r#"{"x": {"type": "UUID"}}"#)).unwrap();
     }
 
     #[test]
@@ -820,13 +806,21 @@ mod tests {
     #[test]
     fn test_roundtrip_int64_from_bigint() {
         // spanner_value(9999999999::BIGINT) → {"value":9999999999,"type":"INT64"}
-        create_statement("SELECT @v", Some(r#"{"v":{"value":9999999999,"type":"INT64"}}"#)).unwrap();
+        create_statement(
+            "SELECT @v",
+            Some(r#"{"v":{"value":9999999999,"type":"INT64"}}"#),
+        )
+        .unwrap();
     }
 
     #[test]
     fn test_roundtrip_int64_from_uinteger() {
         // spanner_value(4294967295::UINTEGER) → {"value":4294967295,"type":"INT64"}
-        create_statement("SELECT @v", Some(r#"{"v":{"value":4294967295,"type":"INT64"}}"#)).unwrap();
+        create_statement(
+            "SELECT @v",
+            Some(r#"{"v":{"value":4294967295,"type":"INT64"}}"#),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -862,7 +856,11 @@ mod tests {
     #[test]
     fn test_roundtrip_float64() {
         // spanner_value(3.14::DOUBLE) → {"value":3.14,"type":"FLOAT64"}
-        create_statement("SELECT @v", Some(r#"{"v":{"value":3.14,"type":"FLOAT64"}}"#)).unwrap();
+        create_statement(
+            "SELECT @v",
+            Some(r#"{"v":{"value":3.14,"type":"FLOAT64"}}"#),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -879,7 +877,11 @@ mod tests {
     #[test]
     fn test_roundtrip_string() {
         // spanner_value('hello'::VARCHAR) → {"value":"hello","type":"STRING"}
-        create_statement("SELECT @v", Some(r#"{"v":{"value":"hello","type":"STRING"}}"#)).unwrap();
+        create_statement(
+            "SELECT @v",
+            Some(r#"{"v":{"value":"hello","type":"STRING"}}"#),
+        )
+        .unwrap();
     }
 
     #[test]

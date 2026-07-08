@@ -3,11 +3,11 @@ use std::sync::{Arc, Mutex};
 
 use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
+use google_cloud_googleapis::spanner::v1::request_options::Priority;
 use google_cloud_googleapis::spanner::v1::PartitionOptions;
 use google_cloud_spanner::reader::RowIterator;
 use google_cloud_spanner::row::Row;
 use google_cloud_spanner::statement::Statement;
-use google_cloud_googleapis::spanner::v1::request_options::Priority;
 use google_cloud_spanner::transaction::{CallOptions, QueryOptions};
 use tokio::sync::mpsc;
 
@@ -63,12 +63,7 @@ impl VTab for SpannerQueryVTab {
         // Discover output schema
         let columns = runtime::block_on(async {
             let client = client::get_or_create_client(&database, endpoint.as_deref()).await?;
-            schema::discover_query_schema(
-                &client,
-                &sql,
-                params_json.as_deref(),
-            )
-            .await
+            schema::discover_query_schema(&client, &sql, params_json.as_deref()).await
         })??;
 
         // Register output columns with DuckDB
@@ -328,7 +323,10 @@ async fn stream_partitioned_query(
         let client = client.clone();
         let rows_delivered = rows_delivered.clone();
         handles.push(tokio::spawn(async move {
-            let mut session = client.get_session().await.map_err(|e| SpannerError::Other(e.to_string()))?;
+            let mut session = client
+                .get_session()
+                .await
+                .map_err(|e| SpannerError::Other(e.to_string()))?;
             let mut iter = RowIterator::new(&mut *session, partition.reader, None, false)
                 .await
                 .map_err(SpannerError::Grpc)?;

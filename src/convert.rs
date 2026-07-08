@@ -51,7 +51,10 @@ unsafe fn unsafe_assign_string(vector: &mut FlatVector<'_>, idx: usize, s: &str)
 pub struct RawValue(pub prost_types::Value);
 
 impl TryFromValue for RawValue {
-    fn try_from(value: &prost_types::Value, _field: &google_cloud_googleapis::spanner::v1::struct_type::Field) -> Result<Self, google_cloud_spanner::row::Error> {
+    fn try_from(
+        value: &prost_types::Value,
+        _field: &google_cloud_googleapis::spanner::v1::struct_type::Field,
+    ) -> Result<Self, google_cloud_spanner::row::Error> {
         Ok(RawValue(value.clone()))
     }
 }
@@ -161,8 +164,7 @@ fn write_array_column(
 
     // Set list entries and write child values
     let mut offset = 0usize;
-    let elem_type_code =
-        TypeCode::try_from(element_type.code).unwrap_or(TypeCode::Unspecified);
+    let elem_type_code = TypeCode::try_from(element_type.code).unwrap_or(TypeCode::Unspecified);
 
     // For nested types, handle differently
     match elem_type_code {
@@ -181,10 +183,9 @@ fn write_array_column(
             }
             list_vector.set_len(total_children);
             // Write struct children
-            let struct_type = element_type
-                .struct_type
-                .as_ref()
-                .ok_or_else(|| SpannerError::Conversion("STRUCT without struct_type".to_string()))?;
+            let struct_type = element_type.struct_type.as_ref().ok_or_else(|| {
+                SpannerError::Conversion("STRUCT without struct_type".to_string())
+            })?;
             let mut child_struct = list_vector.struct_child(total_children);
             let mut flat_idx = 0usize;
             for values in raw_values.iter().flatten() {
@@ -299,8 +300,7 @@ fn write_raw_struct_value(
             .r#type
             .as_ref()
             .ok_or_else(|| SpannerError::Conversion("STRUCT field without type".to_string()))?;
-        let field_type_code =
-            TypeCode::try_from(field_type.code).unwrap_or(TypeCode::Unspecified);
+        let field_type_code = TypeCode::try_from(field_type.code).unwrap_or(TypeCode::Unspecified);
 
         let field_value = values.get(field_idx);
 
@@ -361,8 +361,7 @@ fn write_raw_list_value(
         }
     };
 
-    let elem_type_code =
-        TypeCode::try_from(element_type.code).unwrap_or(TypeCode::Unspecified);
+    let elem_type_code = TypeCode::try_from(element_type.code).unwrap_or(TypeCode::Unspecified);
 
     let current_len = list_vector.len();
     list_vector.set_entry(row_idx, current_len, values.len());
@@ -428,9 +427,9 @@ fn write_raw_scalar_to_flat(
         }
         TypeCode::Int64 | TypeCode::Enum => {
             if let Some(Kind::StringValue(s)) = &value.kind {
-                let v: i64 = s.parse().map_err(|e| {
-                    SpannerError::Conversion(format!("INT64 parse error: {e}"))
-                })?;
+                let v: i64 = s
+                    .parse()
+                    .map_err(|e| SpannerError::Conversion(format!("INT64 parse error: {e}")))?;
                 unsafe { *vector.as_mut_ptr::<i64>().add(idx) = v }
             } else {
                 vector.set_null(idx);
@@ -441,9 +440,9 @@ fn write_raw_scalar_to_flat(
                 unsafe { *vector.as_mut_ptr::<f32>().add(idx) = *v as f32 }
             } else if let Some(Kind::StringValue(s)) = &value.kind {
                 // Handle NaN, Infinity, -Infinity
-                let v: f32 = s.parse().map_err(|e| {
-                    SpannerError::Conversion(format!("FLOAT32 parse error: {e}"))
-                })?;
+                let v: f32 = s
+                    .parse()
+                    .map_err(|e| SpannerError::Conversion(format!("FLOAT32 parse error: {e}")))?;
                 unsafe { *vector.as_mut_ptr::<f32>().add(idx) = v }
             } else {
                 vector.set_null(idx);
@@ -453,9 +452,9 @@ fn write_raw_scalar_to_flat(
             if let Some(Kind::NumberValue(v)) = &value.kind {
                 unsafe { *vector.as_mut_ptr::<f64>().add(idx) = *v }
             } else if let Some(Kind::StringValue(s)) = &value.kind {
-                let v: f64 = s.parse().map_err(|e| {
-                    SpannerError::Conversion(format!("FLOAT64 parse error: {e}"))
-                })?;
+                let v: f64 = s
+                    .parse()
+                    .map_err(|e| SpannerError::Conversion(format!("FLOAT64 parse error: {e}")))?;
                 unsafe { *vector.as_mut_ptr::<f64>().add(idx) = v }
             } else {
                 vector.set_null(idx);
@@ -465,9 +464,8 @@ fn write_raw_scalar_to_flat(
             if let Some(Kind::StringValue(s)) = &value.kind {
                 use bigdecimal::{BigDecimal, ToPrimitive};
                 use std::str::FromStr;
-                let bd = BigDecimal::from_str(s).map_err(|e| {
-                    SpannerError::Conversion(format!("NUMERIC parse error: {e}"))
-                })?;
+                let bd = BigDecimal::from_str(s)
+                    .map_err(|e| SpannerError::Conversion(format!("NUMERIC parse error: {e}")))?;
                 // DuckDB DECIMAL(38,9): fixed-point i128 with scale=9.
                 // with_scale(9) shifts to 9 decimal places, into_bigint_and_scale
                 // gives the unscaled BigInt directly (no string round-trip).
@@ -499,9 +497,8 @@ fn write_raw_scalar_to_flat(
         TypeCode::Date => {
             if let Some(Kind::StringValue(s)) = &value.kind {
                 let format = time::format_description::well_known::Iso8601::DATE;
-                let date = time::Date::parse(s, &format).map_err(|e| {
-                    SpannerError::Conversion(format!("DATE parse error: {e}"))
-                })?;
+                let date = time::Date::parse(s, &format)
+                    .map_err(|e| SpannerError::Conversion(format!("DATE parse error: {e}")))?;
                 let days = (date - EPOCH_DATE).whole_days() as i32;
                 unsafe { *vector.as_mut_ptr::<i32>().add(idx) = days }
             } else {
@@ -512,8 +509,8 @@ fn write_raw_scalar_to_flat(
             if let Some(Kind::StringValue(s)) = &value.kind {
                 let ts = OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
                     .map_err(|e| {
-                        SpannerError::Conversion(format!("TIMESTAMP parse error: {e}"))
-                    })?;
+                    SpannerError::Conversion(format!("TIMESTAMP parse error: {e}"))
+                })?;
                 let micros = (ts.unix_timestamp_nanos() / 1_000) as i64;
                 unsafe { *vector.as_mut_ptr::<i64>().add(idx) = micros }
             } else {
@@ -522,9 +519,8 @@ fn write_raw_scalar_to_flat(
         }
         TypeCode::Uuid => {
             if let Some(Kind::StringValue(s)) = &value.kind {
-                let parsed = uuid::Uuid::parse_str(s).map_err(|e| {
-                    SpannerError::Conversion(format!("UUID parse error: {e}"))
-                })?;
+                let parsed = uuid::Uuid::parse_str(s)
+                    .map_err(|e| SpannerError::Conversion(format!("UUID parse error: {e}")))?;
                 // DuckDB stores UUIDs as hugeint with the MSB flipped for sort ordering.
                 // See: duckdb/src/common/types/uuid.cpp — UUIDToUHugeint / UHugeintToUUID.
                 // See also: duckdb/duckdb-rs#519 (UUID value correctness),

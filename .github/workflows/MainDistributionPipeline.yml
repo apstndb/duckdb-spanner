@@ -39,7 +39,9 @@ jobs:
       extension_name: spanner
       extra_toolchains: rust;python3
       # musl: not targeted; wasm: extension uses tokio+gRPC+rustls (not wasm-compatible).
-      exclude_archs: 'linux_amd64_musl;wasm_mvp;wasm_eh;wasm_threads'
+      # windows_amd64_mingw: aws-lc-sys (via rustls TLS stack) fails to link on MinGW; see #38.
+      # The MSVC windows_amd64 build covers Windows.
+      exclude_archs: 'linux_amd64_musl;wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw'
       # macOS/windows runners lack a Spanner emulator; tests run in emulator-tests below.
       skip_tests: true
 
