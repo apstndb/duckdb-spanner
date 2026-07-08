@@ -111,9 +111,14 @@ fn get_gsql_ddl_db() -> &'static spanemuboost::SpanEmuDatabase {
     DB.get_or_init(|| {
         let emu = get_emulator();
         test_runtime().block_on(async {
-            emu.create_database("gsql-ddl", DatabaseDialect::GoogleStandardSql, vec![], vec![])
-                .await
-                .expect("Failed to create GoogleSQL DDL database")
+            emu.create_database(
+                "gsql-ddl",
+                DatabaseDialect::GoogleStandardSql,
+                vec![],
+                vec![],
+            )
+            .await
+            .expect("Failed to create GoogleSQL DDL database")
         })
     })
 }
@@ -411,10 +416,7 @@ fn test_spanner_array_int64() {
 #[test]
 fn test_spanner_array_string() {
     let row = exec_spanner_one("SELECT ['a', 'b', 'c'] AS col");
-    assert_eq!(
-        row.column::<Vec<String>>(0).unwrap(),
-        vec!["a", "b", "c"]
-    );
+    assert_eq!(row.column::<Vec<String>>(0).unwrap(), vec!["a", "b", "c"]);
 }
 
 #[test]
@@ -457,9 +459,7 @@ fn test_spanner_null_array() {
 #[test]
 fn test_spanner_struct_expression() {
     // STRUCT via query expression (not a column type)
-    let rows = exec_spanner(
-        "SELECT ARRAY(SELECT AS STRUCT 'hello' AS name, 42 AS age) AS col",
-    );
+    let rows = exec_spanner("SELECT ARRAY(SELECT AS STRUCT 'hello' AS name, 42 AS age) AS col");
     assert_eq!(rows.len(), 1);
 }
 
@@ -498,15 +498,13 @@ fn test_spanner_table_null_row() {
 
 #[test]
 fn test_spanner_table_bytes() {
-    let row =
-        exec_spanner_one("SELECT BytesCol FROM ScalarTypes WHERE Id = 1");
+    let row = exec_spanner_one("SELECT BytesCol FROM ScalarTypes WHERE Id = 1");
     assert_eq!(row.column::<Vec<u8>>(0).unwrap(), b"hello");
 }
 
 #[test]
 fn test_spanner_table_date_timestamp() {
-    let row =
-        exec_spanner_one("SELECT DateCol, TimestampCol FROM ScalarTypes WHERE Id = 1");
+    let row = exec_spanner_one("SELECT DateCol, TimestampCol FROM ScalarTypes WHERE Id = 1");
     let date = row.column::<time::Date>(0).unwrap();
     assert_eq!(date.year(), 2024);
     assert_eq!(date.month(), time::Month::January);
@@ -530,10 +528,7 @@ fn test_spanner_table_numeric_json() {
 fn test_spanner_table_array() {
     let row = exec_spanner_one("SELECT IntArray, StrArray FROM ArrayTypes WHERE Id = 1");
     assert_eq!(row.column::<Vec<i64>>(0).unwrap(), vec![10, 20, 30]);
-    assert_eq!(
-        row.column::<Vec<String>>(1).unwrap(),
-        vec!["a", "b", "c"]
-    );
+    assert_eq!(row.column::<Vec<String>>(1).unwrap(), vec!["a", "b", "c"]);
 }
 
 #[test]
@@ -587,7 +582,9 @@ fn test_vtab_query_types() {
         "SELECT BoolCol, Int64Col, Float64Col, StringCol FROM ScalarTypes WHERE Id = 1",
     );
     let (b, i, f, s): (bool, i64, f64, String) = conn
-        .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .query_row(&sql, [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
         .unwrap();
     assert!(b);
     assert_eq!(i, 42);
@@ -614,9 +611,8 @@ fn test_vtab_query_date_timestamp() {
 #[test]
 fn test_vtab_query_numeric_json() {
     let conn = create_duckdb_connection();
-    let sql = vtab_query_sql(
-        "SELECT CAST(NumCol AS STRING), JsonCol FROM NumericTypes WHERE Id = 1",
-    );
+    let sql =
+        vtab_query_sql("SELECT CAST(NumCol AS STRING), JsonCol FROM NumericTypes WHERE Id = 1");
     let (num, json): (String, String) = conn
         .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
         .unwrap();
@@ -667,11 +663,9 @@ fn test_vtab_query_duckdb_aggregate() {
     let conn = create_duckdb_connection();
     let inner = vtab_query_sql("SELECT Int64Col FROM ScalarTypes");
     let sum: i64 = conn
-        .query_row(
-            &format!("SELECT SUM(Int64Col) FROM ({inner})"),
-            [],
-            |r| r.get(0),
-        )
+        .query_row(&format!("SELECT SUM(Int64Col) FROM ({inner})"), [], |r| {
+            r.get(0)
+        })
         .unwrap();
     // 42 + (-100) + NULL = -58
     assert_eq!(sum, -58);
@@ -809,11 +803,9 @@ fn test_vtab_query_bytes() {
     let conn = create_duckdb_connection();
     let sql = vtab_query_sql("SELECT BytesCol FROM ScalarTypes WHERE Id = 1");
     let encoded: String = conn
-        .query_row(
-            &format!("SELECT base64(BytesCol) FROM ({sql})"),
-            [],
-            |r| r.get(0),
-        )
+        .query_row(&format!("SELECT base64(BytesCol) FROM ({sql})"), [], |r| {
+            r.get(0)
+        })
         .unwrap();
     // b'hello' = base64 'aGVsbG8='
     assert_eq!(encoded, "aGVsbG8=");
@@ -901,8 +893,9 @@ fn test_spanner_query_params() {
     let client = spanner_client();
     let rows = test_runtime().block_on(async {
         let mut tx = client.single().await.unwrap();
-        let mut stmt =
-            Statement::new("SELECT Id, StringCol FROM ScalarTypes WHERE Id = @id AND StringCol = @name");
+        let mut stmt = Statement::new(
+            "SELECT Id, StringCol FROM ScalarTypes WHERE Id = @id AND StringCol = @name",
+        );
         stmt.add_param("id", &1_i64);
         stmt.add_param("name", &"hello".to_string());
         let mut iter = tx.query(stmt).await.unwrap();
@@ -979,10 +972,7 @@ enum Expected<'a> {
 fn assert_roundtrip(conn: &Connection, param: &str, expected: Expected) {
     use Expected::*;
 
-    let inner = vtab_query_sql_with(
-        "SELECT @v AS col",
-        &format!("params := {{'v': {param}}}"),
-    );
+    let inner = vtab_query_sql_with("SELECT @v AS col", &format!("params := {{'v': {param}}}"));
 
     let (extract_sql, expected_type, expected_val) = match expected {
         Value(t, v) => ("CAST(col AS VARCHAR)", t, v),
@@ -996,20 +986,19 @@ fn assert_roundtrip(conn: &Connection, param: &str, expected: Expected) {
     };
 
     let actual_type: String = conn
-        .query_row(
-            &format!("SELECT TYPEOF(col) FROM ({inner})"),
-            [],
-            |r| r.get(0),
-        )
+        .query_row(&format!("SELECT TYPEOF(col) FROM ({inner})"), [], |r| {
+            r.get(0)
+        })
         .unwrap();
-    assert_eq!(actual_type, expected_type, "type mismatch for param: {param}");
+    assert_eq!(
+        actual_type, expected_type,
+        "type mismatch for param: {param}"
+    );
 
     let val: String = conn
-        .query_row(
-            &format!("SELECT {extract_sql} FROM ({inner})"),
-            [],
-            |r| r.get(0),
-        )
+        .query_row(&format!("SELECT {extract_sql} FROM ({inner})"), [], |r| {
+            r.get(0)
+        })
         .unwrap();
     assert_eq!(val, expected_val, "value mismatch for param: {param}");
 }
@@ -1165,8 +1154,9 @@ fn test_ddl_operations() {
     // --- spanner_ddl (sync) ---
 
     // 1. CREATE TABLE
-    let sql = make_ddl_sql(db,
-        "CREATE TABLE DdlTest (Id INT64 NOT NULL, Name STRING(MAX)) PRIMARY KEY (Id)"
+    let sql = make_ddl_sql(
+        db,
+        "CREATE TABLE DdlTest (Id INT64 NOT NULL, Name STRING(MAX)) PRIMARY KEY (Id)",
     );
     let (op_name, done, duration): (String, bool, f64) = conn
         .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
@@ -1187,9 +1177,10 @@ fn test_ddl_operations() {
         .unwrap();
     assert!(done);
 
-    let verify_sql = make_query_sql(db,
+    let verify_sql = make_query_sql(
+        db,
         "SELECT column_name FROM INFORMATION_SCHEMA.COLUMNS \
-         WHERE table_name = ''DdlTest'' AND column_name = ''Value''"
+         WHERE table_name = ''DdlTest'' AND column_name = ''Value''",
     );
     let col_name: String = conn.query_row(&verify_sql, [], |r| r.get(0)).unwrap();
     assert_eq!(col_name, "Value");
@@ -1201,16 +1192,18 @@ fn test_ddl_operations() {
         .unwrap();
     assert!(done);
 
-    let verify_sql = make_query_sql(db,
+    let verify_sql = make_query_sql(
+        db,
         "SELECT index_name FROM INFORMATION_SCHEMA.INDEXES \
-         WHERE table_name = ''DdlTest'' AND index_name = ''DdlTestByName''"
+         WHERE table_name = ''DdlTest'' AND index_name = ''DdlTestByName''",
     );
     let idx_name: String = conn.query_row(&verify_sql, [], |r| r.get(0)).unwrap();
     assert_eq!(idx_name, "DdlTestByName");
 
     // 4. DROP INDEX then DROP TABLE
     let drop_idx_sql = make_ddl_sql(db, "DROP INDEX DdlTestByName");
-    conn.execute_batch(&format!("SELECT * FROM ({drop_idx_sql})")).unwrap();
+    conn.execute_batch(&format!("SELECT * FROM ({drop_idx_sql})"))
+        .unwrap();
 
     let drop_sql = make_ddl_sql(db, "DROP TABLE DdlTest");
     let (_, done, _): (String, bool, f64) = conn
@@ -1218,8 +1211,9 @@ fn test_ddl_operations() {
         .unwrap();
     assert!(done);
 
-    let verify_sql = make_query_sql(db,
-        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE table_name = ''DdlTest''"
+    let verify_sql = make_query_sql(
+        db,
+        "SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE table_name = ''DdlTest''",
     );
     let count: i64 = conn.query_row(&verify_sql, [], |r| r.get(0)).unwrap();
     assert_eq!(count, 0);
@@ -1227,8 +1221,9 @@ fn test_ddl_operations() {
     // --- spanner_ddl_async ---
 
     // 5. Async CREATE TABLE
-    let sql = make_ddl_async_sql(db,
-        "CREATE TABLE DdlAsyncTest (Id INT64 NOT NULL, Data BYTES(MAX)) PRIMARY KEY (Id)"
+    let sql = make_ddl_async_sql(
+        db,
+        "CREATE TABLE DdlAsyncTest (Id INT64 NOT NULL, Data BYTES(MAX)) PRIMARY KEY (Id)",
     );
     let (op_name, done): (String, bool) = conn
         .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -1258,7 +1253,10 @@ fn test_ddl_operations() {
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
-    assert!(!rows.is_empty(), "should have at least one operation after DDL");
+    assert!(
+        !rows.is_empty(),
+        "should have at least one operation after DDL"
+    );
     for (name, done) in &rows {
         assert!(!name.is_empty(), "operation name should not be empty");
         assert!(done, "all operations should be done");
@@ -1349,21 +1347,26 @@ fn get_pg_copy_db() -> &'static spanemuboost::SpanEmuDatabase {
                         name character varying(256), \
                         value double precision, \
                         PRIMARY KEY (id)\
-                    )".into(),
+                    )"
+                    .into(),
                     "CREATE TABLE pgsql_copy_array_target (\
                         id bigint NOT NULL, \
                         int_array bigint[], \
                         str_array character varying[], \
                         PRIMARY KEY (id)\
-                    )".into(),
+                    )"
+                    .into(),
                     "CREATE TABLE pgsql_copy_json_target (\
                         id bigint NOT NULL, \
                         doc jsonb, \
                         PRIMARY KEY (id)\
-                    )".into(),
+                    )"
+                    .into(),
                 ],
                 vec![],
-            ).await.expect("Failed to create PG COPY database")
+            )
+            .await
+            .expect("Failed to create PG COPY database")
         })
     })
 }
@@ -1598,7 +1601,9 @@ fn test_copy_to_basic() {
     conn.execute_batch(&sql).unwrap();
 
     // Read back via spanner_query (filter by Id range to avoid conflicts with other tests)
-    let read_sql = vtab_query_sql("SELECT Id, Name, Value FROM CopyTarget WHERE Id BETWEEN 100 AND 102 ORDER BY Id");
+    let read_sql = vtab_query_sql(
+        "SELECT Id, Name, Value FROM CopyTarget WHERE Id BETWEEN 100 AND 102 ORDER BY Id",
+    );
     let rows: Vec<(i64, String, f64)> = conn
         .prepare(&read_sql)
         .unwrap()
@@ -1637,11 +1642,9 @@ fn test_copy_to_types() {
         "SELECT Id, BoolCol, Int64Col, Float64Col, StringCol, DateCol, TimestampCol FROM CopyTypes WHERE Id = 1"
     );
     let (id, b, i, f, s): (i64, bool, i64, f64, String) = conn
-        .query_row(
-            &read_sql,
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-        )
+        .query_row(&read_sql, [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })
         .unwrap();
     assert_eq!(id, 1);
     assert!(b);
@@ -1686,7 +1689,7 @@ fn test_copy_to_with_nulls() {
     conn.execute_batch(&sql).unwrap();
 
     let read_sql = vtab_query_sql(
-        "SELECT BoolCol IS NULL, Int64Col IS NULL, StringCol IS NULL FROM CopyTypes WHERE Id = 300"
+        "SELECT BoolCol IS NULL, Int64Col IS NULL, StringCol IS NULL FROM CopyTypes WHERE Id = 300",
     );
     let (b_null, i_null, s_null): (bool, bool, bool) = conn
         .query_row(&read_sql, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
@@ -1792,14 +1795,18 @@ fn test_pg_ddl_operations() {
     assert!(done);
 
     // 2. ALTER TABLE
-    let alter_sql = make_ddl_sql(db,
-        "ALTER TABLE pgsql_ddl_test ADD COLUMN value double precision"
+    let alter_sql = make_ddl_sql(
+        db,
+        "ALTER TABLE pgsql_ddl_test ADD COLUMN value double precision",
     );
     let done: bool = conn.query_row(&alter_sql, [], |r| r.get(1)).unwrap();
     assert!(done);
 
     // 3. CREATE INDEX
-    let index_sql = make_ddl_sql(db, "CREATE INDEX pgsql_ddl_test_by_name ON pgsql_ddl_test(name)");
+    let index_sql = make_ddl_sql(
+        db,
+        "CREATE INDEX pgsql_ddl_test_by_name ON pgsql_ddl_test(name)",
+    );
     let done: bool = conn.query_row(&index_sql, [], |r| r.get(1)).unwrap();
     assert!(done);
 
@@ -1854,7 +1861,10 @@ fn test_pg_copy_to_basic() {
     conn.execute_batch(&sql).unwrap();
 
     // Read back
-    let read_sql = make_query_sql(db, "SELECT id, name, value FROM pgsql_copy_target WHERE id BETWEEN 100 AND 102 ORDER BY id");
+    let read_sql = make_query_sql(
+        db,
+        "SELECT id, name, value FROM pgsql_copy_target WHERE id BETWEEN 100 AND 102 ORDER BY id",
+    );
     let rows: Vec<(i64, String, f64)> = {
         let mut stmt = conn.prepare(&read_sql).unwrap();
         stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))

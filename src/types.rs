@@ -52,7 +52,9 @@ pub fn spanner_type_to_logical(spanner_type: &Type) -> LogicalTypeHandle {
             }
         }
         other => {
-            eprintln!("[duckdb-spanner] Unsupported Spanner TypeCode {other:?}, falling back to VARCHAR");
+            eprintln!(
+                "[duckdb-spanner] Unsupported Spanner TypeCode {other:?}, falling back to VARCHAR"
+            );
             LogicalTypeHandle::from(LogicalTypeId::Varchar)
         }
     }
@@ -84,19 +86,43 @@ pub fn parse_pg_spanner_type(s: &str) -> Type {
     };
 
     match base {
-        "boolean" | "bool" => Type { code: TypeCode::Bool as i32, ..Default::default() },
-        "bigint" | "int8" => Type { code: TypeCode::Int64 as i32, ..Default::default() },
-        "real" | "float4" => Type { code: TypeCode::Float32 as i32, ..Default::default() },
-        "double precision" | "float8" => Type { code: TypeCode::Float64 as i32, ..Default::default() },
+        "boolean" | "bool" => Type {
+            code: TypeCode::Bool as i32,
+            ..Default::default()
+        },
+        "bigint" | "int8" => Type {
+            code: TypeCode::Int64 as i32,
+            ..Default::default()
+        },
+        "real" | "float4" => Type {
+            code: TypeCode::Float32 as i32,
+            ..Default::default()
+        },
+        "double precision" | "float8" => Type {
+            code: TypeCode::Float64 as i32,
+            ..Default::default()
+        },
         "numeric" => Type {
             code: TypeCode::Numeric as i32,
             type_annotation: TypeAnnotationCode::PgNumeric as i32,
             ..Default::default()
         },
-        "character varying" | "varchar" | "text" => Type { code: TypeCode::String as i32, ..Default::default() },
-        "bytea" => Type { code: TypeCode::Bytes as i32, ..Default::default() },
-        "date" => Type { code: TypeCode::Date as i32, ..Default::default() },
-        "timestamp with time zone" | "timestamptz" => Type { code: TypeCode::Timestamp as i32, ..Default::default() },
+        "character varying" | "varchar" | "text" => Type {
+            code: TypeCode::String as i32,
+            ..Default::default()
+        },
+        "bytea" => Type {
+            code: TypeCode::Bytes as i32,
+            ..Default::default()
+        },
+        "date" => Type {
+            code: TypeCode::Date as i32,
+            ..Default::default()
+        },
+        "timestamp with time zone" | "timestamptz" => Type {
+            code: TypeCode::Timestamp as i32,
+            ..Default::default()
+        },
         "jsonb" => Type {
             code: TypeCode::Json as i32,
             type_annotation: TypeAnnotationCode::PgJsonb as i32,
@@ -107,11 +133,20 @@ pub fn parse_pg_spanner_type(s: &str) -> Type {
             type_annotation: TypeAnnotationCode::PgOid as i32,
             ..Default::default()
         },
-        "interval" => Type { code: TypeCode::Interval as i32, ..Default::default() },
-        "uuid" => Type { code: TypeCode::Uuid as i32, ..Default::default() },
+        "interval" => Type {
+            code: TypeCode::Interval as i32,
+            ..Default::default()
+        },
+        "uuid" => Type {
+            code: TypeCode::Uuid as i32,
+            ..Default::default()
+        },
         other => {
             eprintln!("[duckdb-spanner] Unknown PG Spanner type '{other}', falling back to STRING");
-            Type { code: TypeCode::String as i32, ..Default::default() }
+            Type {
+                code: TypeCode::String as i32,
+                ..Default::default()
+            }
         }
     }
 }
@@ -136,9 +171,7 @@ impl<'a> SpannerTypeParser<'a> {
     }
 
     fn skip_whitespace(&mut self) {
-        while self.pos < self.input.len()
-            && self.input.as_bytes()[self.pos].is_ascii_whitespace()
-        {
+        while self.pos < self.input.len() && self.input.as_bytes()[self.pos].is_ascii_whitespace() {
             self.pos += 1;
         }
     }
@@ -201,24 +234,60 @@ impl<'a> SpannerTypeParser<'a> {
         };
 
         match ident.as_str() {
-            "BOOL" => Type { code: TypeCode::Bool as i32, ..Default::default() },
-            "INT64" => Type { code: TypeCode::Int64 as i32, ..Default::default() },
-            "FLOAT32" => Type { code: TypeCode::Float32 as i32, ..Default::default() },
-            "FLOAT64" => Type { code: TypeCode::Float64 as i32, ..Default::default() },
-            "NUMERIC" => Type { code: TypeCode::Numeric as i32, ..Default::default() },
+            "BOOL" => Type {
+                code: TypeCode::Bool as i32,
+                ..Default::default()
+            },
+            "INT64" => Type {
+                code: TypeCode::Int64 as i32,
+                ..Default::default()
+            },
+            "FLOAT32" => Type {
+                code: TypeCode::Float32 as i32,
+                ..Default::default()
+            },
+            "FLOAT64" => Type {
+                code: TypeCode::Float64 as i32,
+                ..Default::default()
+            },
+            "NUMERIC" => Type {
+                code: TypeCode::Numeric as i32,
+                ..Default::default()
+            },
             "STRING" => {
                 skip_length(self);
-                Type { code: TypeCode::String as i32, ..Default::default() }
+                Type {
+                    code: TypeCode::String as i32,
+                    ..Default::default()
+                }
             }
             "BYTES" => {
                 skip_length(self);
-                Type { code: TypeCode::Bytes as i32, ..Default::default() }
+                Type {
+                    code: TypeCode::Bytes as i32,
+                    ..Default::default()
+                }
             }
-            "DATE" => Type { code: TypeCode::Date as i32, ..Default::default() },
-            "TIMESTAMP" => Type { code: TypeCode::Timestamp as i32, ..Default::default() },
-            "JSON" => Type { code: TypeCode::Json as i32, ..Default::default() },
-            "INTERVAL" => Type { code: TypeCode::Interval as i32, ..Default::default() },
-            "UUID" => Type { code: TypeCode::Uuid as i32, ..Default::default() },
+            "DATE" => Type {
+                code: TypeCode::Date as i32,
+                ..Default::default()
+            },
+            "TIMESTAMP" => Type {
+                code: TypeCode::Timestamp as i32,
+                ..Default::default()
+            },
+            "JSON" => Type {
+                code: TypeCode::Json as i32,
+                ..Default::default()
+            },
+            "INTERVAL" => Type {
+                code: TypeCode::Interval as i32,
+                ..Default::default()
+            },
+            "UUID" => Type {
+                code: TypeCode::Uuid as i32,
+                ..Default::default()
+            },
             "ARRAY" => {
                 self.skip_whitespace();
                 self.consume(b'<');
@@ -270,13 +339,20 @@ impl<'a> SpannerTypeParser<'a> {
                 }
             }
             other => {
-                eprintln!("[duckdb-spanner] Unknown Spanner type '{other}', falling back to STRING");
-                Type { code: TypeCode::String as i32, ..Default::default() }
+                eprintln!(
+                    "[duckdb-spanner] Unknown Spanner type '{other}', falling back to STRING"
+                );
+                Type {
+                    code: TypeCode::String as i32,
+                    ..Default::default()
+                }
             }
         }
     }
 
-    fn parse_struct_fields(&mut self) -> Vec<google_cloud_googleapis::spanner::v1::struct_type::Field> {
+    fn parse_struct_fields(
+        &mut self,
+    ) -> Vec<google_cloud_googleapis::spanner::v1::struct_type::Field> {
         let mut fields = Vec::new();
         loop {
             self.skip_whitespace();
@@ -319,17 +395,32 @@ mod tests {
         assert_eq!(parse_spanner_type("FLOAT64").code, TypeCode::Float64 as i32);
         assert_eq!(parse_spanner_type("NUMERIC").code, TypeCode::Numeric as i32);
         assert_eq!(parse_spanner_type("DATE").code, TypeCode::Date as i32);
-        assert_eq!(parse_spanner_type("TIMESTAMP").code, TypeCode::Timestamp as i32);
+        assert_eq!(
+            parse_spanner_type("TIMESTAMP").code,
+            TypeCode::Timestamp as i32
+        );
         assert_eq!(parse_spanner_type("JSON").code, TypeCode::Json as i32);
         assert_eq!(parse_spanner_type("UUID").code, TypeCode::Uuid as i32);
-        assert_eq!(parse_spanner_type("INTERVAL").code, TypeCode::Interval as i32);
+        assert_eq!(
+            parse_spanner_type("INTERVAL").code,
+            TypeCode::Interval as i32
+        );
     }
 
     #[test]
     fn test_parse_string_with_length() {
-        assert_eq!(parse_spanner_type("STRING(MAX)").code, TypeCode::String as i32);
-        assert_eq!(parse_spanner_type("STRING(100)").code, TypeCode::String as i32);
-        assert_eq!(parse_spanner_type("BYTES(MAX)").code, TypeCode::Bytes as i32);
+        assert_eq!(
+            parse_spanner_type("STRING(MAX)").code,
+            TypeCode::String as i32
+        );
+        assert_eq!(
+            parse_spanner_type("STRING(100)").code,
+            TypeCode::String as i32
+        );
+        assert_eq!(
+            parse_spanner_type("BYTES(MAX)").code,
+            TypeCode::Bytes as i32
+        );
     }
 
     #[test]
@@ -355,9 +446,15 @@ mod tests {
         let st = t.struct_type.unwrap();
         assert_eq!(st.fields.len(), 2);
         assert_eq!(st.fields[0].name, "name");
-        assert_eq!(st.fields[0].r#type.as_ref().unwrap().code, TypeCode::String as i32);
+        assert_eq!(
+            st.fields[0].r#type.as_ref().unwrap().code,
+            TypeCode::String as i32
+        );
         assert_eq!(st.fields[1].name, "age");
-        assert_eq!(st.fields[1].r#type.as_ref().unwrap().code, TypeCode::Int64 as i32);
+        assert_eq!(
+            st.fields[1].r#type.as_ref().unwrap().code,
+            TypeCode::Int64 as i32
+        );
     }
 
     #[test]
@@ -382,23 +479,47 @@ mod tests {
         assert_eq!(parse_pg_spanner_type("bigint").code, TypeCode::Int64 as i32);
         assert_eq!(parse_pg_spanner_type("int8").code, TypeCode::Int64 as i32);
         assert_eq!(parse_pg_spanner_type("real").code, TypeCode::Float32 as i32);
-        assert_eq!(parse_pg_spanner_type("float4").code, TypeCode::Float32 as i32);
-        assert_eq!(parse_pg_spanner_type("double precision").code, TypeCode::Float64 as i32);
-        assert_eq!(parse_pg_spanner_type("float8").code, TypeCode::Float64 as i32);
-        assert_eq!(parse_pg_spanner_type("numeric").code, TypeCode::Numeric as i32);
+        assert_eq!(
+            parse_pg_spanner_type("float4").code,
+            TypeCode::Float32 as i32
+        );
+        assert_eq!(
+            parse_pg_spanner_type("double precision").code,
+            TypeCode::Float64 as i32
+        );
+        assert_eq!(
+            parse_pg_spanner_type("float8").code,
+            TypeCode::Float64 as i32
+        );
+        assert_eq!(
+            parse_pg_spanner_type("numeric").code,
+            TypeCode::Numeric as i32
+        );
         assert_eq!(parse_pg_spanner_type("date").code, TypeCode::Date as i32);
-        assert_eq!(parse_pg_spanner_type("timestamp with time zone").code, TypeCode::Timestamp as i32);
-        assert_eq!(parse_pg_spanner_type("timestamptz").code, TypeCode::Timestamp as i32);
+        assert_eq!(
+            parse_pg_spanner_type("timestamp with time zone").code,
+            TypeCode::Timestamp as i32
+        );
+        assert_eq!(
+            parse_pg_spanner_type("timestamptz").code,
+            TypeCode::Timestamp as i32
+        );
         assert_eq!(parse_pg_spanner_type("jsonb").code, TypeCode::Json as i32);
         assert_eq!(parse_pg_spanner_type("oid").code, TypeCode::Int64 as i32);
-        assert_eq!(parse_pg_spanner_type("interval").code, TypeCode::Interval as i32);
+        assert_eq!(
+            parse_pg_spanner_type("interval").code,
+            TypeCode::Interval as i32
+        );
         assert_eq!(parse_pg_spanner_type("uuid").code, TypeCode::Uuid as i32);
     }
 
     #[test]
     fn test_parse_pg_type_annotations() {
         let numeric = parse_pg_spanner_type("numeric");
-        assert_eq!(numeric.type_annotation, TypeAnnotationCode::PgNumeric as i32);
+        assert_eq!(
+            numeric.type_annotation,
+            TypeAnnotationCode::PgNumeric as i32
+        );
 
         let jsonb = parse_pg_spanner_type("jsonb");
         assert_eq!(jsonb.type_annotation, TypeAnnotationCode::PgJsonb as i32);
@@ -408,14 +529,26 @@ mod tests {
 
         // Non-PG-specific types should have Unspecified annotation
         let boolean = parse_pg_spanner_type("boolean");
-        assert_eq!(boolean.type_annotation, TypeAnnotationCode::Unspecified as i32);
+        assert_eq!(
+            boolean.type_annotation,
+            TypeAnnotationCode::Unspecified as i32
+        );
     }
 
     #[test]
     fn test_parse_pg_string_types() {
-        assert_eq!(parse_pg_spanner_type("character varying").code, TypeCode::String as i32);
-        assert_eq!(parse_pg_spanner_type("character varying(256)").code, TypeCode::String as i32);
-        assert_eq!(parse_pg_spanner_type("varchar").code, TypeCode::String as i32);
+        assert_eq!(
+            parse_pg_spanner_type("character varying").code,
+            TypeCode::String as i32
+        );
+        assert_eq!(
+            parse_pg_spanner_type("character varying(256)").code,
+            TypeCode::String as i32
+        );
+        assert_eq!(
+            parse_pg_spanner_type("varchar").code,
+            TypeCode::String as i32
+        );
         assert_eq!(parse_pg_spanner_type("text").code, TypeCode::String as i32);
     }
 

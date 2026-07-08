@@ -30,9 +30,18 @@ impl VTab for SpannerTablesVTab {
     type InitData = TablesInitData;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        bind.add_result_column("table_schema", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("table_name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("table_type", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+        bind.add_result_column(
+            "table_schema",
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        );
+        bind.add_result_column(
+            "table_name",
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        );
+        bind.add_result_column(
+            "table_type",
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        );
 
         let database = crate::bind_utils::resolve_database_path(bind)?;
         let endpoint = crate::bind_utils::resolve_endpoint(bind);
@@ -118,17 +127,10 @@ async fn list_tables(client: &Client) -> Result<Vec<TableRow>, SpannerError> {
          WHERE TABLE_TYPE = 'BASE TABLE' \
          ORDER BY TABLE_SCHEMA, TABLE_NAME",
     );
-    let mut iter = tx
-        .query(stmt)
-        .await
-        .map_err(SpannerError::Grpc)?;
+    let mut iter = tx.query(stmt).await.map_err(SpannerError::Grpc)?;
 
     let mut rows = Vec::new();
-    while let Some(row) = iter
-        .next()
-        .await
-        .map_err(SpannerError::Grpc)?
-    {
+    while let Some(row) = iter.next().await.map_err(SpannerError::Grpc)? {
         rows.push(TableRow {
             table_schema: row.column::<String>(0)?,
             table_name: row.column::<String>(1)?,

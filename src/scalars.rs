@@ -1,14 +1,18 @@
 //! Native scalar functions replacing SQL macros for Spanner parameter helpers.
 
 use base64::Engine;
-use duckdb::core::{DataChunkHandle, FlatVector, ListVector, LogicalTypeHandle, LogicalTypeId, StructVector};
-use duckdb::types::DuckString;
-use duckdb::ffi::{duckdb_date, duckdb_hugeint, duckdb_interval, duckdb_string_t, duckdb_timestamp};
-use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
-use duckdb::vtab::arrow::{WritableVector, write_arrow_array_to_vector};
 use duckdb::arrow::array::{Array, AsArray, StringArray};
 use duckdb::arrow::datatypes::{DataType, IntervalMonthDayNanoType, TimeUnit};
-use serde_json::{Map, Value, json};
+use duckdb::core::{
+    DataChunkHandle, FlatVector, ListVector, LogicalTypeHandle, LogicalTypeId, StructVector,
+};
+use duckdb::ffi::{
+    duckdb_date, duckdb_hugeint, duckdb_interval, duckdb_string_t, duckdb_timestamp,
+};
+use duckdb::types::DuckString;
+use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
+use duckdb::vtab::arrow::{write_arrow_array_to_vector, WritableVector};
+use serde_json::{json, Map, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -60,9 +64,10 @@ unsafe fn register_nullable_scalar<S: VScalar>(
 
     use duckdb::core::DataChunkHandle;
     use duckdb::ffi::{
-        duckdb_add_scalar_function_to_set, duckdb_create_logical_type, duckdb_create_scalar_function,
-        duckdb_create_scalar_function_set, duckdb_data_chunk, duckdb_destroy_logical_type,
-        duckdb_destroy_scalar_function, duckdb_destroy_scalar_function_set, duckdb_function_info,
+        duckdb_add_scalar_function_to_set, duckdb_create_logical_type,
+        duckdb_create_scalar_function, duckdb_create_scalar_function_set, duckdb_data_chunk,
+        duckdb_destroy_logical_type, duckdb_destroy_scalar_function,
+        duckdb_destroy_scalar_function_set, duckdb_function_info,
         duckdb_register_scalar_function_set, duckdb_scalar_function_add_parameter,
         duckdb_scalar_function_set_error, duckdb_scalar_function_set_extra_info,
         duckdb_scalar_function_set_function, duckdb_scalar_function_set_name,
@@ -94,8 +99,10 @@ unsafe fn register_nullable_scalar<S: VScalar>(
                 ptr: duckdb_data_chunk,
                 owned: bool,
             }
-            let mut chunk: DataChunkHandle =
-                std::mem::transmute(UnownedChunk { ptr: input, owned: false });
+            let mut chunk: DataChunkHandle = std::mem::transmute(UnownedChunk {
+                ptr: input,
+                owned: false,
+            });
             let result = S::invoke(state, &mut chunk, &mut output);
             if let Err(e) = result {
                 if let Ok(msg) = CString::new(e.to_string()) {
@@ -161,14 +168,10 @@ impl VScalar for SpannerValueScalar {
                     let obj = json!({"value": null, "type": "INTERVAL"});
                     strings.push(serde_json::to_string(&obj)?);
                 } else {
-                    let interval = unsafe {
-                        vec.as_slice_with_len::<duckdb_interval>(row + 1)[row]
-                    };
-                    let iso = duckdb_interval_to_iso8601(
-                        interval.months,
-                        interval.days,
-                        interval.micros,
-                    );
+                    let interval =
+                        unsafe { vec.as_slice_with_len::<duckdb_interval>(row + 1)[row] };
+                    let iso =
+                        duckdb_interval_to_iso8601(interval.months, interval.days, interval.micros);
                     let obj = json!({"value": iso, "type": "INTERVAL"});
                     strings.push(serde_json::to_string(&obj)?);
                 }
@@ -182,7 +185,9 @@ impl VScalar for SpannerValueScalar {
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
-        vec![varchar_sig(vec![LogicalTypeHandle::from(LogicalTypeId::Any)])]
+        vec![varchar_sig(vec![LogicalTypeHandle::from(
+            LogicalTypeId::Any,
+        )])]
     }
 }
 
@@ -211,14 +216,10 @@ impl VScalar for SpannerTypedScalar {
                     let obj = json!({"value": null, "type": typ});
                     strings.push(serde_json::to_string(&obj)?);
                 } else {
-                    let interval = unsafe {
-                        value_vec.as_slice_with_len::<duckdb_interval>(row + 1)[row]
-                    };
-                    let iso = duckdb_interval_to_iso8601(
-                        interval.months,
-                        interval.days,
-                        interval.micros,
-                    );
+                    let interval =
+                        unsafe { value_vec.as_slice_with_len::<duckdb_interval>(row + 1)[row] };
+                    let iso =
+                        duckdb_interval_to_iso8601(interval.months, interval.days, interval.micros);
                     let obj = json!({"value": iso, "type": typ});
                     strings.push(serde_json::to_string(&obj)?);
                 }
@@ -282,7 +283,9 @@ impl VScalar for SpannerParamsScalar {
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
-        vec![varchar_sig(vec![LogicalTypeHandle::from(LogicalTypeId::Any)])]
+        vec![varchar_sig(vec![LogicalTypeHandle::from(
+            LogicalTypeId::Any,
+        )])]
     }
 }
 
@@ -309,13 +312,14 @@ impl VScalar for IntervalToIso8601Scalar {
                 )));
             }
         }
-        let array: std::sync::Arc<dyn Array> =
-            std::sync::Arc::new(StringArray::from(values));
+        let array: std::sync::Arc<dyn Array> = std::sync::Arc::new(StringArray::from(values));
         write_arrow_array_to_vector(&array, output)
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
-        vec![varchar_sig(vec![LogicalTypeHandle::from(LogicalTypeId::Interval)])]
+        vec![varchar_sig(vec![LogicalTypeHandle::from(
+            LogicalTypeId::Interval,
+        )])]
     }
 }
 
@@ -337,7 +341,9 @@ fn scalar_type_name(id: LogicalTypeId) -> Option<&'static str> {
         | LogicalTypeId::UTinyint
         | LogicalTypeId::USmallint
         | LogicalTypeId::UInteger => Some("INT64"),
-        LogicalTypeId::UBigint | LogicalTypeId::Hugeint | LogicalTypeId::UHugeint => Some("NUMERIC"),
+        LogicalTypeId::UBigint | LogicalTypeId::Hugeint | LogicalTypeId::UHugeint => {
+            Some("NUMERIC")
+        }
         LogicalTypeId::Float => Some("FLOAT32"),
         LogicalTypeId::Double => Some("FLOAT64"),
         LogicalTypeId::Varchar => Some("STRING"),
@@ -376,24 +382,48 @@ fn encode_spanner_value(
 
     match ty.id() {
         LogicalTypeId::Boolean => Ok(json!(array.as_boolean().value(idx))),
-        LogicalTypeId::Tinyint => Ok(json!(array.as_primitive::<duckdb::arrow::datatypes::Int8Type>().value(idx))),
-        LogicalTypeId::Smallint => Ok(json!(array.as_primitive::<duckdb::arrow::datatypes::Int16Type>().value(idx))),
-        LogicalTypeId::Integer => Ok(json!(array.as_primitive::<duckdb::arrow::datatypes::Int32Type>().value(idx))),
-        LogicalTypeId::Bigint => Ok(json!(array.as_primitive::<duckdb::arrow::datatypes::Int64Type>().value(idx))),
-        LogicalTypeId::UTinyint => Ok(json!(array.as_primitive::<duckdb::arrow::datatypes::UInt8Type>().value(idx) as i64)),
-        LogicalTypeId::USmallint => Ok(json!(array.as_primitive::<duckdb::arrow::datatypes::UInt16Type>().value(idx) as i64)),
-        LogicalTypeId::UInteger => Ok(json!(array.as_primitive::<duckdb::arrow::datatypes::UInt32Type>().value(idx) as i64)),
-        LogicalTypeId::UBigint | LogicalTypeId::Hugeint | LogicalTypeId::UHugeint | LogicalTypeId::Decimal => {
-            Ok(Value::String(array_value_as_string(array, idx, ty)?))
-        }
-        LogicalTypeId::Float => Ok(json!(array.as_primitive::<duckdb::arrow::datatypes::Float32Type>().value(idx))),
-        LogicalTypeId::Double => Ok(json!(array.as_primitive::<duckdb::arrow::datatypes::Float64Type>().value(idx))),
-        LogicalTypeId::Varchar | LogicalTypeId::Uuid | LogicalTypeId::Date | LogicalTypeId::Time => {
-            Ok(Value::String(string_at(array, idx).unwrap_or_default().to_string()))
-        }
+        LogicalTypeId::Tinyint => Ok(json!(array
+            .as_primitive::<duckdb::arrow::datatypes::Int8Type>()
+            .value(idx))),
+        LogicalTypeId::Smallint => Ok(json!(array
+            .as_primitive::<duckdb::arrow::datatypes::Int16Type>()
+            .value(idx))),
+        LogicalTypeId::Integer => Ok(json!(array
+            .as_primitive::<duckdb::arrow::datatypes::Int32Type>()
+            .value(idx))),
+        LogicalTypeId::Bigint => Ok(json!(array
+            .as_primitive::<duckdb::arrow::datatypes::Int64Type>()
+            .value(idx))),
+        LogicalTypeId::UTinyint => Ok(json!(array
+            .as_primitive::<duckdb::arrow::datatypes::UInt8Type>()
+            .value(idx) as i64)),
+        LogicalTypeId::USmallint => Ok(json!(array
+            .as_primitive::<duckdb::arrow::datatypes::UInt16Type>()
+            .value(idx) as i64)),
+        LogicalTypeId::UInteger => Ok(json!(array
+            .as_primitive::<duckdb::arrow::datatypes::UInt32Type>()
+            .value(idx) as i64)),
+        LogicalTypeId::UBigint
+        | LogicalTypeId::Hugeint
+        | LogicalTypeId::UHugeint
+        | LogicalTypeId::Decimal => Ok(Value::String(array_value_as_string(array, idx, ty)?)),
+        LogicalTypeId::Float => Ok(json!(array
+            .as_primitive::<duckdb::arrow::datatypes::Float32Type>()
+            .value(idx))),
+        LogicalTypeId::Double => Ok(json!(array
+            .as_primitive::<duckdb::arrow::datatypes::Float64Type>()
+            .value(idx))),
+        LogicalTypeId::Varchar
+        | LogicalTypeId::Uuid
+        | LogicalTypeId::Date
+        | LogicalTypeId::Time => Ok(Value::String(
+            string_at(array, idx).unwrap_or_default().to_string(),
+        )),
         LogicalTypeId::Blob | LogicalTypeId::Bit => {
             let bytes = binary_at(array, idx)?;
-            Ok(Value::String(base64::engine::general_purpose::STANDARD.encode(bytes)))
+            Ok(Value::String(
+                base64::engine::general_purpose::STANDARD.encode(bytes),
+            ))
         }
         LogicalTypeId::Timestamp | LogicalTypeId::TimestampTZ => {
             Ok(Value::String(timestamp_to_rfc3339(array, idx)?))
@@ -520,30 +550,34 @@ fn flat_vector_to_json_value(
     }
 
     match ty.id() {
-        LogicalTypeId::Boolean => Ok(json!(unsafe { vec.as_slice_with_len::<bool>(row + 1)[row] })),
-        LogicalTypeId::Tinyint => {
-            Ok(json!(unsafe { vec.as_slice_with_len::<i8>(row + 1)[row] } as i64))
-        }
-        LogicalTypeId::Smallint => {
-            Ok(json!(unsafe { vec.as_slice_with_len::<i16>(row + 1)[row] } as i64))
-        }
+        LogicalTypeId::Boolean => Ok(json!(unsafe {
+            vec.as_slice_with_len::<bool>(row + 1)[row]
+        })),
+        LogicalTypeId::Tinyint => Ok(json!(
+            unsafe { vec.as_slice_with_len::<i8>(row + 1)[row] } as i64
+        )),
+        LogicalTypeId::Smallint => Ok(json!(
+            unsafe { vec.as_slice_with_len::<i16>(row + 1)[row] } as i64
+        )),
         LogicalTypeId::Integer => Ok(json!(unsafe { vec.as_slice_with_len::<i32>(row + 1)[row] })),
         LogicalTypeId::Bigint => Ok(json!(unsafe { vec.as_slice_with_len::<i64>(row + 1)[row] })),
-        LogicalTypeId::UTinyint => {
-            Ok(json!(unsafe { vec.as_slice_with_len::<u8>(row + 1)[row] } as i64))
-        }
-        LogicalTypeId::USmallint => {
-            Ok(json!(unsafe { vec.as_slice_with_len::<u16>(row + 1)[row] } as i64))
-        }
-        LogicalTypeId::UInteger => {
-            Ok(json!(unsafe { vec.as_slice_with_len::<u32>(row + 1)[row] } as i64))
-        }
+        LogicalTypeId::UTinyint => Ok(json!(
+            unsafe { vec.as_slice_with_len::<u8>(row + 1)[row] } as i64
+        )),
+        LogicalTypeId::USmallint => Ok(json!(
+            unsafe { vec.as_slice_with_len::<u16>(row + 1)[row] } as i64
+        )),
+        LogicalTypeId::UInteger => Ok(json!(
+            unsafe { vec.as_slice_with_len::<u32>(row + 1)[row] } as i64
+        )),
         LogicalTypeId::UBigint => Ok(Value::String(
             unsafe { vec.as_slice_with_len::<u64>(row + 1)[row] }.to_string(),
         )),
-        LogicalTypeId::Hugeint | LogicalTypeId::UHugeint => Ok(Value::String(hugeint_to_string(
-            unsafe { vec.as_slice_with_len::<duckdb_hugeint>(row + 1)[row] },
-        ))),
+        LogicalTypeId::Hugeint | LogicalTypeId::UHugeint => {
+            Ok(Value::String(hugeint_to_string(unsafe {
+                vec.as_slice_with_len::<duckdb_hugeint>(row + 1)[row]
+            })))
+        }
         LogicalTypeId::Decimal => Ok(Value::String(decimal_vector_to_string(vec, row, ty)?)),
         LogicalTypeId::Date => {
             let days = unsafe { vec.as_slice_with_len::<duckdb_date>(row + 1)[row].days };
@@ -606,7 +640,11 @@ fn decimal_internal_type(width: u8) -> u32 {
     }
 }
 
-unsafe fn read_decimal_raw(data: *mut std::ffi::c_void, row_idx: usize, internal_type: u32) -> i128 {
+unsafe fn read_decimal_raw(
+    data: *mut std::ffi::c_void,
+    row_idx: usize,
+    internal_type: u32,
+) -> i128 {
     match internal_type {
         duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT => *data.cast::<i16>().add(row_idx) as i128,
         duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER => *data.cast::<i32>().add(row_idx) as i128,
@@ -703,7 +741,10 @@ fn binary_at(array: &dyn Array, idx: usize) -> Result<&[u8], Box<dyn std::error:
     }
 }
 
-fn timestamp_to_rfc3339(array: &dyn Array, idx: usize) -> Result<String, Box<dyn std::error::Error>> {
+fn timestamp_to_rfc3339(
+    array: &dyn Array,
+    idx: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
     match array.data_type() {
         DataType::Timestamp(TimeUnit::Microsecond, _) => {
             let micros = array.as_primitive::<TimestampMicrosecondType>().value(idx);
@@ -841,7 +882,10 @@ mod tests {
     #[test]
     fn test_interval_negative_hours() {
         // -90 minutes decomposes as -2h + 30m under euclidean component semantics
-        assert_eq!(duckdb_interval_to_iso8601(0, 0, -90 * 60 * 1_000_000), "PT-2H30M");
+        assert_eq!(
+            duckdb_interval_to_iso8601(0, 0, -90 * 60 * 1_000_000),
+            "PT-2H30M"
+        );
     }
 
     #[test]
@@ -861,7 +905,9 @@ mod tests {
         let conn = open_test_connection();
 
         let result: Option<String> = conn
-            .query_row("SELECT interval_to_iso8601(NULL::INTERVAL)", [], |r| r.get(0))
+            .query_row("SELECT interval_to_iso8601(NULL::INTERVAL)", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert!(result.is_none());
     }
@@ -880,10 +926,7 @@ mod tests {
 
     #[test]
     fn test_scalar_type_name_int64() {
-        assert_eq!(
-            scalar_type_name(LogicalTypeId::Bigint),
-            Some("INT64")
-        );
+        assert_eq!(scalar_type_name(LogicalTypeId::Bigint), Some("INT64"));
     }
 
     #[test]
@@ -938,7 +981,9 @@ mod tests {
         let conn = open_test_connection();
 
         let s: String = conn
-            .query_row("SELECT interval_to_iso8601(INTERVAL '1 day')", [], |r| r.get(0))
+            .query_row("SELECT interval_to_iso8601(INTERVAL '1 day')", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(s, "P1D");
     }

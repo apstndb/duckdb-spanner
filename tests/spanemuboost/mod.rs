@@ -11,15 +11,15 @@
 use std::error::Error;
 
 use google_cloud_gax::conn::Environment;
+use google_cloud_googleapis::spanner::admin::database::v1::{
+    CreateDatabaseRequest, DatabaseDialect,
+};
+use google_cloud_googleapis::spanner::admin::instance::v1::{CreateInstanceRequest, Instance};
 use google_cloud_spanner::admin::client::Client as AdminClient;
 use google_cloud_spanner::admin::AdminClientConfig;
 use google_cloud_spanner::client::{Client, ClientConfig, Error as SpannerClientError};
 use google_cloud_spanner::session::SessionConfig;
 use google_cloud_spanner::statement::Statement;
-use google_cloud_googleapis::spanner::admin::database::v1::{
-    CreateDatabaseRequest, DatabaseDialect,
-};
-use google_cloud_googleapis::spanner::admin::instance::v1::{CreateInstanceRequest, Instance};
 use testcontainers::core::IntoContainerPort;
 use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;

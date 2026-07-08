@@ -200,9 +200,7 @@ unsafe extern "C" fn copy_finalize(info: ffi::duckdb_copy_function_finalize_info
 
 // ─── Inner implementations ──────────────────────────────────────────────────
 
-unsafe fn copy_bind_inner(
-    info: ffi::duckdb_copy_function_bind_info,
-) -> Result<(), String> {
+unsafe fn copy_bind_inner(info: ffi::duckdb_copy_function_bind_info) -> Result<(), String> {
     // Parse COPY options
     let options_val = ffi::duckdb_copy_function_bind_get_options(info);
     let opts = extract_options(options_val);
@@ -385,9 +383,7 @@ unsafe fn copy_sink_inner(
     Ok(())
 }
 
-unsafe fn copy_finalize_inner(
-    info: ffi::duckdb_copy_function_finalize_info,
-) -> Result<(), String> {
+unsafe fn copy_finalize_inner(info: ffi::duckdb_copy_function_finalize_info) -> Result<(), String> {
     let state_ptr = ffi::duckdb_copy_function_finalize_get_global_state(info);
     if state_ptr.is_null() {
         return Ok(());
@@ -623,13 +619,16 @@ fn resolve_copy_database_path(
         let database = database_opt.or_else(|| cfg("spanner_database"));
         let p = project.ok_or(
             "project is required when instance or database is specified. \
-             Use project option or SET spanner_project = '...'")?;
+             Use project option or SET spanner_project = '...'",
+        )?;
         let i = instance.ok_or(
             "instance is required when project or database is specified. \
-             Use instance option or SET spanner_instance = '...'")?;
+             Use instance option or SET spanner_instance = '...'",
+        )?;
         let d = database.ok_or(
             "database is required when project or instance is specified. \
-             Use database option or SET spanner_database = '...'")?;
+             Use database option or SET spanner_database = '...'",
+        )?;
         return Ok(format!("projects/{p}/instances/{i}/databases/{d}"));
     }
 
@@ -644,13 +643,16 @@ fn resolve_copy_database_path(
     if project.is_some() || instance.is_some() || database.is_some() {
         let p = project.ok_or(
             "project is required when instance or database is specified. \
-             Use project option or SET spanner_project = '...'")?;
+             Use project option or SET spanner_project = '...'",
+        )?;
         let i = instance.ok_or(
             "instance is required when project or database is specified. \
-             Use instance option or SET spanner_instance = '...'")?;
+             Use instance option or SET spanner_instance = '...'",
+        )?;
         let d = database.ok_or(
             "database is required when project or instance is specified. \
-             Use database option or SET spanner_database = '...'")?;
+             Use database option or SET spanner_database = '...'",
+        )?;
         return Ok(format!("projects/{p}/instances/{i}/databases/{d}"));
     }
 
@@ -811,8 +813,7 @@ unsafe fn read_duckdb_value(
             let days = *data.cast::<i32>().add(row_idx);
             Kind::StringValue(epoch_days_to_date_string(days)?)
         }
-        ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP
-        | ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ => {
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP | ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ => {
             let micros = *data.cast::<i64>().add(row_idx);
             Kind::StringValue(epoch_micros_to_rfc3339(micros)?)
         }
@@ -898,9 +899,7 @@ unsafe fn read_duckdb_value(
         }
     };
 
-    Ok(Value {
-        kind: Some(kind),
-    })
+    Ok(Value { kind: Some(kind) })
 }
 
 unsafe fn read_duckdb_json_value(
@@ -984,8 +983,7 @@ unsafe fn read_duckdb_json_value(
             let days = *data.cast::<i32>().add(row_idx);
             Ok(serde_json::Value::String(epoch_days_to_date_string(days)?))
         }
-        ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP
-        | ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ => {
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP | ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ => {
             let micros = *data.cast::<i64>().add(row_idx);
             Ok(serde_json::Value::String(epoch_micros_to_rfc3339(micros)?))
         }
