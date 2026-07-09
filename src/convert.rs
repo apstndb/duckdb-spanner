@@ -202,7 +202,10 @@ fn write_array_column(
                 if let Some(Kind::ListValue(list)) = val.kind {
                     total_children += list.values.len();
                     raw_values.push(Some(list.values));
-                } else if let Some(Kind::NullValue(_)) = val.kind {
+                } else if matches!(val.kind, Some(Kind::NullValue(_)) | None) {
+                    // NullValue and absent kind are both legitimate NULLs, consistent
+                    // with write_raw_scalar_to_flat / write_raw_list_value /
+                    // write_raw_struct_value, which all treat `kind: None` as NULL.
                     raw_values.push(None);
                 } else {
                     return Err(type_mismatch_error(
@@ -241,10 +244,11 @@ fn write_array_column(
             })?;
             let mut child_struct = list_vector.struct_child(total_children);
             let mut flat_idx = 0usize;
-            for values in raw_values.iter().flatten() {
-                for val in values {
+            for (row_idx, values) in raw_values.iter().enumerate() {
+                let Some(values) = values else { continue };
+                for (elem_idx, val) in values.iter().enumerate() {
                     write_raw_struct_value(&mut child_struct, flat_idx, val, struct_type, &|| {
-                        format!("column '{column_name}', array element {flat_idx}")
+                        format!("column '{column_name}', row {row_idx}, array element {elem_idx}")
                     })?;
                     flat_idx += 1;
                 }
@@ -270,10 +274,11 @@ fn write_array_column(
             })?;
             let mut child_list = list_vector.list_child();
             let mut flat_idx = 0usize;
-            for values in raw_values.iter().flatten() {
-                for val in values {
+            for (row_idx, values) in raw_values.iter().enumerate() {
+                let Some(values) = values else { continue };
+                for (elem_idx, val) in values.iter().enumerate() {
                     write_raw_list_value(&mut child_list, flat_idx, val, inner_elem_type, &|| {
-                        format!("column '{column_name}', array element {flat_idx}")
+                        format!("column '{column_name}', row {row_idx}, array element {elem_idx}")
                     })?;
                     flat_idx += 1;
                 }
@@ -296,10 +301,11 @@ fn write_array_column(
             list_vector.set_len(total_children);
             let mut child = list_vector.child(total_children);
             let mut flat_idx = 0usize;
-            for values in raw_values.iter().flatten() {
-                for val in values {
+            for (row_idx, values) in raw_values.iter().enumerate() {
+                let Some(values) = values else { continue };
+                for (elem_idx, val) in values.iter().enumerate() {
                     write_raw_scalar_to_flat(&mut child, flat_idx, val, elem_type_code, &|| {
-                        format!("column '{column_name}', array element {flat_idx}")
+                        format!("column '{column_name}', row {row_idx}, array element {elem_idx}")
                     })?;
                     flat_idx += 1;
                 }
@@ -541,11 +547,12 @@ fn write_raw_scalar_to_flat(
                     .map_err(|e| SpannerError::Conversion(format!("INT64 parse error: {e}")))?;
                 unsafe { *vector.as_mut_ptr::<i64>().add(idx) = v }
             } else {
-                return Err(type_mismatch_error(
-                    "INT64 (StringValue)",
-                    &value.kind,
-                    &context(),
-                ));
+                let expected = if type_code == TypeCode::Enum {
+                    "ENUM (StringValue)"
+                } else {
+                    "INT64 (StringValue)"
+                };
+                return Err(type_mismatch_error(expected, &value.kind, &context()));
             }
         }
         TypeCode::Float32 => {
@@ -930,33 +937,207 @@ mod tests {
         assert!(msg.contains("column 'age', row 3"), "message: {msg}");
     }
 
-    #[test]
-    fn write_raw_scalar_bool_mismatch_is_conversion_error() {
-        // A StringValue where BOOL is expected must be a genuine mismatch error,
-        // not a silent NULL.
-        let value = value_of(Kind::StringValue("true".to_string()));
-        let err = match (&value.kind, TypeCode::Bool) {
-            (Some(Kind::BoolValue(_)), _) => panic!("test setup wrong"),
-            (kind, _) => type_mismatch_error("BOOL (BoolValue)", kind, "column 'flag', row 0"),
+    // ─── Real-vector conversion tests (issue #11) ──────────────────────────
+    //
+    // These exercise the production write paths end-to-end against real DuckDB
+    // vectors, so they fail if a mismatch is silently NULLed instead of erroring.
+    // DuckDB vectors are constructible in unit tests because the `bundled`
+    // dev-dependency links the DuckDB C library (see Cargo.toml).
+
+    use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
+    use google_cloud_googleapis::spanner::v1::struct_type::Field;
+    use google_cloud_googleapis::spanner::v1::StructType;
+    use google_cloud_spanner::row::Row;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn scalar_type(code: TypeCode) -> Type {
+        Type {
+            code: code as i32,
+            ..Default::default()
+        }
+    }
+
+    fn array_type(element: Type) -> Type {
+        Type {
+            code: TypeCode::Array as i32,
+            array_element_type: Some(Box::new(element)),
+            ..Default::default()
+        }
+    }
+
+    fn struct_type_proto(fields: Vec<(&str, Type)>) -> Type {
+        Type {
+            code: TypeCode::Struct as i32,
+            struct_type: Some(StructType {
+                fields: fields
+                    .into_iter()
+                    .map(|(name, ty)| Field {
+                        name: name.to_string(),
+                        r#type: Some(ty),
+                    })
+                    .collect(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// Build a one-column, one-row Spanner `Row` carrying `value`.
+    fn single_row(column_type: Type, value: prost_types::Value) -> Row {
+        let field = Field {
+            name: "col".to_string(),
+            r#type: Some(column_type),
         };
-        match err {
-            SpannerError::Conversion(msg) => {
-                assert!(msg.contains("StringValue"));
-                assert!(msg.contains("BOOL"));
+        let mut index = HashMap::new();
+        index.insert("col".to_string(), 0usize);
+        Row::new(Arc::new(index), Arc::new(vec![field]), vec![value])
+    }
+
+    /// Write a single-row, single-column chunk and return the result, so tests
+    /// can assert either a Conversion error or a successful NULL/value write.
+    fn write_one(
+        logical_type: LogicalTypeHandle,
+        column_type: Type,
+        value: prost_types::Value,
+        column_name: &str,
+    ) -> (DataChunkHandle, Result<(), SpannerError>) {
+        let mut chunk = DataChunkHandle::new(&[logical_type]);
+        let rows = vec![single_row(column_type.clone(), value)];
+        let result = write_column_from_rows(&mut chunk, 0, &rows, 0, &column_type, column_name);
+        (chunk, result)
+    }
+
+    #[test]
+    fn scalar_mismatch_returns_conversion_error_with_context() {
+        // BOOL column receiving a StringValue must error, not silently NULL.
+        let (_chunk, result) = write_one(
+            LogicalTypeId::Boolean.into(),
+            scalar_type(TypeCode::Bool),
+            value_of(Kind::StringValue("true".to_string())),
+            "flag",
+        );
+        match result {
+            Err(SpannerError::Conversion(msg)) => {
+                assert!(msg.contains("BOOL"), "message: {msg}");
+                assert!(msg.contains("StringValue"), "message: {msg}");
+                assert!(msg.contains("column 'flag', row 0"), "message: {msg}");
             }
             other => panic!("expected Conversion error, got {other:?}"),
         }
     }
 
     #[test]
-    fn null_value_kind_is_never_classified_as_mismatch() {
-        // NullValue must short-circuit to NULL before any mismatch classification
-        // happens; write_raw_scalar_to_flat handles this before calling
-        // type_mismatch_error, so NullValue should never reach it in real usage.
-        // Guard the classification logic itself: NullValue is always distinguishable
-        // from a "genuine" Kind via kind_name so callers can special-case it first.
-        let kind = Some(Kind::NullValue(0));
-        assert_eq!(kind_name(&kind), "NullValue");
+    fn scalar_null_value_writes_null_not_error() {
+        // NullValue is a legitimate NULL, never a mismatch.
+        let (chunk, result) = write_one(
+            LogicalTypeId::Boolean.into(),
+            scalar_type(TypeCode::Bool),
+            value_of(Kind::NullValue(0)),
+            "flag",
+        );
+        result.expect("NullValue must write NULL, not error");
+        assert!(
+            chunk.flat_vector(0).row_is_null(0),
+            "row 0 should be NULL after a NullValue write"
+        );
+    }
+
+    #[test]
+    fn scalar_absent_kind_writes_null_not_error() {
+        // `kind: None` (absent) is handled as NULL by write_raw_scalar_to_flat.
+        // This bypasses the Row/Option<RawValue> path, which rejects absent kinds
+        // before they reach the writer, so drive the writer directly.
+        let mut chunk = DataChunkHandle::new(&[LogicalTypeId::Boolean.into()]);
+        let mut vector = chunk.flat_vector(0);
+        let value = prost_types::Value { kind: None };
+        write_raw_scalar_to_flat(&mut vector, 0, &value, TypeCode::Bool, &|| {
+            "ctx".to_string()
+        })
+        .expect("absent kind must write NULL, not error");
+        assert!(
+            vector.row_is_null(0),
+            "row 0 should be NULL for absent kind"
+        );
+    }
+
+    #[test]
+    fn list_element_mismatch_returns_conversion_error_with_context() {
+        // ARRAY<BOOL> whose element is a StringValue must error on the element.
+        let list_value = value_of(Kind::ListValue(prost_types::ListValue {
+            values: vec![value_of(Kind::StringValue("nope".to_string()))],
+        }));
+        let (_chunk, result) = write_one(
+            LogicalTypeHandle::list(&LogicalTypeId::Boolean.into()),
+            array_type(scalar_type(TypeCode::Bool)),
+            list_value,
+            "arr",
+        );
+        match result {
+            Err(SpannerError::Conversion(msg)) => {
+                assert!(msg.contains("BOOL"), "message: {msg}");
+                assert!(msg.contains("StringValue"), "message: {msg}");
+                assert!(msg.contains("row 0, array element 0"), "message: {msg}");
+            }
+            other => panic!("expected Conversion error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn struct_field_mismatch_returns_conversion_error_with_context() {
+        // STRUCT<flag BOOL> whose field value is a StringValue must error on the field.
+        let struct_value = value_of(Kind::ListValue(prost_types::ListValue {
+            values: vec![value_of(Kind::StringValue("nope".to_string()))],
+        }));
+        let logical = LogicalTypeHandle::struct_type(&[("flag", LogicalTypeId::Boolean.into())]);
+        let (_chunk, result) = write_one(
+            logical,
+            struct_type_proto(vec![("flag", scalar_type(TypeCode::Bool))]),
+            struct_value,
+            "st",
+        );
+        match result {
+            Err(SpannerError::Conversion(msg)) => {
+                assert!(msg.contains("BOOL"), "message: {msg}");
+                assert!(msg.contains("StringValue"), "message: {msg}");
+                assert!(msg.contains("field 'flag'"), "message: {msg}");
+                assert!(msg.contains("row 0"), "message: {msg}");
+            }
+            other => panic!("expected Conversion error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn array_column_null_value_writes_null_not_error() {
+        // A NullValue at the ARRAY column level is a legitimate NULL. This shares
+        // the `Some(Kind::NullValue(_)) | None` arm in write_array_column, so it
+        // also guards the absent-kind consistency fix (issue #11 review item 2).
+        let (_chunk, result) = write_one(
+            LogicalTypeHandle::list(&LogicalTypeId::Boolean.into()),
+            array_type(scalar_type(TypeCode::Bool)),
+            value_of(Kind::NullValue(0)),
+            "arr",
+        );
+        result.expect("array NullValue must write NULL, not error");
+    }
+
+    #[test]
+    fn array_column_scalar_kind_is_mismatch_not_null() {
+        // A non-list, non-null kind at the ARRAY column level is a genuine
+        // mismatch (only NullValue / absent kind are treated as NULL).
+        let (_chunk, result) = write_one(
+            LogicalTypeHandle::list(&LogicalTypeId::Boolean.into()),
+            array_type(scalar_type(TypeCode::Bool)),
+            value_of(Kind::BoolValue(true)),
+            "arr",
+        );
+        match result {
+            Err(SpannerError::Conversion(msg)) => {
+                assert!(msg.contains("ARRAY"), "message: {msg}");
+                assert!(msg.contains("BoolValue"), "message: {msg}");
+                assert!(msg.contains("column 'arr', row 0"), "message: {msg}");
+            }
+            other => panic!("expected Conversion error, got {other:?}"),
+        }
     }
 
     #[test]
