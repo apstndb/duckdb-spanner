@@ -73,7 +73,8 @@ impl VTab for SpannerScanVTab {
         // If not, auto-detects via INFORMATION_SCHEMA.SCHEMATA (one extra round-trip).
         let columns = runtime::block_on(async {
             let client = client::get_or_create_client(&database, endpoint.as_deref()).await?;
-            schema::discover_table_schema(&client, &table, dialect).await
+            schema::discover_table_schema(&client, &table, dialect, &database, endpoint.as_deref())
+                .await
         })??;
 
         // Register output columns with DuckDB
