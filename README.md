@@ -315,33 +315,32 @@ At most one timestamp bound parameter can be specified. If none is set, Spanner 
 
 ### `spanner_ddl`
 
-Executes one or more DDL statements synchronously and waits for completion.
+Executes a DDL statement synchronously and waits for completion.
 
 ```sql
 SELECT * FROM spanner_ddl('CREATE TABLE Users (Id INT64 NOT NULL, Name STRING(MAX)) PRIMARY KEY (Id)');
 ```
 
 To batch multiple statements into a single `UpdateDatabaseDdl` request (as Spanner
-natively supports), separate them with `;` within the same TEXT argument:
+natively supports), pass a `LIST<VARCHAR>` with `statements := [...]`:
 
 ```sql
-SELECT * FROM spanner_ddl('
-    ALTER TABLE Users ADD COLUMN Email STRING(MAX);
-    ALTER TABLE Users ADD COLUMN Age INT64;
-');
+SELECT * FROM spanner_ddl(statements := [
+    'ALTER TABLE Users ADD COLUMN Email STRING(MAX)',
+    'ALTER TABLE Users ADD COLUMN Age INT64'
+]);
 ```
 
-All statements in the batch are sent as a single longrunning operation and
-succeed or fail atomically. Splitting is a naive `;` split (trailing/empty
-segments are dropped), so it does not understand `;` inside string literals —
-avoid semicolons inside DDL string literals (e.g. `DEFAULT` expressions) when
-batching.
+The statements are sent as one Spanner longrunning operation. Spanner applies
+the DDL statements in order and returns operation-level success or failure; it
+does not guarantee transactional rollback of earlier completed statements in a
+batch.
 
 Returns one row with `operation_name` (VARCHAR), `done` (BOOLEAN), and `duration_secs` (DOUBLE).
 
 ### `spanner_ddl_async`
 
-Submits one or more DDL statements (same `;`-separated batching as `spanner_ddl`)
+Submits a DDL statement, or a `statements := [...]` batch like `spanner_ddl`,
 and returns immediately without waiting for completion.
 
 ```sql
