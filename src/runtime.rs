@@ -62,9 +62,11 @@ mod tests {
     use tokio::sync::Semaphore;
 
     #[test]
-    fn worker_threads_is_at_least_two_and_capped_at_max() {
+    fn worker_threads_is_at_least_one_and_capped_at_max() {
         let n = worker_threads();
-        assert!(n >= 2, "expected at least 2 worker threads, got {n}");
+        // available_parallelism() can legitimately return 1 on single-core or
+        // cgroup-limited runners, so the floor is 1, not 2.
+        assert!(n >= 1, "expected at least 1 worker thread, got {n}");
         assert!(
             n <= MAX_WORKER_THREADS,
             "expected at most {MAX_WORKER_THREADS} worker threads, got {n}"
