@@ -14,7 +14,11 @@ use duckdb::vtab::BindInfo;
 /// # Safety
 /// `con` must be a valid `duckdb_connection`.
 pub unsafe fn register_config_options(con: ffi::duckdb_connection) {
-    register_varchar_option(con, "spanner_project", "Default Google Cloud project ID for Spanner");
+    register_varchar_option(
+        con,
+        "spanner_project",
+        "Default Google Cloud project ID for Spanner",
+    );
     register_varchar_option(con, "spanner_instance", "Default Spanner instance ID");
     register_varchar_option(con, "spanner_database", "Default Spanner database ID");
     register_varchar_option(
@@ -82,9 +86,15 @@ pub unsafe fn get_config_string_from_context(
         let result = if c_str.is_null() {
             None
         } else {
-            let s = std::ffi::CStr::from_ptr(c_str).to_string_lossy().into_owned();
+            let s = std::ffi::CStr::from_ptr(c_str)
+                .to_string_lossy()
+                .into_owned();
             ffi::duckdb_free(c_str as *mut _);
-            if s.is_empty() { None } else { Some(s) }
+            if s.is_empty() {
+                None
+            } else {
+                Some(s)
+            }
         };
 
         ffi::duckdb_destroy_value(&mut { val });

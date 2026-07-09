@@ -200,9 +200,7 @@ unsafe extern "C" fn copy_finalize(info: ffi::duckdb_copy_function_finalize_info
 
 // ─── Inner implementations ──────────────────────────────────────────────────
 
-unsafe fn copy_bind_inner(
-    info: ffi::duckdb_copy_function_bind_info,
-) -> Result<(), String> {
+unsafe fn copy_bind_inner(info: ffi::duckdb_copy_function_bind_info) -> Result<(), String> {
     // Parse COPY options
     let options_val = ffi::duckdb_copy_function_bind_get_options(info);
     let opts = extract_options(options_val);
@@ -306,6 +304,8 @@ unsafe fn copy_global_init_inner(
         &client,
         &table_name,
         DatabaseDialect::Unspecified,
+        &bind_data.database_path,
+        bind_data.endpoint.as_deref(),
     ))
     .map_err(|e| format!("Runtime error: {e}"))?
     .map_err(|e| format!("Schema discovery failed for table '{table_name}': {e}"))?;
@@ -318,12 +318,8 @@ unsafe fn copy_global_init_inner(
     // over the writable target columns in ordinal order. `resolve_copy_columns`
     // also implements case-insensitive by-name matching for when source names are
     // available (see its unit tests).
-    let targets = resolve_copy_columns(
-        &schema_columns,
-        None,
-        bind_data.columns.len(),
-        &table_name,
-    )?;
+    let targets =
+        resolve_copy_columns(&schema_columns, None, bind_data.columns.len(), &table_name)?;
 
     let column_names: Vec<String> = targets.iter().map(|c| c.name.clone()).collect();
 
@@ -390,9 +386,7 @@ unsafe fn copy_sink_inner(
     Ok(())
 }
 
-unsafe fn copy_finalize_inner(
-    info: ffi::duckdb_copy_function_finalize_info,
-) -> Result<(), String> {
+unsafe fn copy_finalize_inner(info: ffi::duckdb_copy_function_finalize_info) -> Result<(), String> {
     let state_ptr = ffi::duckdb_copy_function_finalize_get_global_state(info);
     if state_ptr.is_null() {
         return Ok(());
@@ -550,6 +544,16 @@ fn resolve_copy_columns(
                     "Internal error: {} source names for {source_count} source columns",
                     names.len()
                 ));
+            }
+            let mut seen_names = std::collections::HashMap::new();
+            for name in names {
+                let normalized = name.to_ascii_lowercase();
+                if let Some(first_name) = seen_names.insert(normalized, name) {
+                    return Err(format!(
+                        "COPY source column '{name}' duplicates source column '{first_name}'. \
+                         Source column names must be unique for by-name mapping"
+                    ));
+                }
             }
             let mut resolved = Vec::with_capacity(names.len());
             for name in names {
@@ -721,13 +725,16 @@ fn resolve_copy_database_path(
         let database = database_opt.or_else(|| cfg("spanner_database"));
         let p = project.ok_or(
             "project is required when instance or database is specified. \
-             Use project option or SET spanner_project = '...'")?;
+             Use project option or SET spanner_project = '...'",
+        )?;
         let i = instance.ok_or(
             "instance is required when project or database is specified. \
-             Use instance option or SET spanner_instance = '...'")?;
+             Use instance option or SET spanner_instance = '...'",
+        )?;
         let d = database.ok_or(
             "database is required when project or instance is specified. \
-             Use database option or SET spanner_database = '...'")?;
+             Use database option or SET spanner_database = '...'",
+        )?;
         return Ok(format!("projects/{p}/instances/{i}/databases/{d}"));
     }
 
@@ -742,13 +749,16 @@ fn resolve_copy_database_path(
     if project.is_some() || instance.is_some() || database.is_some() {
         let p = project.ok_or(
             "project is required when instance or database is specified. \
-             Use project option or SET spanner_project = '...'")?;
+             Use project option or SET spanner_project = '...'",
+        )?;
         let i = instance.ok_or(
             "instance is required when project or database is specified. \
-             Use instance option or SET spanner_instance = '...'")?;
+             Use instance option or SET spanner_instance = '...'",
+        )?;
         let d = database.ok_or(
             "database is required when project or instance is specified. \
-             Use database option or SET spanner_database = '...'")?;
+             Use database option or SET spanner_database = '...'",
+        )?;
         return Ok(format!("projects/{p}/instances/{i}/databases/{d}"));
     }
 
@@ -909,8 +919,7 @@ unsafe fn read_duckdb_value(
             let days = *data.cast::<i32>().add(row_idx);
             Kind::StringValue(epoch_days_to_date_string(days)?)
         }
-        ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP
-        | ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ => {
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP | ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ => {
             let micros = *data.cast::<i64>().add(row_idx);
             Kind::StringValue(epoch_micros_to_rfc3339(micros)?)
         }
@@ -996,9 +1005,7 @@ unsafe fn read_duckdb_value(
         }
     };
 
-    Ok(Value {
-        kind: Some(kind),
-    })
+    Ok(Value { kind: Some(kind) })
 }
 
 unsafe fn read_duckdb_json_value(
@@ -1082,8 +1089,7 @@ unsafe fn read_duckdb_json_value(
             let days = *data.cast::<i32>().add(row_idx);
             Ok(serde_json::Value::String(epoch_days_to_date_string(days)?))
         }
-        ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP
-        | ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ => {
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP | ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ => {
             let micros = *data.cast::<i64>().add(row_idx);
             Ok(serde_json::Value::String(epoch_micros_to_rfc3339(micros)?))
         }
@@ -1325,11 +1331,7 @@ mod tests {
     #[test]
     fn positional_excludes_generated_columns() {
         // DDL order: Id, FullName (generated), Name. Writable = Id, Name.
-        let schema = vec![
-            col("Id", false),
-            col("FullName", true),
-            col("Name", false),
-        ];
+        let schema = vec![col("Id", false), col("FullName", true), col("Name", false)];
         let resolved = resolve_copy_columns(&schema, None, 2, "T").unwrap();
         let got: Vec<&str> = resolved.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(got, vec!["Id", "Name"]);
@@ -1361,6 +1363,23 @@ mod tests {
         let got: Vec<&str> = resolved.iter().map(|c| c.name.as_str()).collect();
         // Result follows SOURCE order, using canonical target names.
         assert_eq!(got, vec!["Value", "Id", "Name"]);
+    }
+
+    #[test]
+    fn by_name_rejects_duplicate_source_names() {
+        let schema = vec![col("Id", false), col("Name", false)];
+        let src = names(&["Id", "Id"]);
+        let err = resolve_copy_columns(&schema, Some(&src), 2, "T").unwrap_err();
+        assert!(err.contains("'Id' duplicates source column 'Id'"), "{err}");
+        assert!(err.contains("must be unique"), "{err}");
+    }
+
+    #[test]
+    fn by_name_rejects_case_insensitive_duplicate_source_names() {
+        let schema = vec![col("Id", false), col("Name", false)];
+        let src = names(&["Id", "id"]);
+        let err = resolve_copy_columns(&schema, Some(&src), 2, "T").unwrap_err();
+        assert!(err.contains("'id' duplicates source column 'Id'"), "{err}");
     }
 
     #[test]

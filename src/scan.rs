@@ -73,7 +73,8 @@ impl VTab for SpannerScanVTab {
         // If not, auto-detects via INFORMATION_SCHEMA.SCHEMATA (one extra round-trip).
         let columns = runtime::block_on(async {
             let client = client::get_or_create_client(&database, endpoint.as_deref()).await?;
-            schema::discover_table_schema(&client, &table, dialect).await
+            schema::discover_table_schema(&client, &table, dialect, &database, endpoint.as_deref())
+                .await
         })??;
 
         // Register output columns with DuckDB
@@ -225,7 +226,12 @@ impl VTab for SpannerScanVTab {
         // Write projected columns using the unified conversion.
         // Spanner Read API returns columns in the order we requested (projected order),
         // so spanner_col_idx = i and output_col_idx = i.
-        write_projected_rows(output, &batch, &bind_data.columns, &init_data.projected_columns)?;
+        write_projected_rows(
+            output,
+            &batch,
+            &bind_data.columns,
+            &init_data.projected_columns,
+        )?;
         Ok(())
     }
 
@@ -363,14 +369,26 @@ async fn stream_partitioned_read(
 
     // Execute partitions concurrently, each with its own session from the pool.
     // Partitions embed the transaction selector, so any session can execute them
-    // against the same consistent snapshot.
-    let mut handles = Vec::with_capacity(partitions.len());
+    // against the same consistent snapshot. Concurrency is capped by a semaphore
+    // sized to the shared runtime's worker threads so we don't oversubscribe it
+    // (max_parallelism above only bounds partition *creation*, not execution).
+    let permits = runtime::worker_threads().min(partitions.len().max(1));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(permits));
+    let mut join_set = tokio::task::JoinSet::new();
     for partition in partitions {
         let tx = tx.clone();
         let client = client.clone();
         let rows_delivered = rows_delivered.clone();
-        handles.push(tokio::spawn(async move {
-            let mut session = client.get_session().await.map_err(|e| SpannerError::Other(e.to_string()))?;
+        let semaphore = semaphore.clone();
+        join_set.spawn(async move {
+            let _permit = semaphore
+                .acquire()
+                .await
+                .map_err(|e| SpannerError::Other(format!("Semaphore closed: {e}")))?;
+            let mut session = client
+                .get_session()
+                .await
+                .map_err(|e| SpannerError::Other(e.to_string()))?;
             let mut iter = RowIterator::new(&mut *session, partition.reader, None, false)
                 .await
                 .map_err(SpannerError::Grpc)?;
@@ -381,41 +399,17 @@ async fn stream_partitioned_read(
                 }
             }
             Ok::<(), SpannerError>(())
-        }));
+        });
     }
 
-    let mut remaining = handles;
-    while !remaining.is_empty() {
-        let mut progressed = false;
-        let mut i = 0;
-        while i < remaining.len() {
-            if remaining[i].is_finished() {
-                let handle = remaining.remove(i);
-                progressed = true;
-                match handle.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        for h in remaining {
-                            h.abort();
-                        }
-                        return Err(e);
-                    }
-                    Err(e) => {
-                        for h in remaining {
-                            h.abort();
-                        }
-                        return Err(SpannerError::Other(format!("Task join error: {e}")));
-                    }
-                }
-            } else {
-                i += 1;
-            }
-        }
-        if !progressed {
-            tokio::task::yield_now().await;
-        }
-    }
-    Ok(())
+    // Invariant: partition tasks must be fully terminated before this function
+    // returns. Client eviction close relies on Arc uniqueness => quiescence, so a
+    // task still holding a `Client` clone and `ManagedSession` must not outlive
+    // the streamer. `join_partitions` drains (aborts + awaits) every task on
+    // error before returning; the caller reads `rows_delivered` only after we
+    // return, so an aborted straggler can no longer emit a row past the fallback
+    // decision.
+    runtime::join_partitions(join_set).await
 }
 
 async fn stream_single_read(
@@ -479,7 +473,14 @@ fn write_projected_rows(
     // DuckDB output vector index = i (output only contains projected columns)
     for (i, &orig_col_idx) in projected_columns.iter().enumerate() {
         let col_info = &all_columns[orig_col_idx];
-        convert::write_column_from_rows(output, i, rows, i, &col_info.spanner_type)?;
+        convert::write_column_from_rows(
+            output,
+            i,
+            rows,
+            i,
+            &col_info.spanner_type,
+            &col_info.name,
+        )?;
     }
 
     output.set_len(rows.len());
