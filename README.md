@@ -321,11 +321,27 @@ Executes a DDL statement synchronously and waits for completion.
 SELECT * FROM spanner_ddl('CREATE TABLE Users (Id INT64 NOT NULL, Name STRING(MAX)) PRIMARY KEY (Id)');
 ```
 
+To batch multiple statements into a single `UpdateDatabaseDdl` request (as Spanner
+natively supports), pass a `LIST<VARCHAR>` with `statements := [...]`:
+
+```sql
+SELECT * FROM spanner_ddl(statements := [
+    'ALTER TABLE Users ADD COLUMN Email STRING(MAX)',
+    'ALTER TABLE Users ADD COLUMN Age INT64'
+]);
+```
+
+The statements are sent as one Spanner longrunning operation. Spanner applies
+the DDL statements in order and returns operation-level success or failure; it
+does not guarantee transactional rollback of earlier completed statements in a
+batch.
+
 Returns one row with `operation_name` (VARCHAR), `done` (BOOLEAN), and `duration_secs` (DOUBLE).
 
 ### `spanner_ddl_async`
 
-Submits a DDL statement and returns immediately without waiting for completion.
+Submits a DDL statement, or a `statements := [...]` batch like `spanner_ddl`,
+and returns immediately without waiting for completion.
 
 ```sql
 SELECT * FROM spanner_ddl_async('CREATE INDEX UsersByName ON Users(Name)');
@@ -343,7 +359,7 @@ On real Spanner this uses the Database Admin `ListDatabaseOperations` API with n
 SELECT * FROM spanner_operations();
 ```
 
-Returns rows with `name` (VARCHAR), `done` (BOOLEAN), `metadata_type` (VARCHAR), `error_code` (INTEGER), and `error_message` (VARCHAR).
+Returns rows with `name` (VARCHAR), `done` (BOOLEAN), `metadata_type` (VARCHAR), `error_code` (INTEGER), and `error_message` (VARCHAR). `error_code`/`error_message` are NULL unless the operation finished with an error.
 
 An optional `filter` parameter can be used:
 
