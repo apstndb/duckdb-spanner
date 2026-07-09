@@ -143,9 +143,58 @@ pub unsafe extern "C" fn spanner_init_c_api(
 
 #[cfg(test)]
 mod tests {
+    // Test-only generated key; never used outside local signer smoke tests.
+    const TEST_SERVICE_ACCOUNT_PKCS8: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCHCdylSt7aTImX
+42b6tjowFEAQBlklbXhxdlFuirw63xSmy9QlONBWEGZ5l/Srd0y1iWthhCVf8xfZ
+kwFnXQG4Mw7qObsLt62IsscptZ/EAB8zypAP2rVi6BHz7IP6Z5qnPoEEVOFdKxVF
+PqrgIB81cru8ggf62lXHL1YILLhhOhUHZX9juFKGTBexwBteCCrIfHUfWOqRmi5r
+1DWxtCS4scmuEI/uF+Nwx2n9hNctDfcY+H/wqjEwHOSH6RRxGB0CSbVOSHSZwqk4
+Ak1KNfSsZDflQXgqEZk8mEnN3N9WdmN1XJLdn14JUmHYVBMn7pLt3lnf3WoImfcf
+SKmsP8KZAgMBAAECggEABBo0xjF0De6hPnYhIMw1fh1/8kyugCBnNkXHKVHLuXbY
+Q/HxV/2102uDDpmHlX7xNvY0mU+N84upN9w495ZyNXZ0fCYQMQXUp/UCuLSygBUo
+JqcawTked8YkJ3tI10eAHSmmQ9AZ4+LOSYMQr/CYvGf6JgPzsS5HEehIILLy0Evd
+8dGXIaDD8xwOUOVutjI7FOyJZ/Js0QNVnbqRCB2USeEAlRKNHrEXmMwOhyPW22hM
+BqgPFpI7o9OK6ug1AvzggOO/XDBvMRfm44nJkqTepeSPObVr/GigXH3YFvDYPERR
+/d+1fEEBaaajUSsd6OWku8gj7jFP9QJhaX+PXQF9BQKBgQC7AETAhSwI4uvjqOPZ
+VvBNuF5TLmTL16nKEELxXQ/312+OK1ALyvJ1+tCh6ygnVnCrSI+ttAQACkHvAW3+
+GIGwzYuo9I/6WOlMX0Zc/jPvIHl6DHQbOaXGM2flwsrvZcn557vw4t7gezrsYO8y
+BfH8DOCLx/sVtB0VW3NodI0wXQKBgQC43VIi4b0yt2IYeoDN/WblV1O9k6TZIXRu
+vwm8mDupGVsnk2B7mfEERwkAuRpHoOclmp/JIdvE8H03FvUjryjqCLnrfzukCwtW
+Rz/uWXYPfwXjnFBBn6v0w5dWQMeH0jhfHPuw0lQC0qRHBecAn8X2YfzyUvafEVIR
+6UDvpJQnbQKBgB+ftQDFxKOgFHpElnuryympkzIH933Nc+Y7B8cfkNK9+RyW0Iud
+/5DaIKwxQ3IbmSQuOjYK6l5DXdEYccx1woDu0b551Vtl69ZBinmxd4DqAgEU2BG+
+lv1Etj5RydXgZd7ARLVA+KYH0PgmkGzqOnkAiHy7DggmlICHHaY9h571AoGAYg7r
+wZryK9PAUfGxHxLaIK7IuZd2asJnK1NkS8iIZPMROhXfqNCIWtd/PAXznakI0xaI
+yTyPgZB7KtyfnZUM489LJ1KvBR3inppenASSLjgXnJtOqvCSWtvhC5yC+lWVF0ad
+bzax32lyQEYuOVOGw2FIthUxwkCCwwNyMWugNqUCgYBOjrGJtCKdLXhPLz2Cwb76
+b5657n39SvPLKgVGJzZpM/DlAwPm+oMXeAaZWvzoACHuCBA6AbLdIT6wMGmDdk2y
+2kPfWy7WOtYHwsd3GiAYXI439PWFPumYX7HRpdTuSnjKxG8EvEkW+dsgdQwti9NV
+HRVeBmUqB9ZvD2iFzjibxg==
+-----END PRIVATE KEY-----"#;
+
     #[test]
     fn ensure_rustls_provider_installs_default() {
         super::ensure_rustls_crypto_provider();
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
+    #[tokio::test]
+    async fn google_auth_service_account_uses_installed_provider() {
+        use google_cloud_auth::credentials::service_account::Builder;
+
+        super::ensure_rustls_crypto_provider();
+
+        let key = serde_json::json!({
+            "client_email": "test-client-email",
+            "private_key_id": "test-private-key-id",
+            "private_key": TEST_SERVICE_ACCOUNT_PKCS8,
+            "project_id": "test-project-id",
+            "universe_domain": "googleapis.com",
+        });
+        let signer = Builder::new(key).build_signer().unwrap();
+        let signature = signer.sign(b"duckdb-spanner").await.unwrap();
+
+        assert!(!signature.is_empty());
     }
 }

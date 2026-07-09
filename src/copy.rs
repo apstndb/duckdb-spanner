@@ -125,6 +125,8 @@ struct CopyGlobalState {
 /// # Safety
 /// `con` must be a valid `duckdb_connection`.
 pub unsafe fn register_copy_function(con: ffi::duckdb_connection, config_enabled: bool) {
+    crate::ensure_rustls_crypto_provider();
+
     unsafe {
         let copy_fn = ffi::duckdb_create_copy_function();
 
