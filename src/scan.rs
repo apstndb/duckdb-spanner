@@ -373,13 +373,13 @@ async fn stream_partitioned_read(
     // (max_parallelism above only bounds partition *creation*, not execution).
     let permits = runtime::worker_threads().min(partitions.len().max(1));
     let semaphore = Arc::new(tokio::sync::Semaphore::new(permits));
-    let mut handles = Vec::with_capacity(partitions.len());
+    let mut join_set = tokio::task::JoinSet::new();
     for partition in partitions {
         let tx = tx.clone();
         let client = client.clone();
         let rows_delivered = rows_delivered.clone();
         let semaphore = semaphore.clone();
-        handles.push(tokio::spawn(async move {
+        join_set.spawn(async move {
             let _permit = semaphore
                 .acquire()
                 .await
@@ -398,41 +398,17 @@ async fn stream_partitioned_read(
                 }
             }
             Ok::<(), SpannerError>(())
-        }));
+        });
     }
 
-    let mut remaining = handles;
-    while !remaining.is_empty() {
-        let mut progressed = false;
-        let mut i = 0;
-        while i < remaining.len() {
-            if remaining[i].is_finished() {
-                let handle = remaining.remove(i);
-                progressed = true;
-                match handle.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        for h in remaining {
-                            h.abort();
-                        }
-                        return Err(e);
-                    }
-                    Err(e) => {
-                        for h in remaining {
-                            h.abort();
-                        }
-                        return Err(SpannerError::Other(format!("Task join error: {e}")));
-                    }
-                }
-            } else {
-                i += 1;
-            }
-        }
-        if !progressed {
-            tokio::task::yield_now().await;
-        }
-    }
-    Ok(())
+    // Invariant: partition tasks must be fully terminated before this function
+    // returns. Client eviction close relies on Arc uniqueness => quiescence, so a
+    // task still holding a `Client` clone and `ManagedSession` must not outlive
+    // the streamer. `join_partitions` drains (aborts + awaits) every task on
+    // error before returning; the caller reads `rows_delivered` only after we
+    // return, so an aborted straggler can no longer emit a row past the fallback
+    // decision.
+    runtime::join_partitions(join_set).await
 }
 
 async fn stream_single_read(
