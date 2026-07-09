@@ -21,12 +21,11 @@ use tokio::runtime::Runtime;
 fn ensure_rustls_provider() {
     static PROVIDER: OnceLock<()> = OnceLock::new();
     PROVIDER.get_or_init(|| {
-        // testcontainers/bollard and gcloud-auth enable different rustls providers.
-        // Installing one process-wide provider avoids rustls panicking during tests.
-        #[cfg(windows)]
+        // The library builds the official Google Cloud clients without their
+        // default aws-lc provider so MinGW artifacts link cleanly. Tests install
+        // the same process-wide provider before either testcontainers or the
+        // Spanner clients build TLS configuration.
         let _ = rustls::crypto::ring::default_provider().install_default();
-        #[cfg(not(windows))]
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     });
 }
 

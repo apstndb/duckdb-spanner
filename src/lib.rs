@@ -57,17 +57,13 @@ pub unsafe fn register_c_api_extensions(
     }
 }
 
-#[cfg(windows)]
 fn ensure_rustls_crypto_provider() {
-    // Windows builds use providerless rustls features so MinGW
-    // does not pull in aws-lc-sys. The loadable extension must install the
-    // process-wide provider itself because it can run outside this crate's test
-    // harness.
+    // The official Google Cloud client crates are built without their default
+    // aws-lc provider so the MinGW artifact build does not link aws-lc-sys.
+    // The loadable extension must install a process-wide provider itself
+    // because it can run outside this crate's test harness.
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
-
-#[cfg(not(windows))]
-fn ensure_rustls_crypto_provider() {}
 
 #[cfg(feature = "loadable-extension")]
 const MIN_DUCKDB_C_API_VERSION: &str = "v1.5.0";
@@ -147,9 +143,8 @@ pub unsafe extern "C" fn spanner_init_c_api(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(windows)]
     #[test]
-    fn ensure_rustls_provider_installs_default_on_windows() {
+    fn ensure_rustls_provider_installs_default() {
         super::ensure_rustls_crypto_provider();
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
     }
