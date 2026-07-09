@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::hash::Hash;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -16,11 +17,15 @@ use crate::runtime;
 /// to a handful of databases, and each client owns a session pool worth reclaiming.
 const CACHE_CAPACITY: usize = 8;
 
-/// Upper bound on how long an eviction task waits for in-flight work to finish
-/// before giving up on a graceful close (per reclaim stage). If exceeded, the
-/// client is simply dropped: its sessions are not gracefully closed but will
-/// expire server-side, so this only trades tidiness for a bounded wait.
+/// How long an eviction task waits, per reclaim stage, for in-flight work to
+/// drop its references so the client can be closed by consuming sole ownership.
+/// This is a politeness grace period, not a deadline for closing: if it elapses
+/// while the client is still shared, the eviction task force-closes through a
+/// clone rather than leaking the client (see [`close_evicted`]).
 const EVICT_CLOSE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Poll interval used while waiting for an `Arc` to become uniquely owned.
+const RECLAIM_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// A tiny hand-rolled LRU map. Capacity is small (see [`CACHE_CAPACITY`]), so an
 /// O(n) scan for the least-recently-used entry on eviction is cheap and avoids
@@ -80,6 +85,18 @@ impl<K: Eq + Hash + Clone, V: Clone> LruCache<K, V> {
 
         (value, evicted)
     }
+
+    /// Remove `key` only if it is currently mapped to a value satisfying `pred`.
+    /// Returns whether an entry was removed. Used to drop a slot whose client
+    /// creation failed without clobbering an entry a concurrent caller may have
+    /// since replaced or successfully initialized.
+    fn remove_if<F: FnOnce(&V) -> bool>(&mut self, key: &K, pred: F) -> bool {
+        let matches = self.map.get(key).is_some_and(|(v, _)| pred(v));
+        if matches {
+            self.map.remove(key);
+        }
+        matches
+    }
 }
 
 /// Each cache slot holds a shared [`OnceCell`] so that concurrent binds for the
@@ -90,46 +107,90 @@ type ClientSlot = Arc<OnceCell<Arc<Client>>>;
 static CLIENT_CACHE: LazyLock<Mutex<LruCache<String, ClientSlot>>> =
     LazyLock::new(|| Mutex::new(LruCache::new(CACHE_CAPACITY)));
 
-/// Reclaim sole ownership of `arc`, waiting (bounded) for other holders to drop
-/// their references. Returns `None` if the timeout elapses while still shared.
-async fn take_when_unique<T>(mut arc: Arc<T>, timeout: Duration) -> Option<T> {
+/// Outcome of waiting for an `Arc` to become uniquely owned.
+enum Reclaim<T> {
+    /// The wait succeeded: we now own the value outright.
+    Sole(T),
+    /// The grace period elapsed while other holders still exist; the `Arc` is
+    /// handed back so the caller can still act on a clone of the value.
+    StillShared(Arc<T>),
+}
+
+/// Wait (bounded by `grace`) for `arc` to become uniquely owned. Returns
+/// [`Reclaim::Sole`] once every other holder has dropped its reference, or
+/// [`Reclaim::StillShared`] if the grace period elapses first.
+async fn take_when_unique<T>(mut arc: Arc<T>, grace: Duration) -> Reclaim<T> {
     let start = Instant::now();
     loop {
         match Arc::try_unwrap(arc) {
-            Ok(value) => return Some(value),
+            Ok(value) => return Reclaim::Sole(value),
             Err(shared) => {
-                if start.elapsed() >= timeout {
-                    return None;
+                if start.elapsed() >= grace {
+                    return Reclaim::StillShared(shared);
                 }
                 arc = shared;
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(RECLAIM_POLL_INTERVAL).await;
             }
         }
     }
 }
 
-/// Gracefully close an evicted client once nothing is using it anymore.
+/// Run `close` on the value behind `arc` exactly once, after at most `grace`.
 ///
-/// `Client::close` takes `self`, so we must reclaim ownership of the `Client`
-/// before closing. An evicted slot may still be referenced by in-flight queries
-/// (which hold `Arc<Client>` clones) or by a bind that is mid-`get_or_try_init`
-/// (which holds an `Arc<OnceCell>` clone), so we cannot close immediately.
-/// Instead we wait — first for sole ownership of the slot, then of the client —
-/// before closing. Runs as a detached background task.
-async fn close_evicted(slot: ClientSlot) {
-    // Stage 1: no bind is still awaiting creation on this slot.
-    let Some(cell) = take_when_unique(slot, EVICT_CLOSE_TIMEOUT).await else {
-        return;
+/// Prefers to consume sole ownership (a clean hand-off). If the value is still
+/// shared after the grace period, it force-runs `close` on a *clone* rather than
+/// leaking the value: for a Spanner `Client` this is safe and desirable because
+/// `Client` is `Clone` and its `SessionManager` is shared behind an `Arc`, so
+/// closing any clone cancels the shared cancellation token — deleting the pooled
+/// sessions server-side and stopping the two detached background tasks
+/// (health-check pinger + session creator) that the fork's `SessionManager`
+/// otherwise stops only via `close()` (it has no `Drop`). Straggling holders of
+/// an old clone will get session errors on their next use, which is acceptable
+/// for an already-evicted client.
+async fn close_when_reclaimed<T, F, Fut>(arc: Arc<T>, grace: Duration, close: F)
+where
+    T: Clone,
+    F: FnOnce(T) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    match take_when_unique(arc, grace).await {
+        Reclaim::Sole(value) => close(value).await,
+        Reclaim::StillShared(shared) => close((*shared).clone()).await,
+    }
+}
+
+/// Close an evicted client once nothing is using it anymore, or force it closed
+/// after a grace period if in-flight work overruns.
+///
+/// An evicted slot may still be referenced by a bind mid-`get_or_try_init`
+/// (holding an `Arc<OnceCell>` clone) or by in-flight queries (holding
+/// `Arc<Client>` clones), so we cannot close immediately. We wait a bounded
+/// grace period for those to drain, but do **not** give up if they overrun:
+/// a partitioned scan can stream for minutes and a COPY holds the client for the
+/// whole operation, and simply dropping the client would leak the fork's
+/// `SessionManager` background tasks and keep its pooled sessions alive
+/// server-side indefinitely. Instead [`close_when_reclaimed`] force-closes
+/// through a clone. Runs as a detached background task.
+async fn close_evicted(slot: ClientSlot, grace: Duration) {
+    // Stage 1: reclaim the client out of the slot's OnceCell.
+    let client = match take_when_unique(slot, grace).await {
+        // Sole owner: take the client out of the cell (if creation completed).
+        Reclaim::Sole(cell) => match cell.into_inner() {
+            Some(client) => client,
+            // Creation never completed (e.g. it errored) — nothing to close.
+            None => return,
+        },
+        // Still shared past the grace period (a bind is stuck awaiting creation):
+        // borrow a clone of the client so we can still force it closed.
+        Reclaim::StillShared(slot) => match slot.get() {
+            Some(client) => Arc::clone(client),
+            // Not yet initialized — nothing to close.
+            None => return,
+        },
     };
-    // `None` means creation never completed (e.g. it errored) — nothing to close.
-    let Some(client) = cell.into_inner() else {
-        return;
-    };
-    // Stage 2: no query is still holding the client.
-    let Some(client) = take_when_unique(client, EVICT_CLOSE_TIMEOUT).await else {
-        return;
-    };
-    client.close().await;
+    // Stage 2: close the client, force-closing through a clone if in-flight
+    // queries still hold it past the grace period.
+    close_when_reclaimed(client, grace, |c| c.close()).await;
 }
 
 /// Get or create a Spanner client.
@@ -154,21 +215,32 @@ pub async fn get_or_create_client(
     // std mutex across an await point could deadlock the runtime.
     let (slot, evicted) = {
         let mut cache = CLIENT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        cache.get_or_insert_with(cache_key, || Arc::new(OnceCell::new()))
+        cache.get_or_insert_with(cache_key.clone(), || Arc::new(OnceCell::new()))
     };
 
     // Close any client the insertion evicted, off the hot path.
     if let Some(evicted) = evicted {
-        let _ = runtime::spawn(close_evicted(evicted));
+        let _ = runtime::spawn(close_evicted(evicted, EVICT_CLOSE_TIMEOUT));
     }
 
     // Single-flight: concurrent callers share this slot's OnceCell, so the client
-    // is built at most once. On creation error the cell stays empty and a later
-    // call will retry.
-    let client = slot
+    // is built at most once.
+    match slot
         .get_or_try_init(|| create_client(database, endpoint))
-        .await?;
-    Ok(Arc::clone(client))
+        .await
+    {
+        Ok(client) => Ok(Arc::clone(client)),
+        Err(e) => {
+            // Creation failed: the cell stays empty. Drop the empty slot from the
+            // cache so repeated failures against an unreachable target don't
+            // occupy LRU capacity and evict healthy clients. Remove only if it is
+            // still *this* slot and still empty — a concurrent caller may have
+            // retried and successfully initialized it in the meantime.
+            let mut cache = CLIENT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+            cache.remove_if(&cache_key, |s| Arc::ptr_eq(s, &slot) && s.get().is_none());
+            Err(e)
+        }
+    }
 }
 
 /// Build a brand-new Spanner client for the given target.
@@ -262,19 +334,80 @@ mod tests {
         assert!(!cache.map.contains_key(&1));
     }
 
-    #[tokio::test]
-    async fn take_when_unique_reclaims_sole_owner() {
-        let arc = Arc::new(42);
-        let taken = take_when_unique(arc, Duration::from_secs(1)).await;
-        assert_eq!(taken, Some(42));
+    #[test]
+    fn remove_if_respects_predicate() {
+        let mut cache: LruCache<&str, i32> = LruCache::new(2);
+        cache.get_or_insert_with("a", || 1);
+
+        // Predicate false: entry stays.
+        assert!(!cache.remove_if(&"a", |v| *v == 999));
+        assert!(cache.map.contains_key("a"));
+
+        // Missing key: nothing removed.
+        assert!(!cache.remove_if(&"missing", |_| true));
+
+        // Predicate true: entry removed.
+        assert!(cache.remove_if(&"a", |v| *v == 1));
+        assert!(!cache.map.contains_key("a"));
     }
 
     #[tokio::test]
-    async fn take_when_unique_times_out_while_shared() {
+    async fn take_when_unique_reclaims_sole_owner() {
+        let arc = Arc::new(42);
+        match take_when_unique(arc, Duration::from_secs(1)).await {
+            Reclaim::Sole(v) => assert_eq!(v, 42),
+            Reclaim::StillShared(_) => panic!("should have reclaimed sole ownership"),
+        }
+    }
+
+    #[tokio::test]
+    async fn take_when_unique_hands_back_shared_after_grace() {
         let arc = Arc::new(42);
         let _keepalive = Arc::clone(&arc);
         // A second reference persists, so ownership can never be reclaimed.
-        let taken = take_when_unique(arc, Duration::from_millis(100)).await;
-        assert!(taken.is_none());
+        match take_when_unique(arc, Duration::from_millis(100)).await {
+            Reclaim::StillShared(shared) => assert_eq!(*shared, 42),
+            Reclaim::Sole(_) => panic!("should not have reclaimed while shared"),
+        }
+    }
+
+    /// A clonable stand-in for `Client`: `close` flips a shared flag, standing in
+    /// for the real client's `close().await`.
+    #[derive(Clone)]
+    struct FakeClient {
+        closed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl FakeClient {
+        async fn close(self) {
+            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn close_when_reclaimed_closes_sole_owner() {
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let arc = Arc::new(FakeClient {
+            closed: closed.clone(),
+        });
+        close_when_reclaimed(arc, Duration::from_secs(1), |c| c.close()).await;
+        assert!(closed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn close_when_reclaimed_force_closes_shared_after_grace() {
+        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let arc = Arc::new(FakeClient {
+            closed: closed.clone(),
+        });
+        // A straggler holds a clone that never drops, so the value stays shared
+        // past the grace period. It must still be force-closed (through a clone),
+        // not leaked.
+        let _straggler = Arc::clone(&arc);
+        close_when_reclaimed(arc, Duration::from_millis(100), |c| c.close()).await;
+        assert!(
+            closed.load(std::sync::atomic::Ordering::SeqCst),
+            "shared client must be force-closed after the grace period"
+        );
     }
 }
