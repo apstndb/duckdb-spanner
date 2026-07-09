@@ -21,6 +21,9 @@ fn ensure_rustls_provider() {
     PROVIDER.get_or_init(|| {
         // testcontainers/bollard and gcloud-auth enable different rustls providers.
         // Installing one process-wide provider avoids rustls panicking during tests.
+        #[cfg(windows)]
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        #[cfg(not(windows))]
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     });
 }
