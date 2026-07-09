@@ -59,14 +59,15 @@ impl<K: Eq + Hash + Clone, V: Clone> LruCache<K, V> {
     /// capacity, the least-recently-used entry is evicted and returned as the
     /// second tuple element so the caller can dispose of it.
     fn get_or_insert_with<F: FnOnce() -> V>(&mut self, key: K, make: F) -> (V, Option<V>) {
-        if self.map.contains_key(&key) {
-            let tick = self.next_tick();
-            let entry = self.map.get_mut(&key).unwrap();
+        // Compute the tick before the `get_mut` borrow so the hit path is a
+        // single lookup (calling `next_tick(&mut self)` inside the `if let` would
+        // conflict with the `&mut` borrow held by `entry`).
+        let tick = self.next_tick();
+        if let Some(entry) = self.map.get_mut(&key) {
             entry.1 = tick;
             return (entry.0.clone(), None);
         }
 
-        let tick = self.next_tick();
         let value = make();
         self.map.insert(key, (value.clone(), tick));
 
