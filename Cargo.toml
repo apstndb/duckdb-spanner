@@ -24,6 +24,7 @@ google-cloud-spanner = { git = "https://github.com/googleapis/google-cloud-rust"
 google-cloud-auth = { git = "https://github.com/googleapis/google-cloud-rust", rev = "ac6f8259e708abd471b63e3fad4b4f3b5f08de1c" }
 google-cloud-gax = { git = "https://github.com/googleapis/google-cloud-rust", rev = "ac6f8259e708abd471b63e3fad4b4f3b5f08de1c" }
 google-cloud-longrunning = { git = "https://github.com/googleapis/google-cloud-rust", rev = "ac6f8259e708abd471b63e3fad4b4f3b5f08de1c" }
+google-cloud-rpc = { git = "https://github.com/googleapis/google-cloud-rust", rev = "ac6f8259e708abd471b63e3fad4b4f3b5f08de1c" }
 google-cloud-lro = { git = "https://github.com/googleapis/google-cloud-rust", rev = "ac6f8259e708abd471b63e3fad4b4f3b5f08de1c" }
 google-cloud-spanner-admin-database-v1 = { git = "https://github.com/googleapis/google-cloud-rust", rev = "ac6f8259e708abd471b63e3fad4b4f3b5f08de1c" }
 google-cloud-spanner-admin-instance-v1 = { git = "https://github.com/googleapis/google-cloud-rust", rev = "ac6f8259e708abd471b63e3fad4b4f3b5f08de1c" }

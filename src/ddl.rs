@@ -24,9 +24,9 @@ static ADMIN_CLIENT_CACHE: LazyLock<Mutex<HashMap<String, Arc<DatabaseAdmin>>>> 
 /// Admin clients are NOT per-database (unlike data clients). The cache key is
 /// the endpoint string (or empty for default).
 async fn get_or_create_admin_client(
-    endpoint: Option<&str>,
+    admin_endpoint: Option<&str>,
 ) -> Result<Arc<DatabaseAdmin>, SpannerError> {
-    let cache_key = endpoint.unwrap_or("").to_string();
+    let cache_key = admin_endpoint.unwrap_or("").to_string();
 
     {
         let cache = ADMIN_CLIENT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
@@ -36,7 +36,7 @@ async fn get_or_create_admin_client(
     }
 
     let mut builder = DatabaseAdmin::builder();
-    let emulator_endpoint = endpoint
+    let emulator_endpoint = admin_endpoint
         .map(str::to_owned)
         .or_else(|| std::env::var("SPANNER_EMULATOR_HOST").ok());
     if let Some(ep) = emulator_endpoint {
@@ -61,19 +61,21 @@ fn emulator_endpoint(endpoint: Option<&str>) -> Option<String> {
         .or_else(|| std::env::var("SPANNER_EMULATOR_HOST").ok())
 }
 
+fn emulator_admin_endpoint(endpoint: Option<&str>, admin_endpoint: Option<&str>) -> Option<String> {
+    admin_endpoint
+        .map(admin_endpoint_url)
+        .or_else(|| emulator_endpoint(endpoint).map(|ep| admin_endpoint_url(&ep)))
+}
+
 async fn update_database_ddl(
     admin: &DatabaseAdmin,
     database_path: String,
     statements: Vec<String>,
     endpoint: Option<&str>,
+    admin_endpoint: Option<&str>,
 ) -> Result<InternalOperation, SpannerError> {
-    if let Some(emulator_endpoint) = emulator_endpoint(endpoint) {
-        return update_emulator_database_ddl(
-            &admin_endpoint_url(&emulator_endpoint),
-            &database_path,
-            statements,
-        )
-        .await;
+    if let Some(admin_endpoint) = emulator_admin_endpoint(endpoint, admin_endpoint) {
+        return update_emulator_database_ddl(&admin_endpoint, &database_path, statements).await;
     }
 
     Ok(admin
@@ -88,10 +90,10 @@ async fn wait_database_operation(
     admin: &DatabaseAdmin,
     operation_name: &str,
     endpoint: Option<&str>,
+    admin_endpoint: Option<&str>,
 ) -> Result<InternalOperation, SpannerError> {
-    if let Some(emulator_endpoint) = emulator_endpoint(endpoint) {
-        return wait_emulator_operation(&admin_endpoint_url(&emulator_endpoint), operation_name)
-            .await;
+    if let Some(admin_endpoint) = emulator_admin_endpoint(endpoint, admin_endpoint) {
+        return wait_emulator_operation(&admin_endpoint, operation_name).await;
     }
 
     wait_operation(admin, operation_name).await
@@ -129,11 +131,12 @@ async fn update_emulator_database_ddl(
             return operation_from_json(&body);
         }
 
-        if body.contains("\"code\":9") && body.contains("Schema change operation rejected") {
-            if attempt < MAX_ATTEMPTS {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
-            }
+        if body.contains("\"code\":9")
+            && body.contains("Schema change operation rejected")
+            && attempt < MAX_ATTEMPTS
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
         }
 
         return Err(SpannerError::Other(format!(
@@ -197,7 +200,33 @@ fn operation_from_json(body: &str) -> Result<InternalOperation, SpannerError> {
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
-    Ok(InternalOperation::new().set_name(name).set_done(done))
+    let mut op = InternalOperation::new().set_name(name).set_done(done);
+    if let Some(error) = json.get("error") {
+        let code = error
+            .get("code")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or_default() as i32;
+        let message = error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Spanner DDL operation failed");
+        op = op.set_error(
+            google_cloud_rpc::model::Status::new()
+                .set_code(code)
+                .set_message(message),
+        );
+    }
+
+    Ok(op)
+}
+
+fn ddl_operation_error(op: &InternalOperation) -> Option<String> {
+    op.error().map(|status| {
+        format!(
+            "Spanner DDL operation {} failed: code={}, message={}",
+            op.name, status.code, status.message
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +253,10 @@ fn database_named_parameters() -> Vec<(String, LogicalTypeHandle)> {
         ),
         (
             "endpoint".to_string(),
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        ),
+        (
+            "admin_endpoint".to_string(),
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
         ),
     ]
@@ -336,6 +369,7 @@ pub struct DdlBindData {
     database_path: String,
     statements: Vec<String>,
     endpoint: Option<String>,
+    admin_endpoint: Option<String>,
     // DuckDB may call init() more than once for one bound table function.
     // Cache the full init outcome so repeated callers do not resend DDL and
     // see the same success or error from the first execution.
@@ -363,6 +397,7 @@ impl VTab for SpannerDdlVTab {
         let statements = ddl_statements_from_bind(bind)?;
         let database_path = bind_utils::resolve_database_path(bind)?;
         let endpoint = bind_utils::resolve_endpoint(bind);
+        let admin_endpoint = bind_utils::resolve_admin_endpoint(bind);
 
         bind.add_result_column(
             "operation_name",
@@ -378,6 +413,7 @@ impl VTab for SpannerDdlVTab {
             database_path,
             statements,
             endpoint,
+            admin_endpoint,
             cached_result: Arc::new(Mutex::new(None)),
         })
     }
@@ -389,18 +425,34 @@ impl VTab for SpannerDdlVTab {
             let database_path = bind_data.database_path.clone();
             let statements = bind_data.statements.clone();
             let endpoint = bind_data.endpoint.clone();
+            let admin_endpoint = bind_data.admin_endpoint.clone();
+            let effective_admin_endpoint =
+                emulator_admin_endpoint(endpoint.as_deref(), admin_endpoint.as_deref());
 
             runtime::block_on(async {
-                let admin = get_or_create_admin_client(endpoint.as_deref()).await?;
+                let admin = get_or_create_admin_client(effective_admin_endpoint.as_deref()).await?;
 
                 let start = Instant::now();
-                let op =
-                    update_database_ddl(&admin, database_path, statements, endpoint.as_deref())
-                        .await?;
+                let op = update_database_ddl(
+                    &admin,
+                    database_path,
+                    statements,
+                    endpoint.as_deref(),
+                    admin_endpoint.as_deref(),
+                )
+                .await?;
 
                 let operation_name = op.name.clone();
-                let op =
-                    wait_database_operation(&admin, &operation_name, endpoint.as_deref()).await?;
+                let op = wait_database_operation(
+                    &admin,
+                    &operation_name,
+                    endpoint.as_deref(),
+                    admin_endpoint.as_deref(),
+                )
+                .await?;
+                if let Some(err) = ddl_operation_error(&op) {
+                    return Err(SpannerError::Other(err));
+                }
 
                 let duration_secs = start.elapsed().as_secs_f64();
 
@@ -474,6 +526,7 @@ pub struct DdlAsyncBindData {
     database_path: String,
     statements: Vec<String>,
     endpoint: Option<String>,
+    admin_endpoint: Option<String>,
     // See the comment on `DdlBindData::cached_result`.
     cached_result: Arc<Mutex<Option<Result<DdlAsyncResult, String>>>>,
 }
@@ -498,6 +551,7 @@ impl VTab for SpannerDdlAsyncVTab {
         let statements = ddl_statements_from_bind(bind)?;
         let database_path = bind_utils::resolve_database_path(bind)?;
         let endpoint = bind_utils::resolve_endpoint(bind);
+        let admin_endpoint = bind_utils::resolve_admin_endpoint(bind);
 
         bind.add_result_column(
             "operation_name",
@@ -509,6 +563,7 @@ impl VTab for SpannerDdlAsyncVTab {
             database_path,
             statements,
             endpoint,
+            admin_endpoint,
             cached_result: Arc::new(Mutex::new(None)),
         })
     }
@@ -520,13 +575,24 @@ impl VTab for SpannerDdlAsyncVTab {
             let database_path = bind_data.database_path.clone();
             let statements = bind_data.statements.clone();
             let endpoint = bind_data.endpoint.clone();
+            let admin_endpoint = bind_data.admin_endpoint.clone();
+            let effective_admin_endpoint =
+                emulator_admin_endpoint(endpoint.as_deref(), admin_endpoint.as_deref());
 
             runtime::block_on(async {
-                let admin = get_or_create_admin_client(endpoint.as_deref()).await?;
+                let admin = get_or_create_admin_client(effective_admin_endpoint.as_deref()).await?;
 
-                let op =
-                    update_database_ddl(&admin, database_path, statements, endpoint.as_deref())
-                        .await?;
+                let op = update_database_ddl(
+                    &admin,
+                    database_path,
+                    statements,
+                    endpoint.as_deref(),
+                    admin_endpoint.as_deref(),
+                )
+                .await?;
+                if let Some(err) = ddl_operation_error(&op) {
+                    return Err(SpannerError::Other(err));
+                }
 
                 Ok::<DdlAsyncResult, SpannerError>(DdlAsyncResult {
                     operation_name: op.name,
@@ -594,6 +660,7 @@ impl VTab for SpannerDdlAsyncVTab {
 pub struct OperationsBindData {
     database_path: String,
     endpoint: Option<String>,
+    admin_endpoint: Option<String>,
     filter: Option<String>,
 }
 
@@ -620,6 +687,7 @@ impl VTab for SpannerOperationsVTab {
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
         let database_path = bind_utils::resolve_database_path(bind)?;
         let endpoint = bind_utils::resolve_endpoint(bind);
+        let admin_endpoint = bind_utils::resolve_admin_endpoint(bind);
         let filter = bind_utils::get_named_string(bind, "filter");
 
         bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
@@ -640,6 +708,7 @@ impl VTab for SpannerOperationsVTab {
         Ok(OperationsBindData {
             database_path,
             endpoint,
+            admin_endpoint,
             filter,
         })
     }
@@ -649,10 +718,17 @@ impl VTab for SpannerOperationsVTab {
 
         let database_path = bind_data.database_path.clone();
         let endpoint = bind_data.endpoint.clone();
+        let admin_endpoint = bind_data.admin_endpoint.clone();
         let filter = bind_data.filter.clone();
 
         let ops = runtime::block_on(async {
-            list_database_operations(&database_path, endpoint.as_deref(), filter.as_deref()).await
+            list_database_operations(
+                &database_path,
+                endpoint.as_deref(),
+                admin_endpoint.as_deref(),
+                filter.as_deref(),
+            )
+            .await
         })??;
 
         init.set_max_threads(1);
@@ -774,16 +850,14 @@ async fn wait_operation(
 async fn list_database_operations(
     database_path: &str,
     endpoint: Option<&str>,
+    admin_endpoint: Option<&str>,
     filter: Option<&str>,
 ) -> Result<Vec<OperationRow>, SpannerError> {
     // The emulator only implements google.longrunning.Operations/ListOperations,
     // while real Spanner exposes DatabaseAdmin/ListDatabaseOperations with auth.
-    let mut operations = match endpoint
-        .map(str::to_owned)
-        .or_else(|| std::env::var("SPANNER_EMULATOR_HOST").ok())
-    {
-        Some(emulator_endpoint) => {
-            list_emulator_database_operations(database_path, &emulator_endpoint, filter).await?
+    let mut operations = match emulator_admin_endpoint(endpoint, admin_endpoint) {
+        Some(admin_endpoint) => {
+            list_emulator_database_operations(database_path, &admin_endpoint, filter).await?
         }
         None => list_real_database_operations(database_path, filter).await?,
     };
@@ -835,6 +909,7 @@ async fn list_emulator_database_operations(
 }
 
 fn admin_endpoint_url(endpoint: &str) -> String {
+    let endpoint = endpoint.trim_end_matches('/');
     let endpoint = if endpoint.ends_with(":9010") {
         format!("{}:9020", endpoint.trim_end_matches(":9010"))
     } else {
@@ -878,8 +953,8 @@ mod tests {
     use google_cloud_longrunning::model::Operation as InternalOperation;
 
     use super::{
-        cached_init_result, database_operation_prefix, ddl_statements_from_values,
-        instance_path_from_database_path,
+        admin_endpoint_url, cached_init_result, database_operation_prefix, ddl_operation_error,
+        ddl_statements_from_values, instance_path_from_database_path, operation_from_json,
     };
 
     #[test]
@@ -989,6 +1064,34 @@ mod tests {
             database_operation_prefix("projects/p/instances/i/databases/d"),
             "projects/p/instances/i/databases/d/operations/"
         );
+    }
+
+    #[test]
+    fn test_admin_endpoint_url_maps_default_emulator_port_and_trims_slash() {
+        assert_eq!(
+            admin_endpoint_url("localhost:9010/"),
+            "http://localhost:9020"
+        );
+        assert_eq!(
+            admin_endpoint_url("http://127.0.0.1:9010/"),
+            "http://127.0.0.1:9020"
+        );
+        assert_eq!(
+            admin_endpoint_url("localhost:19020"),
+            "http://localhost:19020"
+        );
+    }
+
+    #[test]
+    fn test_operation_from_json_preserves_error() {
+        let op = operation_from_json(
+            r#"{"name":"projects/p/instances/i/databases/d/operations/op1","done":true,"error":{"code":3,"message":"bad ddl"}}"#,
+        )
+        .unwrap();
+
+        let err = ddl_operation_error(&op).unwrap();
+        assert!(err.contains("code=3"));
+        assert!(err.contains("bad ddl"));
     }
 
     #[test]

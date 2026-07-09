@@ -821,6 +821,7 @@ dependencies = [
  "google-cloud-gax",
  "google-cloud-longrunning",
  "google-cloud-lro",
+ "google-cloud-rpc",
  "google-cloud-spanner",
  "google-cloud-spanner-admin-database-v1",
  "google-cloud-spanner-admin-instance-v1",

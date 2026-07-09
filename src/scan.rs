@@ -245,7 +245,7 @@ impl VTab for SpannerScanVTab {
     }
 
     // Named parameters inspired by BigQuery EXTERNAL_QUERY / CloudSpannerProperties.
-    // TODO: Add database_role once gcloud-spanner exposes creator_role in SessionConfig.
+    // TODO: Add database_role once the official client exposes creator_role in SessionConfig.
     fn named_parameters() -> Option<Vec<(String, LogicalTypeHandle)>> {
         Some(vec![
             // Database identification

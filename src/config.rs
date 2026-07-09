@@ -27,6 +27,11 @@ pub unsafe fn register_config_options(con: ffi::duckdb_connection) {
         "Default Spanner database resource path (projects/P/instances/I/databases/D)",
     );
     register_varchar_option(con, "spanner_endpoint", "Default Spanner gRPC endpoint");
+    register_varchar_option(
+        con,
+        "spanner_admin_endpoint",
+        "Default Spanner admin REST endpoint",
+    );
 }
 
 unsafe fn register_varchar_option(con: ffi::duckdb_connection, name: &str, description: &str) {

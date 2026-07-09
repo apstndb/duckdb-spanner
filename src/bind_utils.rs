@@ -215,3 +215,9 @@ pub fn resolve_endpoint(bind: &BindInfo) -> Option<String> {
     get_named_string(bind, "endpoint")
         .or_else(|| config::get_config_string(bind, "spanner_endpoint"))
 }
+
+/// Resolve the Spanner admin REST endpoint from named arg or config option.
+pub fn resolve_admin_endpoint(bind: &BindInfo) -> Option<String> {
+    get_named_string(bind, "admin_endpoint")
+        .or_else(|| config::get_config_string(bind, "spanner_admin_endpoint"))
+}

@@ -1060,6 +1060,7 @@ roundtrip_tests! {
     test_roundtrip_e2e_timestamp:         "spanner_value('2024-06-15T10:30:00Z'::TIMESTAMPTZ)" => Timestamp("2024-06-15T10:30:00Z");
     test_roundtrip_e2e_bytes:             "spanner_value('\\xDEAD'::BLOB)"                     => Base64("3kFE");
     test_roundtrip_e2e_numeric:           "spanner_value(123.456789::DECIMAL(38,9))"            => Value("DECIMAL(38,9)", "123.456789000");
+    test_roundtrip_e2e_plain_null:        "NULL"                                                => Null("VARCHAR");
     test_roundtrip_e2e_null_int64:        "spanner_value(NULL::BIGINT)"                        => Null("BIGINT");
     test_roundtrip_e2e_null_date:         "spanner_value(NULL::DATE)"                          => Null("DATE");
     test_roundtrip_e2e_spanner_typed:     "spanner_typed(42, 'INT64')"                         => Value("BIGINT", "42");
@@ -1151,21 +1152,23 @@ fn test_error_invalid_sql_query() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn make_ddl_sql(db: &spanemuboost::SpanEmuDatabase, ddl: &str) -> String {
-    // DDL uses DatabaseAdmin's REST endpoint. Testcontainers maps the emulator
-    // gRPC and REST ports independently, so use the captured admin host here.
+    // Testcontainers maps the emulator gRPC and REST ports independently, so
+    // pass both endpoints while keeping `endpoint` on the public gRPC contract.
     format!(
-        "SELECT * FROM spanner_ddl('{}', database_path := '{}', endpoint := '{}')",
+        "SELECT * FROM spanner_ddl('{}', database_path := '{}', endpoint := '{}', admin_endpoint := '{}')",
         ddl.replace('\'', "''"),
         db.database_path(),
+        db.emulator_host(),
         db.admin_host()
     )
 }
 
 fn make_ddl_async_sql(db: &spanemuboost::SpanEmuDatabase, ddl: &str) -> String {
     format!(
-        "SELECT * FROM spanner_ddl_async('{}', database_path := '{}', endpoint := '{}')",
+        "SELECT * FROM spanner_ddl_async('{}', database_path := '{}', endpoint := '{}', admin_endpoint := '{}')",
         ddl.replace('\'', "''"),
         db.database_path(),
+        db.emulator_host(),
         db.admin_host()
     )
 }
@@ -1277,8 +1280,9 @@ fn test_ddl_operations() {
 
     // 6. List operations via spanner_operations
     let ops_sql = format!(
-        "SELECT * FROM spanner_operations(database_path := '{}', endpoint := '{}')",
+        "SELECT * FROM spanner_operations(database_path := '{}', endpoint := '{}', admin_endpoint := '{}')",
         db.database_path(),
+        db.emulator_host(),
         db.admin_host()
     );
     let mut stmt = conn.prepare(&ops_sql).unwrap();
@@ -1917,8 +1921,9 @@ fn test_pg_ddl_operations() {
 
     // 6. spanner_operations
     let ops_sql = format!(
-        "SELECT * FROM spanner_operations(database_path := '{}', endpoint := '{}')",
+        "SELECT * FROM spanner_operations(database_path := '{}', endpoint := '{}', admin_endpoint := '{}')",
         db.database_path(),
+        db.emulator_host(),
         db.admin_host()
     );
     let mut stmt = conn.prepare(&ops_sql).unwrap();

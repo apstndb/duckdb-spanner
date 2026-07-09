@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::future::Future;
 use std::hash::Hash;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -111,9 +110,8 @@ static CLIENT_CACHE: LazyLock<Mutex<LruCache<String, ClientSlot>>> =
 enum Reclaim<T> {
     /// The wait succeeded: we now own the value outright.
     Sole(T),
-    /// The grace period elapsed while other holders still exist; the `Arc` is
-    /// handed back so the caller can still act on a clone of the value.
-    StillShared(Arc<T>),
+    /// The grace period elapsed while other holders still exist.
+    StillShared,
 }
 
 /// Wait (bounded by `grace`) for `arc` to become uniquely owned. Returns
@@ -126,36 +124,12 @@ async fn take_when_unique<T>(mut arc: Arc<T>, grace: Duration) -> Reclaim<T> {
             Ok(value) => return Reclaim::Sole(value),
             Err(shared) => {
                 if start.elapsed() >= grace {
-                    return Reclaim::StillShared(shared);
+                    return Reclaim::StillShared;
                 }
                 arc = shared;
                 tokio::time::sleep(RECLAIM_POLL_INTERVAL).await;
             }
         }
-    }
-}
-
-/// Run `close` on the value behind `arc` exactly once, after at most `grace`.
-///
-/// Prefers to consume sole ownership (a clean hand-off). If the value is still
-/// shared after the grace period, it force-runs `close` on a *clone* rather than
-/// leaking the value: for a Spanner `Client` this is safe and desirable because
-/// `Client` is `Clone` and its `SessionManager` is shared behind an `Arc`, so
-/// closing any clone cancels the shared cancellation token — deleting the pooled
-/// sessions server-side and stopping the two detached background tasks
-/// (health-check pinger + session creator) that the fork's `SessionManager`
-/// otherwise stops only via `close()` (it has no `Drop`). Straggling holders of
-/// an old clone will get session errors on their next use, which is acceptable
-/// for an already-evicted client.
-async fn close_when_reclaimed<T, F, Fut>(arc: Arc<T>, grace: Duration, close: F)
-where
-    T: Clone,
-    F: FnOnce(T) -> Fut,
-    Fut: Future<Output = ()>,
-{
-    match take_when_unique(arc, grace).await {
-        Reclaim::Sole(value) => close(value).await,
-        Reclaim::StillShared(shared) => close((*shared).clone()).await,
     }
 }
 
@@ -172,7 +146,7 @@ async fn close_evicted(slot: ClientSlot, grace: Duration) {
         Reclaim::Sole(cell) => {
             let _ = cell.into_inner();
         }
-        Reclaim::StillShared(_) => {}
+        Reclaim::StillShared => {}
     };
 }
 
@@ -343,7 +317,7 @@ mod tests {
         let arc = Arc::new(42);
         match take_when_unique(arc, Duration::from_secs(1)).await {
             Reclaim::Sole(v) => assert_eq!(v, 42),
-            Reclaim::StillShared(_) => panic!("should have reclaimed sole ownership"),
+            Reclaim::StillShared => panic!("should have reclaimed sole ownership"),
         }
     }
 
@@ -353,48 +327,8 @@ mod tests {
         let _keepalive = Arc::clone(&arc);
         // A second reference persists, so ownership can never be reclaimed.
         match take_when_unique(arc, Duration::from_millis(100)).await {
-            Reclaim::StillShared(shared) => assert_eq!(*shared, 42),
+            Reclaim::StillShared => assert_eq!(*_keepalive, 42),
             Reclaim::Sole(_) => panic!("should not have reclaimed while shared"),
         }
-    }
-
-    /// A clonable stand-in for `Client`: `close` flips a shared flag, standing in
-    /// for the real client's `close().await`.
-    #[derive(Clone)]
-    struct FakeClient {
-        closed: Arc<std::sync::atomic::AtomicBool>,
-    }
-
-    impl FakeClient {
-        async fn close(self) {
-            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
-    #[tokio::test]
-    async fn close_when_reclaimed_closes_sole_owner() {
-        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let arc = Arc::new(FakeClient {
-            closed: closed.clone(),
-        });
-        close_when_reclaimed(arc, Duration::from_secs(1), |c| c.close()).await;
-        assert!(closed.load(std::sync::atomic::Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn close_when_reclaimed_force_closes_shared_after_grace() {
-        let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let arc = Arc::new(FakeClient {
-            closed: closed.clone(),
-        });
-        // A straggler holds a clone that never drops, so the value stays shared
-        // past the grace period. It must still be force-closed (through a clone),
-        // not leaked.
-        let _straggler = Arc::clone(&arc);
-        close_when_reclaimed(arc, Duration::from_millis(100), |c| c.close()).await;
-        assert!(
-            closed.load(std::sync::atomic::Ordering::SeqCst),
-            "shared client must be force-closed after the grace period"
-        );
     }
 }

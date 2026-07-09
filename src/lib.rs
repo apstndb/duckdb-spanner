@@ -59,7 +59,7 @@ pub unsafe fn register_c_api_extensions(
 
 #[cfg(windows)]
 fn ensure_rustls_crypto_provider() {
-    // Windows builds use gcloud-spanner's providerless rustls feature so MinGW
+    // Windows builds use providerless rustls features so MinGW
     // does not pull in aws-lc-sys. The loadable extension must install the
     // process-wide provider itself because it can run outside this crate's test
     // harness.

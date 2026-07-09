@@ -27,9 +27,8 @@ brew install cargo-sweep
   The extension requests at least the DuckDB `v1.5.0` C API at load time because it uses C API functions added in the 1.5 line.
   Keep `DUCKDB_VERSION` aligned with the DuckDB CLI or runtime you plan to load the extension into.
 
-- This project depends on a patched version of [gcloud-spanner](https://github.com/yoshidan/google-cloud-rust) via `[patch.crates-io]`.
-  `Client::get_session` and `RowIterator::new` are made public for concurrent partition execution.
-  Upstream [yoshidan/google-cloud-rust#428](https://github.com/yoshidan/google-cloud-rust/pull/428) (metadata on empty PartialResultSets) is merged in gcloud-spanner 1.8+; rebasing the fork onto 1.8.x is planned.
+- This project depends on the official [googleapis/google-cloud-rust](https://github.com/googleapis/google-cloud-rust) Spanner crates.
+  Partitioned reads and queries use the official partition APIs; no local client fork is required.
 
 - Extension initialization is intentionally manual rather than using `#[duckdb_entrypoint_c_api]`.
   The extension needs a raw `duckdb_connection` to register session config options and the `COPY TO ... FORMAT spanner` copy function, and duckdb-rs currently exposes those APIs only through `duckdb::ffi`.
@@ -46,7 +45,7 @@ brew install cargo-sweep
   fast UTF-8 string vector writes use raw C API escape hatches because safe duckdb-rs wrappers are missing for the exact operation (`src/convert.rs`), and fixed-size vector slices use duckdb-rs `unsafe` APIs (`src/ddl.rs`, `src/convert.rs`).
   Keep the layout checks and local safety comments when touching those paths.
 
-- `database_role` ([fine-grained access control](https://cloud.google.com/spanner/docs/fgac-about)) is not yet supported as a named parameter. The upstream gcloud-spanner `SessionConfig` does not expose `creator_role` for session creation (the underlying `BatchCreateSessionsRequest.session_template` supports it, but the Rust client hardcodes it to `None`).
+- `database_role` ([fine-grained access control](https://cloud.google.com/spanner/docs/fgac-about)) is not yet supported as a named parameter. The official Rust Spanner client does not expose `creator_role` for session creation (the underlying `BatchCreateSessionsRequest.session_template` supports it, but the client hardcodes it to `None`).
 
 - `COPY TO ... FORMAT spanner` supports scalar columns, DuckDB LIST/ARRAY source columns mapped to Spanner ARRAY targets, and DuckDB STRUCT source columns mapped to Spanner JSON targets.
 
@@ -129,6 +128,7 @@ export SPANNER_EMULATOR_HOST=localhost:9010
 ```
 
 Passing `endpoint` explicitly switches the client to emulator-style behavior (plaintext, no auth). Use `endpoint` for the emulator or other local test endpoints; for real Spanner, omit it and rely on ADC.
+DDL helpers use the emulator's REST admin endpoint. With the default emulator ports, `localhost:9010` maps to `localhost:9020` automatically; when gRPC and REST are exposed on unrelated host ports, pass `admin_endpoint` or set `spanner_admin_endpoint`.
 
 ## Getting Started
 
@@ -252,6 +252,7 @@ Session-level defaults can be set via `SET` statements. These are used when the 
 | `spanner_database` | VARCHAR | Default Spanner database ID |
 | `spanner_database_path` | VARCHAR | Default full database resource path (`projects/P/instances/I/databases/D`) |
 | `spanner_endpoint` | VARCHAR | Default gRPC endpoint |
+| `spanner_admin_endpoint` | VARCHAR | Default admin REST endpoint for emulator DDL/operations |
 
 ### Database Resolution
 
@@ -367,7 +368,7 @@ An optional `filter` parameter can be used:
 SELECT * FROM spanner_operations(filter := 'done=true');
 ```
 
-All DDL functions accept the same database identification parameters as `spanner_query` (`database_path`, `project`, `instance`, `database`, `endpoint`).
+All DDL functions accept the same database identification parameters as `spanner_query` (`database_path`, `project`, `instance`, `database`, `endpoint`). They also accept `admin_endpoint` for emulator setups where the REST admin endpoint cannot be derived from `endpoint`.
 
 ### `COPY TO` (Write to Spanner)
 
@@ -615,6 +616,7 @@ This extension registers the following names into the global DuckDB namespace.
 | `spanner_database` | VARCHAR | Default Spanner database ID |
 | `spanner_database_path` | VARCHAR | Default full database resource path |
 | `spanner_endpoint` | VARCHAR | Default gRPC endpoint |
+| `spanner_admin_endpoint` | VARCHAR | Default admin REST endpoint for emulator DDL/operations |
 
 ### Convenience Macro Pattern
 

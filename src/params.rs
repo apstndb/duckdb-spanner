@@ -1,6 +1,6 @@
 use google_cloud_spanner::model::request_options::Priority;
 use google_cloud_spanner::statement::{Statement, StatementBuilder};
-use google_cloud_spanner::types::{Type, TypeCode};
+use google_cloud_spanner::types::{self as spanner_types, Type, TypeCode};
 
 use crate::error::SpannerError;
 use crate::types;
@@ -85,7 +85,9 @@ fn add_plain_param(
             }
         }
         serde_json::Value::String(s) => builder.add_param(key, s),
-        serde_json::Value::Null => builder.add_param(key, &Option::<String>::None),
+        serde_json::Value::Null => {
+            builder.add_typed_param(key, &Option::<String>::None, spanner_types::string())
+        }
         serde_json::Value::Array(_) => {
             return Err(SpannerError::Other(format!(
                 "Plain JSON array for parameter '{key}': use typed form \
@@ -374,6 +376,11 @@ mod tests {
             Some(r#"{"a": true, "b": 42, "c": 3.14, "d": "hello"}"#),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn test_plain_null_is_typed_string_null() {
+        create_statement("SELECT @x", Some(r#"{"x": null}"#)).unwrap();
     }
 
     #[test]
