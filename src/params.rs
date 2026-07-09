@@ -407,6 +407,14 @@ fn add_array_param(
             })?;
             stmt.add_param(key, &v);
         }
+        TypeCode::Interval => {
+            let v = parse_array(key, arr, |k, v| {
+                Ok(IntervalParam(Some(
+                    require_string(k, "INTERVAL", v)?.to_string(),
+                )))
+            })?;
+            stmt.add_param(key, &v);
+        }
         _ => {
             return Err(SpannerError::Other(format!(
                 "Unsupported array element type for parameter '{key}': {elem_code:?}"
@@ -434,6 +442,7 @@ fn add_null_array(
         TypeCode::Numeric => stmt.add_param(key, &Option::<Vec<Option<NumericParam>>>::None),
         TypeCode::Json => stmt.add_param(key, &Option::<Vec<Option<JsonParam>>>::None),
         TypeCode::Uuid => stmt.add_param(key, &Option::<Vec<Option<UuidParam>>>::None),
+        TypeCode::Interval => stmt.add_param(key, &Option::<Vec<Option<IntervalParam>>>::None),
         _ => {
             return Err(SpannerError::Other(format!(
                 "Unsupported array element type for NULL ARRAY parameter '{key}': {elem_code:?}"
@@ -713,6 +722,33 @@ mod tests {
         create_statement(
             "SELECT @x",
             Some(r#"{"x": {"value": ["2024-01-15", "2024-06-15"], "type": "ARRAY<DATE>"}}"#),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_array_interval() {
+        create_statement(
+            "SELECT @x",
+            Some(r#"{"x": {"value": ["P1Y2M3D", "P1D"], "type": "ARRAY<INTERVAL>"}}"#),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_array_interval_with_null_element() {
+        create_statement(
+            "SELECT @x",
+            Some(r#"{"x": {"value": ["P1D", null], "type": "ARRAY<INTERVAL>"}}"#),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_array_interval_null() {
+        create_statement(
+            "SELECT @x",
+            Some(r#"{"x": {"value": null, "type": "ARRAY<INTERVAL>"}}"#),
         )
         .unwrap();
     }

@@ -598,6 +598,14 @@ fn flat_vector_to_json_value(
         LogicalTypeId::Varchar | LogicalTypeId::Uuid | LogicalTypeId::Time => {
             Ok(Value::String(read_varchar_at(vec, row)?))
         }
+        LogicalTypeId::Interval => {
+            let interval = unsafe { vec.as_slice_with_len::<duckdb_interval>(row + 1)[row] };
+            Ok(Value::String(duckdb_interval_to_iso8601(
+                interval.months,
+                interval.days,
+                interval.micros,
+            )))
+        }
         _ => Ok(Value::String(read_varchar_at(vec, row)?)),
     }
 }
@@ -910,6 +918,23 @@ mod tests {
             })
             .unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_spanner_value_interval_array() {
+        let conn = open_test_connection();
+
+        let json: String = conn
+            .query_row(
+                "SELECT spanner_value([INTERVAL '1 day', INTERVAL '1 year 3 months'])",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["type"], "ARRAY<INTERVAL>");
+        assert_eq!(parsed["value"][0], "P1D");
+        assert_eq!(parsed["value"][1], "P1Y3M");
     }
 
     #[test]
