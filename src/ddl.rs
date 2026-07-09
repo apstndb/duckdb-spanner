@@ -55,6 +55,151 @@ async fn get_or_create_admin_client(
     Ok(Arc::clone(entry))
 }
 
+fn emulator_endpoint(endpoint: Option<&str>) -> Option<String> {
+    endpoint
+        .map(str::to_owned)
+        .or_else(|| std::env::var("SPANNER_EMULATOR_HOST").ok())
+}
+
+async fn update_database_ddl(
+    admin: &DatabaseAdmin,
+    database_path: String,
+    statements: Vec<String>,
+    endpoint: Option<&str>,
+) -> Result<InternalOperation, SpannerError> {
+    if let Some(emulator_endpoint) = emulator_endpoint(endpoint) {
+        return update_emulator_database_ddl(
+            &admin_endpoint_url(&emulator_endpoint),
+            &database_path,
+            statements,
+        )
+        .await;
+    }
+
+    Ok(admin
+        .update_database_ddl()
+        .set_database(database_path)
+        .set_statements(statements)
+        .send()
+        .await?)
+}
+
+async fn wait_database_operation(
+    admin: &DatabaseAdmin,
+    operation_name: &str,
+    endpoint: Option<&str>,
+) -> Result<InternalOperation, SpannerError> {
+    if let Some(emulator_endpoint) = emulator_endpoint(endpoint) {
+        return wait_emulator_operation(&admin_endpoint_url(&emulator_endpoint), operation_name)
+            .await;
+    }
+
+    wait_operation(admin, operation_name).await
+}
+
+async fn update_emulator_database_ddl(
+    admin_endpoint: &str,
+    database_path: &str,
+    statements: Vec<String>,
+) -> Result<InternalOperation, SpannerError> {
+    // google-cloud-rust's generated REST client currently sends system query
+    // parameters that the Spanner emulator rejects for UpdateDatabaseDdl.
+    let url = format!(
+        "{}/v1/{}/ddl",
+        admin_endpoint.trim_end_matches('/'),
+        database_path
+    );
+    let client = reqwest::Client::new();
+    let payload = serde_json::json!({ "statements": statements });
+    const MAX_ATTEMPTS: u32 = 25;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        let response = client
+            .patch(&url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| SpannerError::Other(format!("Failed to update emulator DDL: {e:?}")))?;
+        let status = response.status();
+        let body = response.text().await.map_err(|e| {
+            SpannerError::Other(format!("Failed to read emulator DDL response: {e}"))
+        })?;
+
+        if status.is_success() {
+            return operation_from_json(&body);
+        }
+
+        if body.contains("\"code\":9") && body.contains("Schema change operation rejected") {
+            if attempt < MAX_ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        }
+
+        return Err(SpannerError::Other(format!(
+            "Failed to update emulator DDL: status={status}, body={body}"
+        )));
+    }
+
+    Err(SpannerError::Other(
+        "Failed to update emulator DDL: retry loop exhausted".to_string(),
+    ))
+}
+
+async fn wait_emulator_operation(
+    admin_endpoint: &str,
+    operation_name: &str,
+) -> Result<InternalOperation, SpannerError> {
+    let url = format!(
+        "{}/v1/{}",
+        admin_endpoint.trim_end_matches('/'),
+        operation_name
+    );
+    let client = reqwest::Client::new();
+
+    loop {
+        let response = client.get(&url).send().await.map_err(|e| {
+            SpannerError::Other(format!("Failed to fetch emulator operation: {e:?}"))
+        })?;
+        let status = response.status();
+        let body = response.text().await.map_err(|e| {
+            SpannerError::Other(format!("Failed to read emulator operation response: {e}"))
+        })?;
+
+        if !status.is_success() {
+            return Err(SpannerError::Other(format!(
+                "Failed to fetch emulator operation: status={status}, body={body}"
+            )));
+        }
+
+        let op = operation_from_json(&body)?;
+        if op.done {
+            return Ok(op);
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+fn operation_from_json(body: &str) -> Result<InternalOperation, SpannerError> {
+    let json: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| SpannerError::Other(format!("Failed to parse emulator operation: {e}")))?;
+    let name = json
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            SpannerError::Other(format!(
+                "Emulator operation response is missing a string name: {body}"
+            ))
+        })?;
+    let done = json
+        .get("done")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    Ok(InternalOperation::new().set_name(name).set_done(done))
+}
+
 // ---------------------------------------------------------------------------
 // Common named parameters for DDL / operations VTabs
 // ---------------------------------------------------------------------------
@@ -249,15 +394,13 @@ impl VTab for SpannerDdlVTab {
                 let admin = get_or_create_admin_client(endpoint.as_deref()).await?;
 
                 let start = Instant::now();
-                let op = admin
-                    .update_database_ddl()
-                    .set_database(database_path)
-                    .set_statements(statements)
-                    .send()
-                    .await?;
+                let op =
+                    update_database_ddl(&admin, database_path, statements, endpoint.as_deref())
+                        .await?;
 
                 let operation_name = op.name.clone();
-                let op = wait_operation(&admin, &operation_name).await?;
+                let op =
+                    wait_database_operation(&admin, &operation_name, endpoint.as_deref()).await?;
 
                 let duration_secs = start.elapsed().as_secs_f64();
 
@@ -381,12 +524,9 @@ impl VTab for SpannerDdlAsyncVTab {
             runtime::block_on(async {
                 let admin = get_or_create_admin_client(endpoint.as_deref()).await?;
 
-                let op = admin
-                    .update_database_ddl()
-                    .set_database(database_path)
-                    .set_statements(statements)
-                    .send()
-                    .await?;
+                let op =
+                    update_database_ddl(&admin, database_path, statements, endpoint.as_deref())
+                        .await?;
 
                 Ok::<DdlAsyncResult, SpannerError>(DdlAsyncResult {
                     operation_name: op.name,

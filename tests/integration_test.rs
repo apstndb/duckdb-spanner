@@ -1151,11 +1151,13 @@ fn test_error_invalid_sql_query() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn make_ddl_sql(db: &spanemuboost::SpanEmuDatabase, ddl: &str) -> String {
+    // DDL uses DatabaseAdmin's REST endpoint. Testcontainers maps the emulator
+    // gRPC and REST ports independently, so use the captured admin host here.
     format!(
         "SELECT * FROM spanner_ddl('{}', database_path := '{}', endpoint := '{}')",
         ddl.replace('\'', "''"),
         db.database_path(),
-        db.emulator_host()
+        db.admin_host()
     )
 }
 
@@ -1164,7 +1166,7 @@ fn make_ddl_async_sql(db: &spanemuboost::SpanEmuDatabase, ddl: &str) -> String {
         "SELECT * FROM spanner_ddl_async('{}', database_path := '{}', endpoint := '{}')",
         ddl.replace('\'', "''"),
         db.database_path(),
-        db.emulator_host()
+        db.admin_host()
     )
 }
 
@@ -1277,7 +1279,7 @@ fn test_ddl_operations() {
     let ops_sql = format!(
         "SELECT * FROM spanner_operations(database_path := '{}', endpoint := '{}')",
         db.database_path(),
-        db.emulator_host()
+        db.admin_host()
     );
     let mut stmt = conn.prepare(&ops_sql).unwrap();
     let rows: Vec<(String, bool)> = stmt
@@ -1917,7 +1919,7 @@ fn test_pg_ddl_operations() {
     let ops_sql = format!(
         "SELECT * FROM spanner_operations(database_path := '{}', endpoint := '{}')",
         db.database_path(),
-        db.emulator_host()
+        db.admin_host()
     );
     let mut stmt = conn.prepare(&ops_sql).unwrap();
     let rows: Vec<(String, bool)> = stmt
