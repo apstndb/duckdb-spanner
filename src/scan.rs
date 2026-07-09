@@ -496,7 +496,14 @@ fn write_projected_rows(
     // DuckDB output vector index = i (output only contains projected columns)
     for (i, &orig_col_idx) in projected_columns.iter().enumerate() {
         let col_info = &all_columns[orig_col_idx];
-        convert::write_column_from_rows(output, i, rows, i, &col_info.spanner_type)?;
+        convert::write_column_from_rows(
+            output,
+            i,
+            rows,
+            i,
+            &col_info.spanner_type,
+            &col_info.name,
+        )?;
     }
 
     output.set_len(rows.len());
