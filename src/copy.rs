@@ -18,11 +18,14 @@
 
 use std::ffi::{c_void, CStr, CString};
 use std::sync::Arc;
+use std::time::Duration;
 
 use duckdb::ffi;
+use google_cloud_gax::error::rpc::Code;
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::mutation::Mutation;
 use google_cloud_spanner::types::{Type, TypeCode};
+use google_cloud_spanner::Error as SpannerClientError;
 use google_cloud_spanner_admin_database_v1::model::DatabaseDialect;
 use prost_types::value::Kind;
 use prost_types::{ListValue, Value};
@@ -33,6 +36,7 @@ use crate::runtime;
 use crate::schema;
 
 const DEFAULT_BATCH_SIZE: usize = 1000;
+const EMULATOR_WRITE_MAX_ATTEMPTS: u32 = 5;
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -101,6 +105,7 @@ struct CopyExtraInfo {
 /// Global state created during init and shared across sink calls.
 struct CopyGlobalState {
     client: Arc<DatabaseClient>,
+    retry_emulator_internal_write_error: bool,
     table_name: String,
     column_names: Vec<String>,
     mode: MutationMode,
@@ -330,6 +335,7 @@ unsafe fn copy_global_init_inner(
 
     let state = Box::new(CopyGlobalState {
         client,
+        retry_emulator_internal_write_error: bind_data.endpoint.is_some(),
         table_name,
         column_names,
         mode: bind_data.mode,
@@ -782,18 +788,52 @@ fn flush_buffer(state: &mut CopyGlobalState) -> Result<(), String> {
     let mutations = std::mem::take(&mut state.buffer);
     let count = mutations.len();
 
-    let result = runtime::block_on(
-        state
-            .client
-            .write_only_transaction()
-            .build()
-            .write(mutations),
-    )
-    .map_err(|e| format!("Runtime error: {e}"))?;
-    result.map_err(|e| format!("Spanner write error: {e}"))?;
+    runtime::block_on(write_mutations(
+        Arc::clone(&state.client),
+        mutations,
+        state.retry_emulator_internal_write_error,
+    ))
+    .map_err(|e| format!("Runtime error: {e}"))??;
 
     state.rows_written += count as u64;
     Ok(())
+}
+
+async fn write_mutations(
+    client: Arc<DatabaseClient>,
+    mutations: Vec<Mutation>,
+    retry_emulator_internal_error: bool,
+) -> Result<(), String> {
+    let mut attempt = 1;
+    loop {
+        match client
+            .write_only_transaction()
+            .build()
+            .write(mutations.clone())
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(e)
+                if retry_emulator_internal_error
+                    && attempt < EMULATOR_WRITE_MAX_ATTEMPTS
+                    && is_internal_emulator_schema_error(&e) =>
+            {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => return Err(format!("Spanner write error: {e}")),
+        }
+    }
+}
+
+fn is_internal_emulator_schema_error(err: &SpannerClientError) -> bool {
+    err.status().is_some_and(|status| {
+        status.code == Code::Internal
+            && status.message.contains("Schema generation")
+            && status
+                .message
+                .contains("was not registered with the Action Manager")
+    })
 }
 
 fn build_mutation(
@@ -1309,6 +1349,7 @@ unsafe extern "C" fn drop_box<T>(ptr: *mut c_void) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use google_cloud_gax::error::rpc::Status;
     use google_cloud_spanner::types as spanner_types;
 
     fn col(name: &str, is_generated: bool) -> schema::ColumnInfo {
@@ -1413,5 +1454,21 @@ mod tests {
         let resolved = resolve_copy_columns(&schema, Some(&src), 2, "T").unwrap();
         let got: Vec<&str> = resolved.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(got, vec!["Id", "Name"]);
+    }
+
+    #[test]
+    fn detects_emulator_internal_schema_error() {
+        let err =
+            SpannerClientError::service(Status::default().set_code(Code::Internal).set_message(
+                "INTERNAL: Schema generation 0 was not registered with the Action Manager",
+            ));
+        assert!(is_internal_emulator_schema_error(&err));
+
+        let err = SpannerClientError::service(
+            Status::default()
+                .set_code(Code::Internal)
+                .set_message("different internal error"),
+        );
+        assert!(!is_internal_emulator_schema_error(&err));
     }
 }
