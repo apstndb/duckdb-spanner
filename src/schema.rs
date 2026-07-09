@@ -17,6 +17,12 @@ use crate::types;
 /// `detect_dialect` issues a query, so callers that run it on every bind
 /// (`spanner_scan`, `COPY TO ... (FORMAT spanner)`) look here first to avoid
 /// a redundant round-trip against the same database.
+///
+/// TODO: this cache is unbounded — connecting to many distinct databases in a
+/// long-running process grows it without limit (same class of issue as the old
+/// client cache, #5). The payload is tiny (one enum per database) so bounding
+/// it is not urgent, but it should eventually share the client cache's LRU
+/// eviction (or be folded into it).
 static DIALECT_CACHE: LazyLock<Mutex<HashMap<String, DatabaseDialect>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -61,25 +67,42 @@ pub async fn detect_dialect(
     endpoint: Option<&str>,
 ) -> Result<DatabaseDialect, SpannerError> {
     let key = crate::client::cache_key(database, endpoint);
-    if let Some(dialect) = DIALECT_CACHE
+    // Copy the cached value out before the `if let` so the MutexGuard is
+    // dropped immediately rather than held across the block.
+    let cached = DIALECT_CACHE
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&key)
-    {
-        return Ok(*dialect);
+        .copied();
+    if let Some(dialect) = cached {
+        return Ok(dialect);
     }
 
-    let dialect = match detect_dialect_via_database_options(client).await {
-        Ok(dialect) => dialect,
-        Err(_) => detect_dialect_via_public_schema(client).await?,
-    };
-
-    DIALECT_CACHE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(key, dialect);
-
-    Ok(dialect)
+    match detect_dialect_via_database_options(client).await {
+        Ok(dialect) => {
+            // Only DATABASE_OPTIONS-derived results are cached. The value is an
+            // authoritative, immutable database property, so caching it for the
+            // process lifetime is safe.
+            DIALECT_CACHE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key, dialect);
+            Ok(dialect)
+        }
+        Err(e) => {
+            // The primary query failed — this may be a transient error
+            // (e.g. UNAVAILABLE) rather than an unsupported-feature error, so
+            // do NOT cache the heuristic result: caching a misdetection from a
+            // transient blip would permanently poison the dialect for the
+            // process (the exact bug #7 fixes). Return the heuristic result but
+            // leave the cache empty so the next bind retries the primary path.
+            eprintln!(
+                "[duckdb-spanner] dialect detection via DATABASE_OPTIONS failed ({e}), \
+                 falling back to schema heuristic"
+            );
+            detect_dialect_via_public_schema(client).await
+        }
+    }
 }
 
 /// Query `INFORMATION_SCHEMA.DATABASE_OPTIONS` for the `database_dialect` option.
@@ -119,7 +142,9 @@ fn parse_database_dialect_option(value: &str) -> Result<DatabaseDialect, Spanner
 /// GoogleSQL databases do not (unless the user created one, in which case
 /// this misdetects -- see `detect_dialect_via_database_options` above, which
 /// is tried first).
-async fn detect_dialect_via_public_schema(client: &Client) -> Result<DatabaseDialect, SpannerError> {
+async fn detect_dialect_via_public_schema(
+    client: &Client,
+) -> Result<DatabaseDialect, SpannerError> {
     let stmt = Statement::new(
         "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = 'public'",
     );
