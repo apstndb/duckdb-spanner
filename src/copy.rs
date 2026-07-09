@@ -310,22 +310,23 @@ unsafe fn copy_global_init_inner(
     .map_err(|e| format!("Runtime error: {e}"))?
     .map_err(|e| format!("Schema discovery failed for table '{table_name}': {e}"))?;
 
-    // Validate column count matches
-    if bind_data.columns.len() != schema_columns.len() {
-        return Err(format!(
-            "Column count mismatch: source has {} columns, Spanner table '{}' has {} columns",
-            bind_data.columns.len(),
-            table_name,
-            schema_columns.len()
-        ));
-    }
+    // Map the COPY source columns to the writable Spanner target columns,
+    // excluding generated columns (Spanner rejects writes to them).
+    //
+    // The DuckDB COPY C API does not expose the source column names in this
+    // version (only their types), so `None` is passed and mapping is positional
+    // over the writable target columns in ordinal order. `resolve_copy_columns`
+    // also implements case-insensitive by-name matching for when source names are
+    // available (see its unit tests).
+    let targets =
+        resolve_copy_columns(&schema_columns, None, bind_data.columns.len(), &table_name)?;
 
-    let column_names: Vec<String> = schema_columns.iter().map(|c| c.name.clone()).collect();
+    let column_names: Vec<String> = targets.iter().map(|c| c.name.clone()).collect();
 
     // Enrich DuckDB column metadata with Spanner target type codes
     let mut columns = bind_data.columns.clone();
-    for (col, schema_col) in columns.iter_mut().zip(schema_columns.iter()) {
-        apply_spanner_type(col, &schema_col.spanner_type)?;
+    for (col, target) in columns.iter_mut().zip(targets.iter()) {
+        apply_spanner_type(col, &target.spanner_type)?;
     }
 
     let state = Box::new(CopyGlobalState {
@@ -504,6 +505,109 @@ fn apply_spanner_type(col: &mut ColumnMeta, spanner_type: &Type) -> Result<(), S
     }
 
     Ok(())
+}
+
+// ─── Source → target column mapping ─────────────────────────────────────────
+
+/// Map the COPY source columns to the writable Spanner target columns.
+///
+/// Generated columns (which Spanner rejects writes to) are always excluded from
+/// the writable target set. Two mapping strategies are supported:
+///
+/// * **By name** (`source_names = Some(..)` with every entry non-empty): each
+///   source column is matched to a target column case-insensitively. A source
+///   column with no target match — or one that resolves to a generated column —
+///   is a hard error listing the available writable target columns.
+/// * **Positional** (`source_names = None`, or any name empty): the source
+///   columns are mapped to the writable target columns in ordinal order, and only
+///   the arity is validated. This is the fallback used at runtime because the
+///   DuckDB COPY C API does not expose source column names in this version.
+///
+/// Returns one target [`schema::ColumnInfo`] per source column, in source order,
+/// which the caller uses both as the mutation column list and to enrich the
+/// source metadata with Spanner target types.
+fn resolve_copy_columns(
+    schema_columns: &[schema::ColumnInfo],
+    source_names: Option<&[String]>,
+    source_count: usize,
+    table: &str,
+) -> Result<Vec<schema::ColumnInfo>, String> {
+    let writable: Vec<&schema::ColumnInfo> =
+        schema_columns.iter().filter(|c| !c.is_generated).collect();
+    let generated_count = schema_columns.len() - writable.len();
+
+    // By-name mapping requires a name for every source column.
+    if let Some(names) = source_names {
+        if names.iter().all(|n| !n.is_empty()) {
+            if names.len() != source_count {
+                return Err(format!(
+                    "Internal error: {} source names for {source_count} source columns",
+                    names.len()
+                ));
+            }
+            let mut seen_names = std::collections::HashMap::new();
+            for name in names {
+                let normalized = name.to_ascii_lowercase();
+                if let Some(first_name) = seen_names.insert(normalized, name) {
+                    return Err(format!(
+                        "COPY source column '{name}' duplicates source column '{first_name}'. \
+                         Source column names must be unique for by-name mapping"
+                    ));
+                }
+            }
+            let mut resolved = Vec::with_capacity(names.len());
+            for name in names {
+                // Match against ALL target columns (including generated ones) so a
+                // source column pointing at a generated column yields a precise
+                // error instead of a generic "no match".
+                match schema_columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(name))
+                {
+                    Some(c) if c.is_generated => {
+                        return Err(format!(
+                            "COPY source column '{name}' maps to generated column '{}' in \
+                             Spanner table '{table}', which cannot be written",
+                            c.name
+                        ));
+                    }
+                    Some(c) => resolved.push(c.clone()),
+                    None => {
+                        return Err(format!(
+                            "COPY source column '{name}' has no matching column in Spanner \
+                             table '{table}'. Available target columns: {}",
+                            join_column_names(&writable)
+                        ));
+                    }
+                }
+            }
+            return Ok(resolved);
+        }
+    }
+
+    // Positional fallback over the writable (non-generated) target columns.
+    if source_count != writable.len() {
+        let gen_note = if generated_count > 0 {
+            format!(" ({generated_count} generated column(s) excluded)")
+        } else {
+            String::new()
+        };
+        return Err(format!(
+            "Column count mismatch: source has {source_count} column(s), but Spanner table \
+             '{table}' has {} writable column(s){gen_note}",
+            writable.len()
+        ));
+    }
+
+    Ok(writable.into_iter().cloned().collect())
+}
+
+fn join_column_names(columns: &[&schema::ColumnInfo]) -> String {
+    columns
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // ─── Option extraction ──────────────────────────────────────────────────────
@@ -1199,5 +1303,120 @@ unsafe fn set_finalize_error(info: ffi::duckdb_copy_function_finalize_info, msg:
 unsafe extern "C" fn drop_box<T>(ptr: *mut c_void) {
     if !ptr.is_null() {
         drop(Box::from_raw(ptr as *mut T));
+    }
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use google_cloud_googleapis::spanner::v1::{Type, TypeCode};
+
+    fn col(name: &str, is_generated: bool) -> schema::ColumnInfo {
+        schema::ColumnInfo {
+            name: name.to_string(),
+            spanner_type: Type {
+                code: TypeCode::Int64 as i32,
+                ..Default::default()
+            },
+            is_generated,
+        }
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn positional_excludes_generated_columns() {
+        // DDL order: Id, FullName (generated), Name. Writable = Id, Name.
+        let schema = vec![col("Id", false), col("FullName", true), col("Name", false)];
+        let resolved = resolve_copy_columns(&schema, None, 2, "T").unwrap();
+        let got: Vec<&str> = resolved.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(got, vec!["Id", "Name"]);
+    }
+
+    #[test]
+    fn positional_arity_mismatch_mentions_generated() {
+        let schema = vec![col("Id", false), col("Gen", true), col("Name", false)];
+        // Source provides 3 columns but only 2 are writable.
+        let err = resolve_copy_columns(&schema, None, 3, "T").unwrap_err();
+        assert!(err.contains("2 writable column(s)"), "{err}");
+        assert!(err.contains("1 generated column(s) excluded"), "{err}");
+    }
+
+    #[test]
+    fn positional_arity_mismatch_without_generated() {
+        let schema = vec![col("Id", false), col("Name", false)];
+        let err = resolve_copy_columns(&schema, None, 3, "T").unwrap_err();
+        assert!(err.contains("2 writable column(s)"), "{err}");
+        assert!(!err.contains("generated"), "{err}");
+    }
+
+    #[test]
+    fn by_name_matches_case_insensitively_and_reorders() {
+        // DDL order: Id, Name, Value. Source order differs and casing differs.
+        let schema = vec![col("Id", false), col("Name", false), col("Value", false)];
+        let src = names(&["value", "ID", "name"]);
+        let resolved = resolve_copy_columns(&schema, Some(&src), 3, "T").unwrap();
+        let got: Vec<&str> = resolved.iter().map(|c| c.name.as_str()).collect();
+        // Result follows SOURCE order, using canonical target names.
+        assert_eq!(got, vec!["Value", "Id", "Name"]);
+    }
+
+    #[test]
+    fn by_name_rejects_duplicate_source_names() {
+        let schema = vec![col("Id", false), col("Name", false)];
+        let src = names(&["Id", "Id"]);
+        let err = resolve_copy_columns(&schema, Some(&src), 2, "T").unwrap_err();
+        assert!(err.contains("'Id' duplicates source column 'Id'"), "{err}");
+        assert!(err.contains("must be unique"), "{err}");
+    }
+
+    #[test]
+    fn by_name_rejects_case_insensitive_duplicate_source_names() {
+        let schema = vec![col("Id", false), col("Name", false)];
+        let src = names(&["Id", "id"]);
+        let err = resolve_copy_columns(&schema, Some(&src), 2, "T").unwrap_err();
+        assert!(err.contains("'id' duplicates source column 'Id'"), "{err}");
+    }
+
+    #[test]
+    fn by_name_unmatched_source_errors_with_available_columns() {
+        let schema = vec![col("Id", false), col("Name", false)];
+        let src = names(&["Id", "Missing"]);
+        let err = resolve_copy_columns(&schema, Some(&src), 2, "T").unwrap_err();
+        assert!(err.contains("'Missing' has no matching column"), "{err}");
+        // Available list contains the writable target columns.
+        assert!(err.contains("Id, Name"), "{err}");
+    }
+
+    #[test]
+    fn by_name_source_to_generated_column_errors() {
+        let schema = vec![col("Id", false), col("Gen", true)];
+        let src = names(&["Id", "gen"]);
+        let err = resolve_copy_columns(&schema, Some(&src), 2, "T").unwrap_err();
+        assert!(err.contains("maps to generated column 'Gen'"), "{err}");
+    }
+
+    #[test]
+    fn by_name_excludes_generated_from_available_list() {
+        let schema = vec![col("Id", false), col("Gen", true), col("Name", false)];
+        let src = names(&["Id", "Nope"]);
+        let err = resolve_copy_columns(&schema, Some(&src), 2, "T").unwrap_err();
+        // Generated column must not appear in the "available target columns" hint.
+        assert!(err.contains("Id, Name"), "{err}");
+        assert!(!err.contains("Gen"), "{err}");
+    }
+
+    #[test]
+    fn empty_source_name_falls_back_to_positional() {
+        let schema = vec![col("Id", false), col("Name", false)];
+        // One empty name disables by-name matching; positional arity applies.
+        let src = names(&["Id", ""]);
+        let resolved = resolve_copy_columns(&schema, Some(&src), 2, "T").unwrap();
+        let got: Vec<&str> = resolved.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(got, vec!["Id", "Name"]);
     }
 }

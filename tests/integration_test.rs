@@ -84,6 +84,12 @@ fn get_gsql_db() -> &'static spanemuboost::SpanEmuDatabase {
                         Id INT64 NOT NULL, BoolCol BOOL, Int64Col INT64, Float64Col FLOAT64, \
                         StringCol STRING(MAX), DateCol DATE, TimestampCol TIMESTAMP\
                     ) PRIMARY KEY (Id)".into(),
+                    // Doubled is a generated column between the writable columns; COPY
+                    // must skip it and map source columns onto Id/Amount/Label.
+                    "CREATE TABLE CopyGenerated (\
+                        Id INT64 NOT NULL, Amount INT64, \
+                        Doubled INT64 AS (Amount * 2) STORED, Label STRING(MAX)\
+                    ) PRIMARY KEY (Id)".into(),
                 ],
                 vec![
                     "INSERT INTO ScalarTypes (Id, BoolCol, Int64Col, Float64Col, StringCol, BytesCol, DateCol, TimestampCol) \
@@ -1362,6 +1368,15 @@ fn get_pg_copy_db() -> &'static spanemuboost::SpanEmuDatabase {
                         PRIMARY KEY (id)\
                     )"
                     .into(),
+                    // doubled is a generated column between the writable columns.
+                    "CREATE TABLE pgsql_copy_generated (\
+                        id bigint NOT NULL, \
+                        amount bigint, \
+                        doubled bigint GENERATED ALWAYS AS (amount * 2) STORED, \
+                        label character varying(256), \
+                        PRIMARY KEY (id)\
+                    )"
+                    .into(),
                 ],
                 vec![],
             )
@@ -1774,6 +1789,58 @@ fn test_copy_to_column_count_mismatch() {
     );
 }
 
+#[test]
+fn test_copy_to_excludes_generated_column() {
+    let conn = create_duckdb_connection_with_copy();
+    let db = get_gsql_db();
+
+    // CopyGenerated columns: Id, Amount, Doubled (generated), Label.
+    // Only the 3 writable columns are targeted, so 3 source columns map onto
+    // Id/Amount/Label and Doubled is computed by Spanner.
+    let sql = format!(
+        "COPY (SELECT CAST(400 AS BIGINT) AS Id, CAST(21 AS BIGINT) AS Amount, 'gen' AS Label) \
+         TO 'CopyGenerated' (FORMAT spanner, database_path '{}', endpoint '{}')",
+        db.database_path(),
+        db.emulator_host()
+    );
+    conn.execute_batch(&sql).unwrap();
+
+    let read_sql =
+        vtab_query_sql("SELECT Amount, Doubled, Label FROM CopyGenerated WHERE Id = 400");
+    let (amount, doubled, label): (i64, i64, String) = conn
+        .query_row(&read_sql, [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap();
+    assert_eq!(amount, 21);
+    assert_eq!(
+        doubled, 42,
+        "generated column should be computed by Spanner"
+    );
+    assert_eq!(
+        label, "gen",
+        "Label must not be shifted into the generated column"
+    );
+}
+
+#[test]
+fn test_copy_to_generated_column_count_mismatch() {
+    let conn = create_duckdb_connection_with_copy();
+    let db = get_gsql_db();
+
+    // Supplying a 4th value for the generated column must fail: only 3 writable.
+    let sql = format!(
+        "COPY (SELECT CAST(401 AS BIGINT) AS Id, CAST(5 AS BIGINT) AS Amount, \
+             CAST(999 AS BIGINT) AS Doubled, 'x' AS Label) \
+         TO 'CopyGenerated' (FORMAT spanner, database_path '{}', endpoint '{}')",
+        db.database_path(),
+        db.emulator_host()
+    );
+    let err_msg = conn.execute_batch(&sql).unwrap_err().to_string();
+    assert!(
+        err_msg.contains("Column count mismatch") && err_msg.contains("generated"),
+        "error should mention count mismatch and generated columns, got: {err_msg}"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // PostgreSQL dialect — DDL tests
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1941,4 +2008,33 @@ fn test_pg_copy_to_struct_json() {
     assert_eq!(value["label"], "pg");
     assert_eq!(value["ok"], true);
     assert_eq!(value["nums"], serde_json::json!([1, 2]));
+}
+
+#[test]
+fn test_pg_copy_to_excludes_generated_column() {
+    let conn = create_pg_duckdb_connection_with_copy();
+    let db = get_pg_copy_db();
+
+    // pgsql_copy_generated columns: id, amount, doubled (generated), label.
+    // Only the 3 writable columns are targeted; doubled is computed by Spanner.
+    let sql = format!(
+        "COPY (SELECT CAST(400 AS BIGINT) AS id, CAST(21 AS BIGINT) AS amount, 'gen' AS label) \
+         TO 'pgsql_copy_generated' (FORMAT spanner, database_path '{}', endpoint '{}')",
+        db.database_path(),
+        db.emulator_host()
+    );
+    conn.execute_batch(&sql).unwrap();
+
+    let rows = exec_spanner_on(
+        db,
+        "SELECT amount, doubled, label FROM pgsql_copy_generated WHERE id = 400",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].column::<i64>(0).unwrap(), 21);
+    assert_eq!(
+        rows[0].column::<i64>(1).unwrap(),
+        42,
+        "generated column should be computed by Spanner"
+    );
+    assert_eq!(rows[0].column::<String>(2).unwrap(), "gen");
 }

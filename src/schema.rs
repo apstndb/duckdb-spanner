@@ -31,6 +31,10 @@ static DIALECT_CACHE: LazyLock<Mutex<HashMap<String, DatabaseDialect>>> =
 pub struct ColumnInfo {
     pub name: String,
     pub spanner_type: Type,
+    /// True when the column is generated (INFORMATION_SCHEMA.IS_GENERATED != 'NEVER').
+    /// Generated columns are computed by Spanner and reject writes, so COPY TO must
+    /// exclude them from the target column list.
+    pub is_generated: bool,
 }
 
 /// Parse a dialect string from user input.
@@ -190,6 +194,8 @@ pub async fn discover_query_schema(
         .map(|field| ColumnInfo {
             name: field.name.clone(),
             spanner_type: field.r#type.clone().unwrap_or_default(),
+            // Query result columns are never "generated" in the write sense.
+            is_generated: false,
         })
         .collect();
 
@@ -229,6 +235,7 @@ pub async fn discover_table_schema(
         let _table_schema: String = row.column(0)?;
         let name: String = row.column(1)?;
         let spanner_type_str: String = row.column(2)?;
+        let is_generated_str: String = row.column(3)?;
 
         // Use the detected database dialect, not TABLE_SCHEMA (PG tables in named
         // schemas such as myschema.Users still use PostgreSQL type strings).
@@ -237,7 +244,16 @@ pub async fn discover_table_schema(
             _ => types::parse_spanner_type(&spanner_type_str),
         };
 
-        columns.push(ColumnInfo { name, spanner_type });
+        // INFORMATION_SCHEMA.IS_GENERATED is 'NEVER' for ordinary columns and
+        // 'ALWAYS' for generated columns in both the GoogleSQL and PostgreSQL
+        // dialects. Anything other than 'NEVER' is treated as generated.
+        let is_generated = !is_generated_str.eq_ignore_ascii_case("NEVER");
+
+        columns.push(ColumnInfo {
+            name,
+            spanner_type,
+            is_generated,
+        });
     }
 
     if columns.is_empty() {
@@ -259,14 +275,14 @@ fn build_columns_query(dialect: DatabaseDialect, schema_name: &str, table_name: 
     if schema_name.is_empty() {
         let (sql, table_param) = match dialect {
             DatabaseDialect::Postgresql => (
-                "SELECT TABLE_SCHEMA, COLUMN_NAME, SPANNER_TYPE \
+                "SELECT TABLE_SCHEMA, COLUMN_NAME, SPANNER_TYPE, IS_GENERATED \
                  FROM INFORMATION_SCHEMA.COLUMNS \
                  WHERE TABLE_SCHEMA IN ('', 'public') AND TABLE_NAME = $1 \
                  ORDER BY ORDINAL_POSITION",
                 "p1",
             ),
             _ => (
-                "SELECT TABLE_SCHEMA, COLUMN_NAME, SPANNER_TYPE \
+                "SELECT TABLE_SCHEMA, COLUMN_NAME, SPANNER_TYPE, IS_GENERATED \
                  FROM INFORMATION_SCHEMA.COLUMNS \
                  WHERE TABLE_SCHEMA IN ('', 'public') AND TABLE_NAME = @table \
                  ORDER BY ORDINAL_POSITION",
@@ -279,7 +295,7 @@ fn build_columns_query(dialect: DatabaseDialect, schema_name: &str, table_name: 
     } else {
         let (sql, schema_param, table_param) = match dialect {
             DatabaseDialect::Postgresql => (
-                "SELECT TABLE_SCHEMA, COLUMN_NAME, SPANNER_TYPE \
+                "SELECT TABLE_SCHEMA, COLUMN_NAME, SPANNER_TYPE, IS_GENERATED \
                  FROM INFORMATION_SCHEMA.COLUMNS \
                  WHERE TABLE_SCHEMA = $1 AND TABLE_NAME = $2 \
                  ORDER BY ORDINAL_POSITION",
@@ -287,7 +303,7 @@ fn build_columns_query(dialect: DatabaseDialect, schema_name: &str, table_name: 
                 "p2",
             ),
             _ => (
-                "SELECT TABLE_SCHEMA, COLUMN_NAME, SPANNER_TYPE \
+                "SELECT TABLE_SCHEMA, COLUMN_NAME, SPANNER_TYPE, IS_GENERATED \
                  FROM INFORMATION_SCHEMA.COLUMNS \
                  WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @table \
                  ORDER BY ORDINAL_POSITION",
