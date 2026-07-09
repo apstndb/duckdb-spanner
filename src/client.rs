@@ -194,6 +194,18 @@ async fn close_evicted(slot: ClientSlot, grace: Duration) {
     close_when_reclaimed(client, grace, |c| c.close()).await;
 }
 
+/// Build the cache key used to identify a `(database, endpoint)` pair.
+///
+/// Shared by the client cache below and the dialect cache in `schema.rs` so a
+/// database's detected dialect can be looked up under the same identity as
+/// its cached client.
+pub fn cache_key(database: &str, endpoint: Option<&str>) -> String {
+    match endpoint {
+        Some(ep) => format!("{database}@{ep}"),
+        None => database.to_string(),
+    }
+}
+
 /// Get or create a Spanner client.
 ///
 /// - `endpoint: None` → default behavior (uses `SPANNER_EMULATOR_HOST` env var if set, otherwise real Spanner with auth)
@@ -206,10 +218,7 @@ pub async fn get_or_create_client(
     database: &str,
     endpoint: Option<&str>,
 ) -> Result<Arc<Client>, SpannerError> {
-    let cache_key = match endpoint {
-        Some(ep) => format!("{database}@{ep}"),
-        None => database.to_string(),
-    };
+    let cache_key = cache_key(database, endpoint);
 
     // Look up (or create) the slot for this key under the std mutex. The lock is
     // released before any `.await` below — bind runs on `block_on`, so holding a

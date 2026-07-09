@@ -304,6 +304,8 @@ unsafe fn copy_global_init_inner(
         &client,
         &table_name,
         DatabaseDialect::Unspecified,
+        &bind_data.database_path,
+        bind_data.endpoint.as_deref(),
     ))
     .map_err(|e| format!("Runtime error: {e}"))?
     .map_err(|e| format!("Schema discovery failed for table '{table_name}': {e}"))?;
