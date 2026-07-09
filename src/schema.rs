@@ -129,7 +129,11 @@ async fn detect_dialect_via_database_options(
 /// Parse the `OPTION_VALUE` returned for the `database_dialect` row of
 /// `INFORMATION_SCHEMA.DATABASE_OPTIONS`.
 fn parse_database_dialect_option(value: &str) -> Result<DatabaseDialect, SpannerError> {
-    match value {
+    let normalized = value
+        .trim()
+        .trim_matches(|c| c == '\'' || c == '"')
+        .to_ascii_uppercase();
+    match normalized.as_str() {
         "POSTGRESQL" => Ok(DatabaseDialect::Postgresql),
         "GOOGLE_STANDARD_SQL" => Ok(DatabaseDialect::GoogleStandardSql),
         other => Err(SpannerError::Other(format!(
@@ -322,6 +326,18 @@ mod tests {
         assert_eq!(
             parse_database_dialect_option("POSTGRESQL").unwrap(),
             DatabaseDialect::Postgresql
+        );
+    }
+
+    #[test]
+    fn parse_database_dialect_option_normalizes_case_quotes_and_whitespace() {
+        assert_eq!(
+            parse_database_dialect_option("  'postgresql'  ").unwrap(),
+            DatabaseDialect::Postgresql
+        );
+        assert_eq!(
+            parse_database_dialect_option("\"google_standard_sql\"").unwrap(),
+            DatabaseDialect::GoogleStandardSql
         );
     }
 
