@@ -258,7 +258,10 @@ pub async fn discover_table_schema(
 
     if columns.is_empty() {
         let msg = if schema_name.is_empty() {
-            format!("Table {table_name} not found in INFORMATION_SCHEMA (searched schemas '' and 'public')")
+            let default_schema = default_schema_for_dialect(dialect);
+            format!(
+                "Table {table_name} not found in INFORMATION_SCHEMA (searched default schema {default_schema:?})"
+            )
         } else {
             format!("Table {table_name} in schema {schema_name} not found in INFORMATION_SCHEMA")
         };
@@ -272,49 +275,47 @@ pub async fn discover_table_schema(
 ///
 /// GoogleSQL uses `@param`; PostgreSQL uses `$N` with param names `pN`.
 fn build_columns_query(dialect: DatabaseDialect, schema_name: &str, table_name: &str) -> Statement {
+    let (sql, schema_param, table_param) = columns_query_template(dialect);
+    let schema_value = schema_value_for_table(dialect, schema_name).to_string();
+    let mut stmt = Statement::new(sql);
+    stmt.add_param(schema_param, &schema_value);
+    stmt.add_param(table_param, &table_name.to_string());
+    stmt
+}
+
+fn columns_query_template(dialect: DatabaseDialect) -> (&'static str, &'static str, &'static str) {
+    match dialect {
+        DatabaseDialect::Postgresql => (
+            "SELECT TABLE_SCHEMA, COLUMN_NAME, SPANNER_TYPE, IS_GENERATED \
+             FROM INFORMATION_SCHEMA.COLUMNS \
+             WHERE TABLE_SCHEMA = $1 AND TABLE_NAME = $2 \
+             ORDER BY ORDINAL_POSITION",
+            "p1",
+            "p2",
+        ),
+        _ => (
+            "SELECT TABLE_SCHEMA, COLUMN_NAME, SPANNER_TYPE, IS_GENERATED \
+             FROM INFORMATION_SCHEMA.COLUMNS \
+             WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @table \
+             ORDER BY ORDINAL_POSITION",
+            "schema",
+            "table",
+        ),
+    }
+}
+
+fn schema_value_for_table<'a>(dialect: DatabaseDialect, schema_name: &'a str) -> &'a str {
     if schema_name.is_empty() {
-        let (sql, table_param) = match dialect {
-            DatabaseDialect::Postgresql => (
-                "SELECT TABLE_SCHEMA, COLUMN_NAME, SPANNER_TYPE, IS_GENERATED \
-                 FROM INFORMATION_SCHEMA.COLUMNS \
-                 WHERE TABLE_SCHEMA IN ('', 'public') AND TABLE_NAME = $1 \
-                 ORDER BY ORDINAL_POSITION",
-                "p1",
-            ),
-            _ => (
-                "SELECT TABLE_SCHEMA, COLUMN_NAME, SPANNER_TYPE, IS_GENERATED \
-                 FROM INFORMATION_SCHEMA.COLUMNS \
-                 WHERE TABLE_SCHEMA IN ('', 'public') AND TABLE_NAME = @table \
-                 ORDER BY ORDINAL_POSITION",
-                "table",
-            ),
-        };
-        let mut stmt = Statement::new(sql);
-        stmt.add_param(table_param, &table_name.to_string());
-        stmt
+        default_schema_for_dialect(dialect)
     } else {
-        let (sql, schema_param, table_param) = match dialect {
-            DatabaseDialect::Postgresql => (
-                "SELECT TABLE_SCHEMA, COLUMN_NAME, SPANNER_TYPE, IS_GENERATED \
-                 FROM INFORMATION_SCHEMA.COLUMNS \
-                 WHERE TABLE_SCHEMA = $1 AND TABLE_NAME = $2 \
-                 ORDER BY ORDINAL_POSITION",
-                "p1",
-                "p2",
-            ),
-            _ => (
-                "SELECT TABLE_SCHEMA, COLUMN_NAME, SPANNER_TYPE, IS_GENERATED \
-                 FROM INFORMATION_SCHEMA.COLUMNS \
-                 WHERE TABLE_SCHEMA = @schema AND TABLE_NAME = @table \
-                 ORDER BY ORDINAL_POSITION",
-                "schema",
-                "table",
-            ),
-        };
-        let mut stmt = Statement::new(sql);
-        stmt.add_param(schema_param, &schema_name.to_string());
-        stmt.add_param(table_param, &table_name.to_string());
-        stmt
+        schema_name
+    }
+}
+
+fn default_schema_for_dialect(dialect: DatabaseDialect) -> &'static str {
+    match dialect {
+        DatabaseDialect::Postgresql => "public",
+        _ => "",
     }
 }
 
@@ -382,6 +383,43 @@ mod tests {
         assert_eq!(
             split_schema_table("myschema.MyTable"),
             ("myschema", "MyTable")
+        );
+    }
+
+    #[test]
+    fn build_columns_query_uses_dialect_default_schema_for_bare_names() {
+        let (gsql_sql, gsql_schema_param, gsql_table_param) =
+            columns_query_template(DatabaseDialect::GoogleStandardSql);
+        assert!(gsql_sql.contains("TABLE_SCHEMA = @schema"));
+        assert!(!gsql_sql.contains("TABLE_SCHEMA IN"));
+        assert_eq!(gsql_schema_param, "schema");
+        assert_eq!(gsql_table_param, "table");
+        assert_eq!(
+            schema_value_for_table(DatabaseDialect::GoogleStandardSql, ""),
+            ""
+        );
+
+        let (pg_sql, pg_schema_param, pg_table_param) =
+            columns_query_template(DatabaseDialect::Postgresql);
+        assert!(pg_sql.contains("TABLE_SCHEMA = $1"));
+        assert!(!pg_sql.contains("TABLE_SCHEMA IN"));
+        assert_eq!(pg_schema_param, "p1");
+        assert_eq!(pg_table_param, "p2");
+        assert_eq!(
+            schema_value_for_table(DatabaseDialect::Postgresql, ""),
+            "public"
+        );
+    }
+
+    #[test]
+    fn build_columns_query_keeps_qualified_schema_exact() {
+        assert_eq!(
+            schema_value_for_table(DatabaseDialect::GoogleStandardSql, "public"),
+            "public"
+        );
+        assert_eq!(
+            schema_value_for_table(DatabaseDialect::Postgresql, "custom"),
+            "custom"
         );
     }
 
