@@ -99,9 +99,7 @@ jobs:
       reduced_ci_mode: ${{ needs.changes.outputs.reduced_ci_mode }}
       run_disk_clean_step: ${{ github.event_name != 'pull_request' }}
       # musl: not targeted; wasm: extension uses tokio+gRPC+rustls (not wasm-compatible).
-      # windows_amd64_mingw: aws-lc-sys (via rustls TLS stack) fails to link on MinGW; see #38.
-      # The MSVC windows_amd64 build covers Windows.
-      exclude_archs: 'linux_amd64_musl;wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw'
+      exclude_archs: 'linux_amd64_musl;wasm_mvp;wasm_eh;wasm_threads'
       # macOS/windows runners lack a Spanner emulator; tests run in emulator-tests below.
       skip_tests: true
 
