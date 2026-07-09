@@ -3,15 +3,15 @@ use std::sync::{Arc, Mutex};
 
 use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
-use google_cloud_googleapis::spanner::v1::request_options::Priority;
-use google_cloud_googleapis::spanner::v1::PartitionOptions;
-use google_cloud_spanner::key;
-use google_cloud_spanner::reader::RowIterator;
-use google_cloud_spanner::row::Row;
-use google_cloud_spanner::transaction::{CallOptions, ReadOptions};
+use google_cloud_spanner::client::DatabaseClient;
+use google_cloud_spanner::key::KeySet;
+use google_cloud_spanner::model::request_options::Priority;
+use google_cloud_spanner::model::PartitionOptions;
+use google_cloud_spanner::read::ReadRequest;
+use google_cloud_spanner::result::Row;
 use tokio::sync::mpsc;
 
-use google_cloud_googleapis::spanner::admin::database::v1::DatabaseDialect;
+use google_cloud_spanner_admin_database_v1::model::DatabaseDialect;
 
 use crate::error::SpannerError;
 use crate::schema::ColumnInfo;
@@ -73,8 +73,14 @@ impl VTab for SpannerScanVTab {
         // If not, auto-detects via INFORMATION_SCHEMA.SCHEMATA (one extra round-trip).
         let columns = runtime::block_on(async {
             let client = client::get_or_create_client(&database, endpoint.as_deref()).await?;
-            schema::discover_table_schema(&client, &table, dialect, &database, endpoint.as_deref())
-                .await
+            schema::discover_table_schema(
+                &client,
+                &table,
+                dialect.clone(),
+                &database,
+                endpoint.as_deref(),
+            )
+            .await
         })??;
 
         // Register output columns with DuckDB
@@ -125,7 +131,7 @@ impl VTab for SpannerScanVTab {
         let use_data_boost = bind_data.use_data_boost;
         let max_parallelism = bind_data.max_parallelism;
         let timestamp_bound = bind_data.timestamp_bound.clone();
-        let priority = bind_data.priority;
+        let priority = bind_data.priority.clone();
 
         runtime::spawn(async move {
             let rows_delivered = Arc::new(AtomicBool::new(false));
@@ -138,10 +144,7 @@ impl VTab for SpannerScanVTab {
 
                 if use_parallelism {
                     let partition_options =
-                        max_parallelism.map(|max| PartitionOptions {
-                            max_partitions: max,
-                            ..Default::default()
-                        });
+                        max_parallelism.map(|max| PartitionOptions::default().set_max_partitions(max));
 
                     match stream_partitioned_read(
                         &client,
@@ -150,7 +153,7 @@ impl VTab for SpannerScanVTab {
                         &col_refs,
                         &index,
                         timestamp_bound.as_ref(),
-                        priority,
+                        priority.clone(),
                         use_data_boost,
                         partition_options,
                         rows_delivered.clone(),
@@ -172,7 +175,7 @@ impl VTab for SpannerScanVTab {
                     &col_refs,
                     &index,
                     timestamp_bound.as_ref(),
-                    priority,
+                    priority.clone(),
                 )
                 .await
             }
@@ -319,7 +322,7 @@ impl VTab for SpannerScanVTab {
 
 #[allow(clippy::too_many_arguments)]
 async fn stream_partitioned_read(
-    client: &google_cloud_spanner::client::Client,
+    client: &DatabaseClient,
     tx: &mpsc::Sender<Result<Row, SpannerError>>,
     table: &str,
     column_names: &[&str],
@@ -330,42 +333,16 @@ async fn stream_partitioned_read(
     partition_options: Option<PartitionOptions>,
     rows_delivered: Arc<AtomicBool>,
 ) -> Result<(), SpannerError> {
-    let call_options = CallOptions {
-        priority,
-        ..Default::default()
-    };
+    let mut batch_tx = client.batch_read_only_transaction();
+    if let Some(tb) = timestamp_bound {
+        batch_tx = batch_tx.set_timestamp_bound(tb.to_timestamp_bound());
+    }
+    let batch_tx = batch_tx.build().await?;
 
-    let mut batch_tx = if let Some(tb) = timestamp_bound {
-        client
-            .batch_read_only_transaction_with_option(
-                google_cloud_spanner::client::ReadOnlyTransactionOption {
-                    timestamp_bound: tb.to_timestamp_bound(),
-                    call_options: call_options.clone(),
-                },
-            )
-            .await?
-    } else {
-        client.batch_read_only_transaction().await?
-    };
-
-    let read_options = ReadOptions {
-        index: index.to_string(),
-        call_options,
-        ..Default::default()
-    };
-
+    let read = build_read_request(table, column_names, index, priority);
     let partitions = batch_tx
-        .partition_read_with_option(
-            table,
-            column_names,
-            key::all_keys(),
-            partition_options,
-            read_options,
-            data_boost_enabled,
-            None,
-        )
-        .await
-        .map_err(SpannerError::Grpc)?;
+        .partition_read(read, partition_options.unwrap_or_default())
+        .await?;
 
     // Execute partitions concurrently, each with its own session from the pool.
     // Partitions embed the transaction selector, so any session can execute them
@@ -385,14 +362,11 @@ async fn stream_partitioned_read(
                 .acquire()
                 .await
                 .map_err(|e| SpannerError::Other(format!("Semaphore closed: {e}")))?;
-            let mut session = client
-                .get_session()
-                .await
-                .map_err(|e| SpannerError::Other(e.to_string()))?;
-            let mut iter = RowIterator::new(&mut *session, partition.reader, None, false)
-                .await
-                .map_err(SpannerError::Grpc)?;
-            while let Some(row) = iter.next().await.map_err(SpannerError::Grpc)? {
+            let mut iter = partition
+                .set_data_boost(data_boost_enabled)
+                .execute(&client)
+                .await?;
+            while let Some(row) = iter.next().await.transpose()? {
                 rows_delivered.store(true, Ordering::SeqCst);
                 if tx.send(Ok(row)).await.is_err() {
                     return Ok(()); // receiver dropped
@@ -413,7 +387,7 @@ async fn stream_partitioned_read(
 }
 
 async fn stream_single_read(
-    client: &google_cloud_spanner::client::Client,
+    client: &DatabaseClient,
     tx: &mpsc::Sender<Result<Row, SpannerError>>,
     table: &str,
     column_names: &[&str],
@@ -421,34 +395,40 @@ async fn stream_single_read(
     timestamp_bound: Option<&crate::bind_utils::TimestampBoundConfig>,
     priority: Option<Priority>,
 ) -> Result<(), SpannerError> {
-    let mut spanner_tx = if let Some(tb) = timestamp_bound {
-        client
-            .single_with_timestamp_bound(tb.to_timestamp_bound())
-            .await?
-    } else {
-        client.single().await?
-    };
+    let mut spanner_tx = client.single_use();
+    if let Some(tb) = timestamp_bound {
+        spanner_tx = spanner_tx.set_timestamp_bound(tb.to_timestamp_bound());
+    }
+    let spanner_tx = spanner_tx.build();
 
-    let read_options = ReadOptions {
-        index: index.to_string(),
-        call_options: CallOptions {
-            priority,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
+    let read = build_read_request(table, column_names, index, priority);
+    let mut iter = spanner_tx.execute_read(read).await?;
 
-    let mut iter = spanner_tx
-        .read_with_option(table, column_names, key::all_keys(), read_options)
-        .await
-        .map_err(SpannerError::Grpc)?;
-
-    while let Some(row) = iter.next().await.map_err(SpannerError::Grpc)? {
+    while let Some(row) = iter.next().await.transpose()? {
         if tx.send(Ok(row)).await.is_err() {
             return Ok(()); // receiver dropped
         }
     }
     Ok(())
+}
+
+fn build_read_request(
+    table: &str,
+    column_names: &[&str],
+    index: &str,
+    priority: Option<Priority>,
+) -> ReadRequest {
+    let columns = column_names.iter().copied();
+    let builder = ReadRequest::builder(table, columns);
+    let mut builder = if index.is_empty() {
+        builder.with_keys(KeySet::all())
+    } else {
+        builder.with_index(index, KeySet::all())
+    };
+    if let Some(priority) = priority {
+        builder = builder.set_priority(priority);
+    }
+    builder.build()
 }
 
 // ─── Projected Row Writing ──────────────────────────────────────────────────

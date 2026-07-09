@@ -20,11 +20,10 @@ use std::ffi::{c_void, CStr, CString};
 use std::sync::Arc;
 
 use duckdb::ffi;
-use google_cloud_googleapis::spanner::admin::database::v1::DatabaseDialect;
-use google_cloud_googleapis::spanner::v1::mutation;
-use google_cloud_googleapis::spanner::v1::Mutation;
-use google_cloud_googleapis::spanner::v1::Type;
-use google_cloud_spanner::client::Client;
+use google_cloud_spanner::client::DatabaseClient;
+use google_cloud_spanner::mutation::Mutation;
+use google_cloud_spanner::types::{Type, TypeCode};
+use google_cloud_spanner_admin_database_v1::model::DatabaseDialect;
 use prost_types::value::Kind;
 use prost_types::{ListValue, Value};
 
@@ -74,7 +73,7 @@ struct ColumnMeta {
     /// Field metadata for DuckDB STRUCT columns.
     struct_fields: Vec<StructFieldMeta>,
     /// Target Spanner column type code (populated during GlobalInit).
-    spanner_type_code: i32,
+    spanner_type_code: TypeCode,
 }
 
 #[derive(Clone)]
@@ -101,13 +100,13 @@ struct CopyExtraInfo {
 
 /// Global state created during init and shared across sink calls.
 struct CopyGlobalState {
-    client: Arc<Client>,
+    client: Arc<DatabaseClient>,
     table_name: String,
     column_names: Vec<String>,
     mode: MutationMode,
     batch_size: usize,
     columns: Vec<ColumnMeta>,
-    buffer: Vec<ListValue>,
+    buffer: Vec<Mutation>,
     rows_written: u64,
 }
 
@@ -376,7 +375,12 @@ unsafe fn copy_sink_inner(
             let val = read_duckdb_value(vectors[col_idx], row_idx, &state.columns[col_idx])?;
             values.push(val);
         }
-        state.buffer.push(ListValue { values });
+        state.buffer.push(build_mutation(
+            state.mode,
+            &state.table_name,
+            &state.column_names,
+            values,
+        ));
 
         if state.buffer.len() >= state.batch_size {
             flush_buffer(state)?;
@@ -466,22 +470,20 @@ unsafe fn column_meta_from_logical_type(
         array_size,
         child,
         struct_fields,
-        spanner_type_code: 0,
+        spanner_type_code: TypeCode::Unspecified,
     })
 }
 
 fn apply_spanner_type(col: &mut ColumnMeta, spanner_type: &Type) -> Result<(), String> {
-    use google_cloud_googleapis::spanner::v1::TypeCode;
-
-    col.spanner_type_code = spanner_type.code;
+    col.spanner_type_code = spanner_type.code();
     let source_is_array = col.type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST
         || col.type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_ARRAY;
 
     if source_is_array {
-        if spanner_type.code != TypeCode::Array as i32 {
+        if spanner_type.code() != TypeCode::Array {
             return Err(format!(
-                "DuckDB LIST/ARRAY source column requires a Spanner ARRAY target, got TypeCode {}",
-                spanner_type.code
+                "DuckDB LIST/ARRAY source column requires a Spanner ARRAY target, got TypeCode {:?}",
+                spanner_type.code()
             ));
         }
 
@@ -489,18 +491,15 @@ fn apply_spanner_type(col: &mut ColumnMeta, spanner_type: &Type) -> Result<(), S
             "DuckDB LIST/ARRAY source column is missing child metadata".to_string()
         })?;
         let elem_type = spanner_type
-            .array_element_type
-            .as_deref()
+            .array_element_type()
             .ok_or_else(|| "Spanner ARRAY target is missing element type metadata".to_string())?;
-        apply_spanner_type(child, elem_type)?;
+        apply_spanner_type(child, &elem_type)?;
     }
 
-    if col.type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_STRUCT
-        && spanner_type.code != TypeCode::Json as i32
-    {
+    if col.type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_STRUCT && spanner_type.code() != TypeCode::Json {
         return Err(format!(
-            "DuckDB STRUCT source column requires a Spanner JSON target, got TypeCode {}",
-            spanner_type.code
+            "DuckDB STRUCT source column requires a Spanner JSON target, got TypeCode {:?}",
+            spanner_type.code()
         ));
     }
 
@@ -780,13 +779,18 @@ fn flush_buffer(state: &mut CopyGlobalState) -> Result<(), String> {
         return Ok(());
     }
 
-    let rows = std::mem::take(&mut state.buffer);
-    let count = rows.len();
-    let mutation = build_mutation(state.mode, &state.table_name, &state.column_names, rows);
+    let mutations = std::mem::take(&mut state.buffer);
+    let count = mutations.len();
 
-    let result = runtime::block_on(state.client.apply(vec![mutation]))
-        .map_err(|e| format!("Runtime error: {e}"))?;
-    result.map_err(|e| format!("Spanner apply error: {e}"))?;
+    let result = runtime::block_on(
+        state
+            .client
+            .write_only_transaction()
+            .build()
+            .write(mutations),
+    )
+    .map_err(|e| format!("Runtime error: {e}"))?;
+    result.map_err(|e| format!("Spanner write error: {e}"))?;
 
     state.rows_written += count as u64;
     Ok(())
@@ -796,24 +800,19 @@ fn build_mutation(
     mode: MutationMode,
     table: &str,
     columns: &[String],
-    rows: Vec<ListValue>,
+    values: Vec<Value>,
 ) -> Mutation {
-    let write = mutation::Write {
-        table: table.to_string(),
-        columns: columns.to_vec(),
-        values: rows,
+    let mut builder = match mode {
+        MutationMode::Insert => Mutation::new_insert_builder(table),
+        MutationMode::Update => Mutation::new_update_builder(table),
+        MutationMode::InsertOrUpdate => Mutation::new_insert_or_update_builder(table),
+        MutationMode::Replace => Mutation::new_replace_builder(table),
     };
 
-    let operation = match mode {
-        MutationMode::Insert => mutation::Operation::Insert(write),
-        MutationMode::Update => mutation::Operation::Update(write),
-        MutationMode::InsertOrUpdate => mutation::Operation::InsertOrUpdate(write),
-        MutationMode::Replace => mutation::Operation::Replace(write),
-    };
-
-    Mutation {
-        operation: Some(operation),
+    for (column, value) in columns.iter().zip(values.iter()) {
+        builder = builder.set(column.as_str()).to(value);
     }
+    builder.build()
 }
 
 // ─── DuckDB vector → Spanner proto Value conversion ─────────────────────────
@@ -945,9 +944,8 @@ unsafe fn read_duckdb_value(
             let raw_i128 = read_decimal_raw(data, row_idx, col.decimal_internal_type);
             // If the target Spanner column is FLOAT64 or FLOAT32, convert to NumberValue.
             // Spanner FLOAT64 rejects StringValue (except for NaN/Infinity).
-            use google_cloud_googleapis::spanner::v1::TypeCode;
-            if col.spanner_type_code == TypeCode::Float64 as i32
-                || col.spanner_type_code == TypeCode::Float32 as i32
+            if col.spanner_type_code == TypeCode::Float64
+                || col.spanner_type_code == TypeCode::Float32
             {
                 let s = decimal_i128_to_string(raw_i128, col.decimal_scale);
                 let f: f64 = s
@@ -1311,15 +1309,12 @@ unsafe extern "C" fn drop_box<T>(ptr: *mut c_void) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use google_cloud_googleapis::spanner::v1::{Type, TypeCode};
+    use google_cloud_spanner::types as spanner_types;
 
     fn col(name: &str, is_generated: bool) -> schema::ColumnInfo {
         schema::ColumnInfo {
             name: name.to_string(),
-            spanner_type: Type {
-                code: TypeCode::Int64 as i32,
-                ..Default::default()
-            },
+            spanner_type: spanner_types::int64(),
             is_generated,
         }
     }

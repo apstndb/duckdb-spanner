@@ -6,10 +6,12 @@ use duckdb::Connection;
 use duckdb_spanner::{
     register_c_api_extensions, register_copy_function, register_extension_functions,
 };
-use google_cloud_gax::conn::Environment;
-use google_cloud_googleapis::spanner::admin::database::v1::DatabaseDialect;
-use google_cloud_spanner::client::{Client, ClientConfig};
+use google_cloud_auth::credentials::anonymous::Builder as Anonymous;
+use google_cloud_spanner::client::{DatabaseClient, Spanner};
+use google_cloud_spanner::result::Row as SpannerRow;
 use google_cloud_spanner::statement::Statement;
+use google_cloud_spanner::value::FromValue;
+use google_cloud_spanner_admin_database_v1::model::DatabaseDialect;
 use tokio::runtime::Runtime;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -132,32 +134,59 @@ fn get_gsql_ddl_db() -> &'static spanemuboost::SpanEmuDatabase {
     })
 }
 
+async fn database_client_for(db: &spanemuboost::SpanEmuDatabase) -> DatabaseClient {
+    let spanner = Spanner::builder()
+        .with_endpoint(format!("http://{}", db.emulator_host()))
+        .with_credentials(Anonymous::new().build())
+        .build()
+        .await
+        .unwrap();
+    spanner
+        .database_client(db.database_path())
+        .build()
+        .await
+        .unwrap()
+}
+
+trait RowColumnExt {
+    fn column<T: FromValue>(&self, idx: usize) -> google_cloud_spanner::Result<T>;
+}
+
+impl RowColumnExt for SpannerRow {
+    fn column<T: FromValue>(&self, idx: usize) -> google_cloud_spanner::Result<T> {
+        self.try_get(idx)
+    }
+}
+
+fn numeric_column(row: &SpannerRow, idx: usize) -> bigdecimal::BigDecimal {
+    row.raw_values()
+        .get(idx)
+        .and_then(|value| value.try_as_string())
+        .expect("NUMERIC value should be encoded as string")
+        .parse()
+        .expect("valid NUMERIC decimal")
+}
+
 /// Get a shared Spanner data client connected to the GoogleSQL read database.
-fn spanner_client() -> Arc<Client> {
-    static CLIENT: OnceLock<Arc<Client>> = OnceLock::new();
+fn spanner_client() -> Arc<DatabaseClient> {
+    static CLIENT: OnceLock<Arc<DatabaseClient>> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
             let db = get_gsql_db();
-            test_runtime().block_on(async {
-                let config = ClientConfig {
-                    environment: Environment::Emulator(db.emulator_host().to_string()),
-                    ..Default::default()
-                };
-                Arc::new(Client::new(db.database_path(), config).await.unwrap())
-            })
+            test_runtime().block_on(async { Arc::new(database_client_for(db).await) })
         })
         .clone()
 }
 
 /// Execute a Spanner SQL query and return all rows.
-fn exec_spanner(sql: &str) -> Vec<google_cloud_spanner::row::Row> {
+fn exec_spanner(sql: &str) -> Vec<SpannerRow> {
     let client = spanner_client();
     test_runtime().block_on(async {
-        let mut tx = client.single().await.unwrap();
-        let stmt = Statement::new(sql);
-        let mut iter = tx.query(stmt).await.unwrap();
+        let tx = client.single_use().build();
+        let stmt = Statement::builder(sql).build();
+        let mut iter = tx.execute_query(stmt).await.unwrap();
         let mut rows = Vec::new();
-        while let Some(row) = iter.next().await.unwrap() {
+        while let Some(row) = iter.next().await.transpose().unwrap() {
             rows.push(row);
         }
         rows
@@ -165,7 +194,7 @@ fn exec_spanner(sql: &str) -> Vec<google_cloud_spanner::row::Row> {
 }
 
 /// Execute a Spanner SQL query expecting exactly one row.
-fn exec_spanner_one(sql: &str) -> google_cloud_spanner::row::Row {
+fn exec_spanner_one(sql: &str) -> SpannerRow {
     let rows = exec_spanner(sql);
     assert_eq!(
         rows.len(),
@@ -176,21 +205,14 @@ fn exec_spanner_one(sql: &str) -> google_cloud_spanner::row::Row {
     rows.into_iter().next().unwrap()
 }
 
-fn exec_spanner_on(
-    db: &spanemuboost::SpanEmuDatabase,
-    sql: &str,
-) -> Vec<google_cloud_spanner::row::Row> {
+fn exec_spanner_on(db: &spanemuboost::SpanEmuDatabase, sql: &str) -> Vec<SpannerRow> {
     test_runtime().block_on(async {
-        let config = ClientConfig {
-            environment: Environment::Emulator(db.emulator_host().to_string()),
-            ..Default::default()
-        };
-        let client = Client::new(db.database_path(), config).await.unwrap();
-        let mut tx = client.single().await.unwrap();
-        let stmt = Statement::new(sql);
-        let mut iter = tx.query(stmt).await.unwrap();
+        let client = database_client_for(db).await;
+        let tx = client.single_use().build();
+        let stmt = Statement::builder(sql).build();
+        let mut iter = tx.execute_query(stmt).await.unwrap();
         let mut rows = Vec::new();
-        while let Some(row) = iter.next().await.unwrap() {
+        while let Some(row) = iter.next().await.transpose().unwrap() {
             rows.push(row);
         }
         rows
@@ -367,12 +389,12 @@ fn test_spanner_timestamp() {
 #[test]
 fn test_spanner_numeric() {
     let row = exec_spanner_one("SELECT NUMERIC '123.456789' AS col");
-    let bd = row.column::<bigdecimal::BigDecimal>(0).unwrap();
+    let bd = numeric_column(&row, 0);
     let expected: bigdecimal::BigDecimal = "123.456789".parse().unwrap();
     assert_eq!(bd, expected);
 
     let row = exec_spanner_one("SELECT NUMERIC '-99999.999999999' AS col");
-    let bd = row.column::<bigdecimal::BigDecimal>(0).unwrap();
+    let bd = numeric_column(&row, 0);
     let expected: bigdecimal::BigDecimal = "-99999.999999999".parse().unwrap();
     assert_eq!(bd, expected);
 }
@@ -526,7 +548,7 @@ fn test_spanner_table_date_timestamp() {
 #[test]
 fn test_spanner_table_numeric_json() {
     let row = exec_spanner_one("SELECT NumCol, JsonCol FROM NumericTypes WHERE Id = 1");
-    let bd = row.column::<bigdecimal::BigDecimal>(0).unwrap();
+    let bd = numeric_column(&row, 0);
     let expected: bigdecimal::BigDecimal = "123.456789".parse().unwrap();
     assert_eq!(bd, expected);
     let json = row.column::<String>(1).unwrap();
@@ -901,15 +923,16 @@ fn test_vtab_scan_exact_staleness() {
 fn test_spanner_query_params() {
     let client = spanner_client();
     let rows = test_runtime().block_on(async {
-        let mut tx = client.single().await.unwrap();
-        let mut stmt = Statement::new(
+        let tx = client.single_use().build();
+        let stmt = Statement::builder(
             "SELECT Id, StringCol FROM ScalarTypes WHERE Id = @id AND StringCol = @name",
-        );
-        stmt.add_param("id", &1_i64);
-        stmt.add_param("name", &"hello".to_string());
-        let mut iter = tx.query(stmt).await.unwrap();
+        )
+        .add_param("id", &1_i64)
+        .add_param("name", &"hello".to_string())
+        .build();
+        let mut iter = tx.execute_query(stmt).await.unwrap();
         let mut rows = Vec::new();
-        while let Some(row) = iter.next().await.unwrap() {
+        while let Some(row) = iter.next().await.transpose().unwrap() {
             rows.push(row);
         }
         rows

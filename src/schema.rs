@@ -1,12 +1,11 @@
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 
-use google_cloud_googleapis::spanner::admin::database::v1::DatabaseDialect;
-use google_cloud_googleapis::spanner::v1::execute_sql_request::QueryMode;
-use google_cloud_googleapis::spanner::v1::Type;
-use google_cloud_spanner::client::Client;
+use google_cloud_spanner::client::DatabaseClient;
+use google_cloud_spanner::model::execute_sql_request::QueryMode;
 use google_cloud_spanner::statement::Statement;
-use google_cloud_spanner::transaction::QueryOptions;
+use google_cloud_spanner::types::Type;
+use google_cloud_spanner_admin_database_v1::model::DatabaseDialect;
 
 use crate::error::SpannerError;
 use crate::types;
@@ -66,7 +65,7 @@ pub fn parse_dialect(s: &str) -> Result<DatabaseDialect, Box<dyn std::error::Err
 /// since callers such as `spanner_scan` and `COPY TO ... (FORMAT spanner)`
 /// invoke this on every bind.
 pub async fn detect_dialect(
-    client: &Client,
+    client: &DatabaseClient,
     database: &str,
     endpoint: Option<&str>,
 ) -> Result<DatabaseDialect, SpannerError> {
@@ -77,7 +76,7 @@ pub async fn detect_dialect(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&key)
-        .copied();
+        .cloned();
     if let Some(dialect) = cached {
         return Ok(dialect);
     }
@@ -90,7 +89,7 @@ pub async fn detect_dialect(
             DIALECT_CACHE
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(key, dialect);
+                .insert(key, dialect.clone());
             Ok(dialect)
         }
         Err(e) => {
@@ -111,17 +110,18 @@ pub async fn detect_dialect(
 
 /// Query `INFORMATION_SCHEMA.DATABASE_OPTIONS` for the `database_dialect` option.
 async fn detect_dialect_via_database_options(
-    client: &Client,
+    client: &DatabaseClient,
 ) -> Result<DatabaseDialect, SpannerError> {
-    let stmt = Statement::new(
+    let stmt = Statement::builder(
         "SELECT OPTION_VALUE FROM INFORMATION_SCHEMA.DATABASE_OPTIONS \
          WHERE OPTION_NAME = 'database_dialect'",
-    );
-    let mut tx = client.single().await?;
-    let mut iter = tx.query(stmt).await.map_err(SpannerError::Grpc)?;
-    match iter.next().await.map_err(SpannerError::Grpc)? {
+    )
+    .build();
+    let tx = client.single_use().build();
+    let mut iter = tx.execute_query(stmt).await?;
+    match iter.next().await.transpose()? {
         Some(row) => {
-            let value: String = row.column(0)?;
+            let value: String = row.try_get(0)?;
             parse_database_dialect_option(&value)
         }
         None => Err(SpannerError::Other(
@@ -151,14 +151,15 @@ fn parse_database_dialect_option(value: &str) -> Result<DatabaseDialect, Spanner
 /// this misdetects -- see `detect_dialect_via_database_options` above, which
 /// is tried first).
 async fn detect_dialect_via_public_schema(
-    client: &Client,
+    client: &DatabaseClient,
 ) -> Result<DatabaseDialect, SpannerError> {
-    let stmt = Statement::new(
+    let stmt = Statement::builder(
         "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = 'public'",
-    );
-    let mut tx = client.single().await?;
-    let mut iter = tx.query(stmt).await.map_err(SpannerError::Grpc)?;
-    if iter.next().await.map_err(SpannerError::Grpc)?.is_some() {
+    )
+    .build();
+    let tx = client.single_use().build();
+    let mut iter = tx.execute_query(stmt).await?;
+    if iter.next().await.transpose()?.is_some() {
         Ok(DatabaseDialect::Postgresql)
     } else {
         Ok(DatabaseDialect::GoogleStandardSql)
@@ -167,33 +168,33 @@ async fn detect_dialect_via_public_schema(
 
 /// Discover the output schema of a SQL query using Plan mode.
 pub async fn discover_query_schema(
-    client: &Client,
+    client: &DatabaseClient,
     sql: &str,
     params_json: Option<&str>,
 ) -> Result<Vec<ColumnInfo>, SpannerError> {
-    let mut tx = client.single().await?;
-    let stmt = crate::params::create_statement(sql, params_json)?;
-    let options = QueryOptions {
-        mode: QueryMode::Plan,
-        ..Default::default()
-    };
-    let mut iter = tx.query_with_option(stmt, options).await?;
+    let tx = client.single_use().build();
+    let stmt = crate::params::create_statement(sql, params_json)?.set_query_mode(QueryMode::Plan);
+    let mut iter = tx.execute_query(stmt).await?;
 
     // Consume the iterator to ensure metadata is fully populated
-    while let Some(_row) = iter.next().await.map_err(SpannerError::Grpc)? {}
+    while let Some(_row) = iter.next().await.transpose()? {}
 
-    let metadata = iter.columns_metadata();
-    if metadata.is_empty() {
+    let metadata = iter.metadata().ok_or_else(|| {
+        SpannerError::Other(format!("No column metadata returned for query: {sql}"))
+    })?;
+    if metadata.column_names().is_empty() {
         return Err(SpannerError::Other(format!(
             "No column metadata returned for query: {sql}"
         )));
     }
 
     let columns = metadata
+        .column_names()
         .iter()
-        .map(|field| ColumnInfo {
-            name: field.name.clone(),
-            spanner_type: field.r#type.clone().unwrap_or_default(),
+        .zip(metadata.column_types().iter())
+        .map(|(name, spanner_type)| ColumnInfo {
+            name: name.clone(),
+            spanner_type: spanner_type.clone(),
             // Query result columns are never "generated" in the write sense.
             is_generated: false,
         })
@@ -212,7 +213,7 @@ pub async fn discover_query_schema(
 /// - `"MyTable"` — resolves to the default schema ('' for GoogleSQL, 'public' for PG)
 /// - `"myschema.MyTable"` — resolves to named schema `myschema`
 pub async fn discover_table_schema(
-    client: &Client,
+    client: &DatabaseClient,
     table: &str,
     dialect: DatabaseDialect,
     database: &str,
@@ -226,16 +227,16 @@ pub async fn discover_table_schema(
 
     let (schema_name, table_name) = split_schema_table(table);
 
-    let mut tx = client.single().await?;
-    let stmt = build_columns_query(dialect, schema_name, table_name);
-    let mut iter = tx.query(stmt).await.map_err(SpannerError::Grpc)?;
+    let stmt = build_columns_query(dialect.clone(), schema_name, table_name);
+    let tx = client.single_use().build();
+    let mut iter = tx.execute_query(stmt).await?;
 
     let mut columns = Vec::new();
-    while let Some(row) = iter.next().await.map_err(SpannerError::Grpc)? {
-        let _table_schema: String = row.column(0)?;
-        let name: String = row.column(1)?;
-        let spanner_type_str: String = row.column(2)?;
-        let is_generated_str: String = row.column(3)?;
+    while let Some(row) = iter.next().await.transpose()? {
+        let _table_schema: String = row.try_get(0)?;
+        let name: String = row.try_get(1)?;
+        let spanner_type_str: String = row.try_get(2)?;
+        let is_generated_str: String = row.try_get(3)?;
 
         // Use the detected database dialect, not TABLE_SCHEMA (PG tables in named
         // schemas such as myschema.Users still use PostgreSQL type strings).
@@ -275,12 +276,12 @@ pub async fn discover_table_schema(
 ///
 /// GoogleSQL uses `@param`; PostgreSQL uses `$N` with param names `pN`.
 fn build_columns_query(dialect: DatabaseDialect, schema_name: &str, table_name: &str) -> Statement {
-    let (sql, schema_param, table_param) = columns_query_template(dialect);
+    let (sql, schema_param, table_param) = columns_query_template(dialect.clone());
     let schema_value = schema_value_for_table(dialect, schema_name).to_string();
-    let mut stmt = Statement::new(sql);
-    stmt.add_param(schema_param, &schema_value);
-    stmt.add_param(table_param, &table_name.to_string());
-    stmt
+    Statement::builder(sql)
+        .add_param(schema_param, &schema_value)
+        .add_param(table_param, &table_name.to_string())
+        .build()
 }
 
 fn columns_query_template(dialect: DatabaseDialect) -> (&'static str, &'static str, &'static str) {

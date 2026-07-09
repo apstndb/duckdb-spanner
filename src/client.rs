@@ -4,8 +4,8 @@ use std::hash::Hash;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use google_cloud_gax::conn::Environment;
-use google_cloud_spanner::client::{Client, ClientConfig};
+use google_cloud_auth::credentials::anonymous::Builder as Anonymous;
+use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use tokio::sync::OnceCell;
 
 use crate::error::SpannerError;
@@ -13,15 +13,14 @@ use crate::runtime;
 
 /// Maximum number of Spanner clients kept alive at once. Connecting to more
 /// distinct `(database, endpoint)` targets than this evicts the least-recently
-/// used client (and closes it). A small fixed bound is fine: most processes talk
-/// to a handful of databases, and each client owns a session pool worth reclaiming.
+/// used client. A small fixed bound is fine: most processes talk to a handful
+/// of databases, and each client owns session maintenance state worth reclaiming.
 const CACHE_CAPACITY: usize = 8;
 
 /// How long an eviction task waits, per reclaim stage, for in-flight work to
-/// drop its references so the client can be closed by consuming sole ownership.
-/// This is a politeness grace period, not a deadline for closing: if it elapses
-/// while the client is still shared, the eviction task force-closes through a
-/// clone rather than leaking the client (see [`close_evicted`]).
+/// drop its references so the client can be reclaimed by consuming sole ownership.
+/// The official google-cloud-rust `DatabaseClient` has no public close method;
+/// dropping the final clone lets the weakly-held maintenance task exit.
 const EVICT_CLOSE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Poll interval used while waiting for an `Arc` to become uniquely owned.
@@ -103,7 +102,7 @@ impl<K: Eq + Hash + Clone, V: Clone> LruCache<K, V> {
 /// Each cache slot holds a shared [`OnceCell`] so that concurrent binds for the
 /// same key create the underlying [`Client`] exactly once (single-flight),
 /// instead of each racing bind building its own client and leaking sessions.
-type ClientSlot = Arc<OnceCell<Arc<Client>>>;
+type ClientSlot = Arc<OnceCell<Arc<DatabaseClient>>>;
 
 static CLIENT_CACHE: LazyLock<Mutex<LruCache<String, ClientSlot>>> =
     LazyLock::new(|| Mutex::new(LruCache::new(CACHE_CAPACITY)));
@@ -160,38 +159,21 @@ where
     }
 }
 
-/// Close an evicted client once nothing is using it anymore, or force it closed
-/// after a grace period if in-flight work overruns.
+/// Drop an evicted client once nothing is using it anymore.
 ///
 /// An evicted slot may still be referenced by a bind mid-`get_or_try_init`
 /// (holding an `Arc<OnceCell>` clone) or by in-flight queries (holding
-/// `Arc<Client>` clones), so we cannot close immediately. We wait a bounded
-/// grace period for those to drain, but do **not** give up if they overrun:
-/// a partitioned scan can stream for minutes and a COPY holds the client for the
-/// whole operation, and simply dropping the client would leak the fork's
-/// `SessionManager` background tasks and keep its pooled sessions alive
-/// server-side indefinitely. Instead [`close_when_reclaimed`] force-closes
-/// through a clone. Runs as a detached background task.
+/// `Arc<DatabaseClient>` clones), so we cannot reclaim immediately. We wait a
+/// bounded grace period for those to drain; if they overrun, dropping this
+/// eviction task's clone is still the only public lifecycle action available in
+/// the official client. Runs as a detached background task.
 async fn close_evicted(slot: ClientSlot, grace: Duration) {
-    // Stage 1: reclaim the client out of the slot's OnceCell.
-    let client = match take_when_unique(slot, grace).await {
-        // Sole owner: take the client out of the cell (if creation completed).
-        Reclaim::Sole(cell) => match cell.into_inner() {
-            Some(client) => client,
-            // Creation never completed (e.g. it errored) — nothing to close.
-            None => return,
-        },
-        // Still shared past the grace period (a bind is stuck awaiting creation):
-        // borrow a clone of the client so we can still force it closed.
-        Reclaim::StillShared(slot) => match slot.get() {
-            Some(client) => Arc::clone(client),
-            // Not yet initialized — nothing to close.
-            None => return,
-        },
+    match take_when_unique(slot, grace).await {
+        Reclaim::Sole(cell) => {
+            let _ = cell.into_inner();
+        }
+        Reclaim::StillShared(_) => {}
     };
-    // Stage 2: close the client, force-closing through a clone if in-flight
-    // queries still hold it past the grace period.
-    close_when_reclaimed(client, grace, |c| c.close()).await;
 }
 
 /// Build the cache key used to identify a `(database, endpoint)` pair.
@@ -217,7 +199,7 @@ pub fn cache_key(database: &str, endpoint: Option<&str>) -> String {
 pub async fn get_or_create_client(
     database: &str,
     endpoint: Option<&str>,
-) -> Result<Arc<Client>, SpannerError> {
+) -> Result<Arc<DatabaseClient>, SpannerError> {
     let cache_key = cache_key(database, endpoint);
 
     // Look up (or create) the slot for this key under the std mutex. The lock is
@@ -257,30 +239,25 @@ pub async fn get_or_create_client(
 async fn create_client(
     database: &str,
     endpoint: Option<&str>,
-) -> Result<Arc<Client>, SpannerError> {
-    let config = match endpoint {
-        Some(ep) => {
-            // Explicit endpoint: emulator mode (no auth, plain HTTP)
-            ClientConfig {
-                environment: Environment::Emulator(ep.to_string()),
-                ..Default::default()
-            }
-        }
-        None => {
-            // Default: respect SPANNER_EMULATOR_HOST env var, or use real auth
-            if std::env::var("SPANNER_EMULATOR_HOST").is_ok() {
-                ClientConfig::default()
-            } else {
-                ClientConfig::default()
-                    .with_auth()
-                    .await
-                    .map_err(|e| SpannerError::Other(format!("Auth error: {e}")))?
-            }
-        }
-    };
+) -> Result<Arc<DatabaseClient>, SpannerError> {
+    let mut builder = Spanner::builder();
+    if let Some(ep) = endpoint {
+        builder = builder
+            .with_endpoint(endpoint_url(ep))
+            .with_credentials(Anonymous::new().build());
+    }
 
-    let client = Client::new(database, config).await?;
+    let spanner = builder.build().await?;
+    let client = spanner.database_client(database).build().await?;
     Ok(Arc::new(client))
+}
+
+pub(crate) fn endpoint_url(endpoint: &str) -> String {
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint.to_string()
+    } else {
+        format!("http://{endpoint}")
+    }
 }
 
 #[cfg(test)]
