@@ -36,9 +36,9 @@ SELECT * FROM spanner_query_raw(
 );
 
 CREATE MACRO spanner_ddl(
-    sql,
+    sql := NULL,
     database_path := NULL, project := NULL, instance := NULL, database := NULL,
-    endpoint := NULL
+    endpoint := NULL, statements := NULL
 ) AS TABLE
 SELECT * FROM spanner_ddl_raw(
     sql,
@@ -46,13 +46,14 @@ SELECT * FROM spanner_ddl_raw(
     project := project,
     instance := instance,
     database := database,
-    endpoint := endpoint
+    endpoint := endpoint,
+    statements := statements
 );
 
 CREATE MACRO spanner_ddl_async(
-    sql,
+    sql := NULL,
     database_path := NULL, project := NULL, instance := NULL, database := NULL,
-    endpoint := NULL
+    endpoint := NULL, statements := NULL
 ) AS TABLE
 SELECT * FROM spanner_ddl_async_raw(
     sql,
@@ -60,7 +61,8 @@ SELECT * FROM spanner_ddl_async_raw(
     project := project,
     instance := instance,
     database := database,
-    endpoint := endpoint
+    endpoint := endpoint,
+    statements := statements
 );
 
 CREATE MACRO spanner_operations(
