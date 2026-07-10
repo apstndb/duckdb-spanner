@@ -26,9 +26,7 @@ On macOS with Colima, set `DOCKER_HOST=unix://$HOME/.colima/default/docker.sock`
 
 Tests live in `test/sql/` (SQLLogicTest format): `spanner_smoke.test`, `spanner_query.test`, `spanner_scan.test`, `spanner_scalars.test`, `spanner_params.test`, `spanner_tables.test`, `spanner_replacement_scan.test`, `spanner_ddl.test`, `spanner_copy.test`. The runner loads the built extension via `--external-extension build/release/spanner.duckdb_extension`. Use `require spanner` in tests to load it. Emulator tests use `SPANNER_EMULATOR_HOST` (default `localhost:9010`) and `SET allow_extensions_metadata_mismatch=true` when loading via `--external-extension`.
 
-**Run emulator-backed tests serially.** Only one of `make test_release` or `make test-integration` should hit the shared Spanner emulator at a time; concurrent runs cause flaky `Session not found` errors. For a clean slate: `make emulator-stop && make emulator-start`.
-
-Shell integration tests (`tests/integration.sh`) remain available as `make test-integration` (40 cases; requires Docker emulator).
+**Run emulator-backed tests serially.** Run only one `make test_release` invocation against the shared Spanner emulator at a time; concurrent runs cause flaky `Session not found` errors. For a clean slate: `make emulator-stop && make emulator-start`.
 
 ### Rust integration tests
 

@@ -1,4 +1,4 @@
-.PHONY: build build-sweep build-release extension duckdb emulator-start emulator-stop emulator-status test test_debug test_release test-integration clean sweep sweep-dry-run ensure-cargo-sweep configure debug release clean_all
+.PHONY: build build-sweep build-release extension duckdb emulator-start emulator-stop emulator-status test test_debug test_release clean sweep sweep-dry-run ensure-cargo-sweep configure debug release clean_all
 
 # Detect OS for library extension
 UNAME := $(shell uname)
@@ -84,10 +84,6 @@ emulator-status:
 test: test_release
 test_debug: test_extension_debug
 test_release: test_extension_release
-
-# Shell integration tests (requires Docker emulator)
-test-integration: extension
-	@bash tests/integration.sh "$$(pwd)/$(EXTENSION)"
 
 ensure-cargo-sweep:
 	@command -v cargo-sweep >/dev/null 2>&1 || { \
