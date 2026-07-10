@@ -66,10 +66,10 @@ check-google-cloud-rust:
 	bash scripts/check-google-cloud-rust.sh
 
 check-duckdb-version:
-	@$(DUCKDB_VERSION_CHECK) "$(DUCKDB_TARGET_VERSION)" "$(DUCKDB_VERSION_EFFECTIVE)" "$(DUCKDB_CLI_VERSION)"
+	@bash $(DUCKDB_VERSION_CHECK) "$(DUCKDB_TARGET_VERSION)" "$(DUCKDB_VERSION)" "$(DUCKDB_CLI_VERSION)"
 
 check-target-duckdb-version:
-	@$(DUCKDB_VERSION_CHECK) "$(DUCKDB_TARGET_VERSION)" "$(TARGET_DUCKDB_VERSION_INPUT)"
+	@bash $(DUCKDB_VERSION_CHECK) "$(DUCKDB_TARGET_VERSION)" "$(TARGET_DUCKDB_VERSION)"
 
 extension: build-release
 ifeq ($(strip $(EXT_VERSION)),)
