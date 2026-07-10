@@ -35,4 +35,7 @@ statement ok
 SELECT IF(table_type = 'VIEW' AND parent_table_name IS NULL, 1, error('expected filtered view metadata')) FROM spanner_tables(table_type := 'VIEW', table_name := 'ScalarTypesView');
 
 statement ok
+SELECT IF(table_type = 'VIEW', 1, error('expected case-insensitive table type filter')) FROM spanner_tables(table_type := 'view', table_name := 'ScalarTypesView');
+
+statement ok
 SELECT IF(parent_table_name = 'InterleavedParent', 1, error('expected interleaved parent')) FROM spanner_tables(table_name := 'InterleavedChild');

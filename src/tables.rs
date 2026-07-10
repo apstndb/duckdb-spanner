@@ -61,6 +61,7 @@ impl VTab for SpannerTablesVTab {
             // Preserve the original zero-argument behavior; callers opt into
             // views (or other INFORMATION_SCHEMA table types) explicitly.
             table_type: crate::bind_utils::get_named_string(bind, "table_type")
+                .map(|value| value.to_ascii_uppercase())
                 .unwrap_or_else(|| "BASE TABLE".to_string()),
             schema: crate::bind_utils::get_named_string(bind, "schema"),
             table_name: crate::bind_utils::get_named_string(bind, "table_name"),
