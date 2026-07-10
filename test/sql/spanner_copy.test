@@ -57,6 +57,11 @@ COPY (SELECT CAST(4.25 AS DOUBLE), CAST(903 AS BIGINT), 'reordered_columns') TO 
 statement ok
 SELECT IF(Name = 'reordered_columns' AND strpos(Value::VARCHAR, '4.25') > 0, 1, error('expected explicit reordered COPY columns')) FROM spanner_query('SELECT Name, Value FROM CopyTarget WHERE Id = 903');
 
+statement error
+COPY (SELECT CAST(904 AS BIGINT), 'empty_column_name', CAST(1.0 AS DOUBLE)) TO 'CopyTarget' (FORMAT spanner, columns ['Id', '', 'Value']);
+----
+must not contain empty column names
+
 # --- generated columns are excluded from the writable target list ---
 # CopyGenerated has a generated column (Doubled) sitting between the writable
 # columns (Id, Amount, Label). COPY must map the 3 source columns positionally

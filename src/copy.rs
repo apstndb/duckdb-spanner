@@ -669,7 +669,7 @@ unsafe fn extract_options(
                     let mut values = Vec::with_capacity(list_size as usize);
                     for index in 0..list_size {
                         let elem = ffi::duckdb_get_list_child(child_val, index);
-                        if let Some(s) = value_to_string(elem) {
+                        if let Some(s) = value_to_string_allow_empty(elem) {
                             values.push(s);
                         }
                         ffi::duckdb_destroy_value(&mut { elem });
@@ -709,6 +709,11 @@ fn option_value<'a>(
 
 /// Extract a string from a `duckdb_value`.
 unsafe fn value_to_string(val: ffi::duckdb_value) -> Option<String> {
+    value_to_string_allow_empty(val).filter(|s| !s.is_empty())
+}
+
+/// Extract a string while preserving empty values for list-valued options.
+unsafe fn value_to_string_allow_empty(val: ffi::duckdb_value) -> Option<String> {
     if val.is_null() || ffi::duckdb_is_null_value(val) {
         return None;
     }
@@ -718,11 +723,7 @@ unsafe fn value_to_string(val: ffi::duckdb_value) -> Option<String> {
     }
     let s = CStr::from_ptr(c_str).to_string_lossy().into_owned();
     ffi::duckdb_free(c_str as *mut _);
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    Some(s)
 }
 
 /// Resolve the Spanner database resource path from COPY options and config.
