@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -8,7 +7,9 @@ use google_cloud_auth::credentials::anonymous::Builder as Anonymous;
 use google_cloud_gax::paginator::ItemPaginator;
 use google_cloud_longrunning::model::{operation, Operation as InternalOperation};
 use google_cloud_spanner_admin_database_v1::client::DatabaseAdmin;
+use tokio::sync::OnceCell;
 
+use crate::cache::LruCache;
 use crate::error::SpannerError;
 use crate::{bind_utils, runtime};
 
@@ -16,8 +17,23 @@ use crate::{bind_utils, runtime};
 // Admin client cache
 // ---------------------------------------------------------------------------
 
-static ADMIN_CLIENT_CACHE: LazyLock<Mutex<HashMap<String, Arc<DatabaseAdmin>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Maximum number of admin client identities retained at once. The key is the
+/// same endpoint/auth identity used by the previous unbounded cache.
+const ADMIN_CACHE_CAPACITY: usize = 8;
+
+type CacheSlot<T> = Arc<OnceCell<Arc<T>>>;
+type AdminClientSlot = CacheSlot<DatabaseAdmin>;
+
+static ADMIN_CLIENT_CACHE: LazyLock<Mutex<LruCache<String, AdminClientSlot>>> =
+    LazyLock::new(|| Mutex::new(LruCache::new(ADMIN_CACHE_CAPACITY)));
+
+fn get_or_insert_cache_slot<T>(
+    cache: &Mutex<LruCache<String, CacheSlot<T>>>,
+    cache_key: String,
+) -> (CacheSlot<T>, Option<CacheSlot<T>>) {
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    cache.get_or_insert_with(cache_key, || Arc::new(OnceCell::new()))
+}
 
 /// Get or create a Spanner Admin client.
 ///
@@ -28,13 +44,30 @@ async fn get_or_create_admin_client(
 ) -> Result<Arc<DatabaseAdmin>, SpannerError> {
     let cache_key = admin_endpoint.unwrap_or("").to_string();
 
-    {
-        let cache = ADMIN_CLIENT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(client) = cache.get(&cache_key) {
-            return Ok(Arc::clone(client));
-        }
+    // The std mutex only protects the LRU map. It is released before awaiting
+    // client construction, and the shared OnceCell makes construction for a
+    // given identity single-flight.
+    let (slot, evicted) = get_or_insert_cache_slot(&ADMIN_CLIENT_CACHE, cache_key.clone());
+
+    if let Some(evicted) = evicted {
+        // DatabaseAdmin has no public close API. Dropping the evicted slot
+        // releases the cache's ownership; active callers retain their own Arc
+        // clones and the SDK cleans up when those final references are dropped.
+        drop(evicted);
     }
 
+    // Keep failed cells in the bounded LRU so a waiter that starts a retry uses
+    // this same OnceCell. Removing an empty slot here can race that retry and
+    // break single-flight by allowing a replacement slot to be inserted.
+    let client = slot
+        .get_or_try_init(|| create_admin_client(admin_endpoint))
+        .await?;
+    Ok(Arc::clone(client))
+}
+
+async fn create_admin_client(
+    admin_endpoint: Option<&str>,
+) -> Result<Arc<DatabaseAdmin>, SpannerError> {
     let mut builder = DatabaseAdmin::builder();
     let emulator_endpoint = admin_endpoint
         .map(str::to_owned)
@@ -45,14 +78,7 @@ async fn get_or_create_admin_client(
             .with_credentials(Anonymous::new().build());
     }
 
-    let client = builder.build().await?;
-    let client = Arc::new(client);
-
-    let mut cache = ADMIN_CLIENT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    let entry = cache
-        .entry(cache_key)
-        .or_insert_with(|| Arc::clone(&client));
-    Ok(Arc::clone(entry))
+    Ok(Arc::new(builder.build().await?))
 }
 
 fn emulator_endpoint(endpoint: Option<&str>) -> Option<String> {
@@ -942,7 +968,7 @@ fn instance_path_from_database_path(database_path: &str) -> Result<&str, Spanner
 mod tests {
     use std::ffi::CString;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     use duckdb::ffi::{
         duckdb_create_int64, duckdb_create_list_value, duckdb_create_logical_type,
@@ -952,9 +978,12 @@ mod tests {
     };
     use google_cloud_longrunning::model::Operation as InternalOperation;
 
+    use crate::cache::LruCache;
+
     use super::{
         admin_endpoint_url, cached_init_result, database_operation_prefix, ddl_operation_error,
-        ddl_statements_from_values, instance_path_from_database_path, operation_from_json,
+        ddl_statements_from_values, get_or_insert_cache_slot, instance_path_from_database_path,
+        operation_from_json, CacheSlot,
     };
 
     #[test]
@@ -1049,6 +1078,47 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn test_admin_cache_slot_is_single_flight() {
+        let cache = Arc::new(Mutex::new(LruCache::new(2)));
+        let constructions = Arc::new(AtomicUsize::new(0));
+
+        let (first, second) = tokio::join!(
+            initialize_test_cache_slot(Arc::clone(&cache), Arc::clone(&constructions)),
+            initialize_test_cache_slot(Arc::clone(&cache), Arc::clone(&constructions)),
+        );
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(constructions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_admin_cache_failed_slot_retries_single_flight() {
+        let cache = Arc::new(Mutex::new(LruCache::new(1)));
+        let key = "shared-admin".to_string();
+        let (slot, evicted) = get_or_insert_cache_slot(&cache, key.clone());
+        assert!(evicted.is_none());
+
+        let error = slot
+            .get_or_try_init(|| async { Err::<Arc<usize>, _>("initialization failed") })
+            .await
+            .unwrap_err();
+        assert_eq!(error, "initialization failed");
+
+        let (retained, evicted) = get_or_insert_cache_slot(&cache, key);
+        assert!(evicted.is_none());
+        assert!(Arc::ptr_eq(&slot, &retained));
+
+        let constructions = Arc::new(AtomicUsize::new(0));
+        let (first, second) = tokio::join!(
+            initialize_test_cache_slot(Arc::clone(&cache), Arc::clone(&constructions)),
+            initialize_test_cache_slot(Arc::clone(&cache), Arc::clone(&constructions)),
+        );
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(constructions.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn test_instance_path_from_database_path() {
         assert_eq!(
@@ -1114,6 +1184,24 @@ mod tests {
             matching_names,
             vec![format!("{database_path}/operations/op-1")]
         );
+    }
+
+    async fn initialize_test_cache_slot(
+        cache: Arc<Mutex<LruCache<String, CacheSlot<usize>>>>,
+        constructions: Arc<AtomicUsize>,
+    ) -> Arc<usize> {
+        let (slot, evicted) = get_or_insert_cache_slot(&cache, "shared-admin".to_string());
+        assert!(evicted.is_none());
+
+        let client = slot
+            .get_or_try_init(|| async move {
+                constructions.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                Ok::<Arc<usize>, &'static str>(Arc::new(42))
+            })
+            .await
+            .unwrap();
+        Arc::clone(client)
     }
 
     fn varchar_value(s: &str) -> duckdb::vtab::Value {

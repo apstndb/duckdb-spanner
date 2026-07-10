@@ -1,4 +1,5 @@
 mod bind_utils;
+mod cache;
 mod client;
 mod config;
 mod convert;
