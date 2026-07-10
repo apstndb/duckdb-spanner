@@ -27,7 +27,7 @@ jobs:
       run_emulator: ${{ steps.changed.outputs.run_emulator }}
       reduced_ci_mode: ${{ steps.changed.outputs.reduced_ci_mode }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -77,7 +77,7 @@ jobs:
     # arm64 pool: same 4/16 as ubuntu-latest, separate queue from linux_amd64 builds.
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -118,7 +118,7 @@ jobs:
     # Spanner emulator is multi-arch; run on arm to leave x64 for linux_amd64 builds.
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -138,7 +138,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
