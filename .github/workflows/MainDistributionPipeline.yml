@@ -89,6 +89,7 @@ jobs:
         with:
           cache-on-failure: true
 
+      - run: make check-google-cloud-rust
       - run: cargo fmt --check
       - run: cargo clippy --features loadable-extension
       - run: cargo test --lib

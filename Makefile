@@ -1,4 +1,4 @@
-.PHONY: build build-sweep build-release extension duckdb emulator-start emulator-stop emulator-status test test_debug test_release clean sweep sweep-dry-run ensure-cargo-sweep configure debug release clean_all
+.PHONY: build build-sweep build-release check-google-cloud-rust extension duckdb emulator-start emulator-stop emulator-status test test_debug test_release clean sweep sweep-dry-run ensure-cargo-sweep configure debug release clean_all
 
 # Detect OS for library extension
 UNAME := $(shell uname)
@@ -41,6 +41,9 @@ build-sweep: ensure-cargo-sweep build
 
 build-release:
 	cargo build --features loadable-extension --release
+
+check-google-cloud-rust:
+	bash scripts/check-google-cloud-rust.sh
 
 extension: build-release
 ifeq ($(strip $(EXT_VERSION)),)

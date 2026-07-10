@@ -182,8 +182,9 @@ HRVeBmUqB9ZvD2iFzjibxg==
     }
 
     #[tokio::test]
-    async fn google_auth_service_account_uses_installed_provider() {
+    async fn google_client_tls_transport_uses_installed_provider() {
         use google_cloud_auth::credentials::service_account::Builder;
+        use google_cloud_spanner::client::Spanner;
 
         super::ensure_rustls_crypto_provider();
 
@@ -194,9 +195,16 @@ HRVeBmUqB9ZvD2iFzjibxg==
             "project_id": "test-project-id",
             "universe_domain": "googleapis.com",
         });
-        let signer = Builder::new(key).build_signer().unwrap();
-        let signature = signer.sign(b"duckdb-spanner").await.unwrap();
+        let credentials = Builder::new(key).build().unwrap();
+        // Building the transport initializes the authenticated rustls path, but
+        // creating a Spanner client is lazy and does not issue an RPC.
+        let client = Spanner::builder()
+            .with_endpoint("https://localhost.invalid")
+            .with_credentials(credentials)
+            .build()
+            .await
+            .unwrap();
 
-        assert!(!signature.is_empty());
+        drop(client);
     }
 }
