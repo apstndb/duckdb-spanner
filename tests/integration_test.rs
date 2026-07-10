@@ -1622,8 +1622,9 @@ fn test_copy_to_registration() {
                 FORMAT spanner, \
                 database_path 'projects/p/instances/i/databases/d', \
                 endpoint '127.0.0.1:1'\
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
         let mut result = std::mem::MaybeUninit::zeroed();
         let r = duckdb::ffi::duckdb_query(con, sql.as_ptr(), result.as_mut_ptr());
         let mut result = result.assume_init();

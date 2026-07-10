@@ -224,8 +224,11 @@ async fn create_client(
     database: &str,
     endpoint: Option<&str>,
 ) -> Result<Arc<DatabaseClient>, SpannerError> {
-    match tokio::time::timeout(CLIENT_CONNECT_TIMEOUT, create_client_inner(database, endpoint))
-        .await
+    match tokio::time::timeout(
+        CLIENT_CONNECT_TIMEOUT,
+        create_client_inner(database, endpoint),
+    )
+    .await
     {
         Ok(result) => result,
         Err(_) => Err(SpannerError::Other(format!(
