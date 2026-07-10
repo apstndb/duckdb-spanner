@@ -234,11 +234,21 @@ Replacement scans intentionally support only the table name. Use `spanner_scan(.
 
 ### `spanner_tables`
 
-Lists Spanner base tables from `INFORMATION_SCHEMA.TABLES`.
+Lists Spanner base tables from `INFORMATION_SCHEMA.TABLES`. Each row contains
+`table_schema`, `table_name`, `table_type`, and `parent_table_name`; the parent
+is `NULL` for non-interleaved tables and views. The zero-argument form preserves
+the base-table-only result set. Use `table_type := 'VIEW'` to list views.
 It accepts the same database identification parameters and config defaults as `spanner_query` and `spanner_scan`.
 
 ```sql
 SELECT * FROM spanner_tables();
+
+-- Filters are applied by Spanner before rows are returned to DuckDB.
+SELECT * FROM spanner_tables(
+    table_type := 'VIEW',
+    schema := 'public',
+    table_name := 'active_users'
+);
 ```
 
 ### Config Options
@@ -586,7 +596,7 @@ This extension registers the following names into the global DuckDB namespace.
 | `spanner_query` | table macro | Wraps `spanner_query_raw` with ergonomic params (see [Table Functions](#table-functions)) |
 | `spanner_query_raw` | table function | Execute Spanner SQL (see [Low-Level Table Function](#spanner_query_raw----low-level-table-function)) |
 | `spanner_scan` | table function | Read a Spanner table (see [Table Functions](#table-functions)) |
-| `spanner_tables` | table function | List Spanner base tables from `INFORMATION_SCHEMA.TABLES` |
+| `spanner_tables` | table function | List Spanner tables or views from `INFORMATION_SCHEMA.TABLES` |
 | `"spanner:Table"` | replacement scan | Shorthand for `spanner_scan('Table')` using configured session defaults |
 | `spanner_ddl` | table macro | Execute DDL synchronously (see [`spanner_ddl`](#spanner_ddl)) |
 | `spanner_ddl_async` | table macro | Submit DDL asynchronously (see [`spanner_ddl_async`](#spanner_ddl_async)) |

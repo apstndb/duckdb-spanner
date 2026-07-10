@@ -94,6 +94,12 @@ fn get_gsql_db() -> &'static spanemuboost::SpanEmuDatabase {
                         Id INT64 NOT NULL, Amount INT64, \
                         Doubled INT64 AS (Amount * 2) STORED, Label STRING(MAX)\
                     ) PRIMARY KEY (Id)".into(),
+                    "CREATE TABLE InterleavedParent (Id INT64 NOT NULL) PRIMARY KEY (Id)".into(),
+                    "CREATE TABLE InterleavedChild (\
+                        Id INT64 NOT NULL, ChildId INT64 NOT NULL\
+                    ) PRIMARY KEY (Id, ChildId), INTERLEAVE IN PARENT InterleavedParent ON DELETE CASCADE".into(),
+                    "CREATE VIEW ScalarTypesView SQL SECURITY INVOKER AS \
+                     SELECT ScalarTypes.Id AS Id, ScalarTypes.StringCol AS StringCol FROM ScalarTypes".into(),
                 ],
                 vec![
                     "INSERT INTO ScalarTypes (Id, BoolCol, Int64Col, Float64Col, StringCol, BytesCol, DateCol, TimestampCol) \
@@ -772,15 +778,62 @@ fn test_replacement_scan_spanner_prefix() {
 fn test_spanner_tables() {
     let conn = create_duckdb_connection();
     let db = get_gsql_db();
-    let sql = format!(
-        "SELECT table_name FROM spanner_tables(database_path := '{}', endpoint := '{}') \
-         WHERE table_name = 'ScalarTypes'",
+    let tables = format!(
+        "spanner_tables(database_path := '{}', endpoint := '{}')",
         db.database_path(),
         db.emulator_host()
     );
 
-    let table_name: String = conn.query_row(&sql, [], |r| r.get(0)).unwrap();
-    assert_eq!(table_name, "ScalarTypes");
+    let (table_type, parent_table_name): (String, Option<String>) = conn
+        .query_row(
+            &format!(
+                "SELECT table_type, parent_table_name FROM {tables} WHERE table_name = 'ScalarTypes'"
+            ),
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(table_type, "BASE TABLE");
+    assert_eq!(parent_table_name, None);
+
+    let default_view_count: i64 = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM {tables} WHERE table_type = 'VIEW'"),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(default_view_count, 0);
+
+    let (table_name, table_type): (String, String) = conn
+        .query_row(
+            &format!(
+                "SELECT table_name, table_type FROM spanner_tables(\
+                 database_path := '{}', endpoint := '{}', table_type := 'VIEW', \
+                 table_name := 'ScalarTypesView')",
+                db.database_path(),
+                db.emulator_host()
+            ),
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(table_name, "ScalarTypesView");
+    assert_eq!(table_type, "VIEW");
+
+    let parent_table_name: String = conn
+        .query_row(
+            &format!(
+                "SELECT parent_table_name FROM spanner_tables(\
+                 database_path := '{}', endpoint := '{}', table_name := 'InterleavedChild')",
+                db.database_path(),
+                db.emulator_host()
+            ),
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(parent_table_name, "InterleavedParent");
 }
 
 #[test]
@@ -1341,6 +1394,8 @@ fn get_pg_db() -> &'static spanemuboost::SpanEmuDatabase {
                         json_col jsonb, \
                         PRIMARY KEY (id)\
                     )".into(),
+                    "CREATE VIEW user_names SQL SECURITY INVOKER AS \
+                     SELECT users.id AS id, users.name AS name FROM users".into(),
                 ],
                 vec![
                     "INSERT INTO users (id, name, age) VALUES (1, 'Alice', 30)".into(),
@@ -1462,6 +1517,28 @@ fn pg_vtab_scan_sql_with(table: &str, extra_params: &str) -> String {
 fn create_pg_duckdb_connection() -> Connection {
     let _ = get_pg_db(); // ensure emulator + PG database are ready
     open_extension_connection()
+}
+
+#[test]
+fn test_pg_spanner_tables_filters() {
+    let conn = create_pg_duckdb_connection();
+    let db = get_pg_db();
+    let (table_name, table_type, parent_table_name): (String, String, Option<String>) = conn
+        .query_row(
+            &format!(
+                "SELECT table_name, table_type, parent_table_name FROM spanner_tables(\
+                 database_path := '{}', endpoint := '{}', table_type := 'VIEW', \
+                 schema := 'public', table_name := 'user_names')",
+                db.database_path(),
+                db.emulator_host()
+            ),
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(table_name, "user_names");
+    assert_eq!(table_type, "VIEW");
+    assert_eq!(parent_table_name, None);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

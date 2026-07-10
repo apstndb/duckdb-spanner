@@ -53,13 +53,16 @@ if ! curl -sf -X POST \
 		"createStatement": "CREATE DATABASE `test-db`",
 		"extraStatements": [
 			"CREATE TABLE ScalarTypes (Id INT64 NOT NULL, BoolCol BOOL, Int64Col INT64, Float64Col FLOAT64, StringCol STRING(MAX), BytesCol BYTES(MAX), DateCol DATE, TimestampCol TIMESTAMP) PRIMARY KEY (Id)",
+			"CREATE VIEW ScalarTypesView SQL SECURITY INVOKER AS SELECT ScalarTypes.Id AS Id, ScalarTypes.StringCol AS StringCol FROM ScalarTypes",
 			"CREATE TABLE EmptyTable (Id INT64 NOT NULL, Name STRING(MAX)) PRIMARY KEY (Id)",
 			"CREATE TABLE NullableTypes (Id INT64 NOT NULL, Val STRING(MAX)) PRIMARY KEY (Id)",
 			"CREATE TABLE NumericTypes (Id INT64 NOT NULL, NumCol NUMERIC, JsonCol JSON) PRIMARY KEY (Id)",
 			"CREATE TABLE ArrayTypes (Id INT64 NOT NULL, IntArray ARRAY<INT64>, StrArray ARRAY<STRING(MAX)>) PRIMARY KEY (Id)",
 			"CREATE TABLE CopyTarget (Id INT64 NOT NULL, Name STRING(MAX), Value FLOAT64) PRIMARY KEY (Id)",
 			"CREATE TABLE CopyTypes (Id INT64 NOT NULL, BoolCol BOOL, Int64Col INT64, Float64Col FLOAT64, StringCol STRING(MAX), DateCol DATE, TimestampCol TIMESTAMP) PRIMARY KEY (Id)",
-			"CREATE TABLE CopyGenerated (Id INT64 NOT NULL, Amount INT64, Doubled INT64 AS (Amount * 2) STORED, Label STRING(MAX)) PRIMARY KEY (Id)"
+			"CREATE TABLE CopyGenerated (Id INT64 NOT NULL, Amount INT64, Doubled INT64 AS (Amount * 2) STORED, Label STRING(MAX)) PRIMARY KEY (Id)",
+			"CREATE TABLE InterleavedParent (Id INT64 NOT NULL) PRIMARY KEY (Id)",
+			"CREATE TABLE InterleavedChild (Id INT64 NOT NULL, ChildId INT64 NOT NULL) PRIMARY KEY (Id, ChildId), INTERLEAVE IN PARENT InterleavedParent ON DELETE CASCADE"
 		]
 	}' >/dev/null 2>&1; then
 	echo "ERROR: failed to create database ${DATABASE}" >&2
