@@ -849,9 +849,9 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, SpannerError> {
         .map_err(|e| SpannerError::Conversion(format!("base64 decode error: {e}")))
 }
 
-/// Hint for child vector capacity. DuckDB's vector standard size.
+/// Hint for child vector capacity based on DuckDB's runtime chunk size.
 fn rows_capacity_hint() -> usize {
-    2048
+    crate::vector_size::runtime_vector_size()
 }
 
 #[cfg(test)]

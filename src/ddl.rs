@@ -754,8 +754,8 @@ impl VTab for SpannerOperationsVTab {
             return Ok(());
         }
 
-        // Drain up to 2048 rows per call
-        let batch_size = ops.len().min(2048);
+        // Drain at most one DuckDB data chunk per call.
+        let batch_size = ops.len().min(crate::vector_size::runtime_vector_size());
         let batch: Vec<OperationRow> = ops.drain(..batch_size).collect();
 
         let col_name = output.flat_vector(0);
