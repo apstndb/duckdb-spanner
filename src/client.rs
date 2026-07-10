@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-use std::hash::Hash;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -9,6 +7,7 @@ use google_cloud_gax::retry_policy::{Aip194Strict, RetryPolicyExt};
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use tokio::sync::OnceCell;
 
+use crate::cache::LruCache;
 use crate::error::SpannerError;
 use crate::runtime;
 
@@ -34,79 +33,6 @@ const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Per-attempt RPC timeout while creating the multiplexed session.
 const SESSION_CREATE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// A tiny hand-rolled LRU map. Capacity is small (see [`CACHE_CAPACITY`]), so an
-/// O(n) scan for the least-recently-used entry on eviction is cheap and avoids
-/// pulling in an external crate. Recency is tracked with a monotonic counter.
-///
-/// This type is deliberately free of any Spanner/async concerns so the eviction
-/// policy can be unit-tested on its own (see the tests module below).
-struct LruCache<K, V> {
-    capacity: usize,
-    tick: u64,
-    map: HashMap<K, (V, u64)>,
-}
-
-impl<K: Eq + Hash + Clone, V: Clone> LruCache<K, V> {
-    fn new(capacity: usize) -> Self {
-        assert!(capacity >= 1, "LRU capacity must be at least 1");
-        Self {
-            capacity,
-            tick: 0,
-            map: HashMap::new(),
-        }
-    }
-
-    fn next_tick(&mut self) -> u64 {
-        self.tick += 1;
-        self.tick
-    }
-
-    /// Return the value for `key`, marking it most-recently-used, or insert one
-    /// produced by `make` if absent. When inserting pushes the map over
-    /// capacity, the least-recently-used entry is evicted and returned as the
-    /// second tuple element so the caller can dispose of it.
-    fn get_or_insert_with<F: FnOnce() -> V>(&mut self, key: K, make: F) -> (V, Option<V>) {
-        // Compute the tick before the `get_mut` borrow so the hit path is a
-        // single lookup (calling `next_tick(&mut self)` inside the `if let` would
-        // conflict with the `&mut` borrow held by `entry`).
-        let tick = self.next_tick();
-        if let Some(entry) = self.map.get_mut(&key) {
-            entry.1 = tick;
-            return (entry.0.clone(), None);
-        }
-
-        let value = make();
-        self.map.insert(key, (value.clone(), tick));
-
-        let evicted = if self.map.len() > self.capacity {
-            // The entry we just inserted has the newest tick, so the minimum is
-            // always some other, older entry — never the one we just added.
-            let lru_key = self
-                .map
-                .iter()
-                .min_by_key(|(_, (_, t))| *t)
-                .map(|(k, _)| k.clone());
-            lru_key.and_then(|k| self.map.remove(&k)).map(|(v, _)| v)
-        } else {
-            None
-        };
-
-        (value, evicted)
-    }
-
-    /// Remove `key` only if it is currently mapped to a value satisfying `pred`.
-    /// Returns whether an entry was removed. Used to drop a slot whose client
-    /// creation failed without clobbering an entry a concurrent caller may have
-    /// since replaced or successfully initialized.
-    fn remove_if<F: FnOnce(&V) -> bool>(&mut self, key: &K, pred: F) -> bool {
-        let matches = self.map.get(key).is_some_and(|(v, _)| pred(v));
-        if matches {
-            self.map.remove(key);
-        }
-        matches
-    }
-}
 
 /// Each cache slot holds a shared [`OnceCell`] so that concurrent binds for the
 /// same key create the underlying [`Client`] exactly once (single-flight),
@@ -281,80 +207,6 @@ pub(crate) fn endpoint_url(endpoint: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn returns_existing_without_eviction() {
-        let mut cache: LruCache<&str, i32> = LruCache::new(2);
-        let (v, evicted) = cache.get_or_insert_with("a", || 1);
-        assert_eq!(v, 1);
-        assert!(evicted.is_none());
-
-        // Second lookup of the same key reuses the value and evicts nothing.
-        let (v, evicted) = cache.get_or_insert_with("a", || panic!("should not build"));
-        assert_eq!(v, 1);
-        assert!(evicted.is_none());
-    }
-
-    #[test]
-    fn evicts_least_recently_used() {
-        let mut cache: LruCache<&str, i32> = LruCache::new(2);
-        cache.get_or_insert_with("a", || 1);
-        cache.get_or_insert_with("b", || 2);
-
-        // Inserting a third key over capacity evicts the LRU ("a").
-        let (_, evicted) = cache.get_or_insert_with("c", || 3);
-        assert_eq!(evicted, Some(1));
-        assert!(!cache.map.contains_key("a"));
-        assert!(cache.map.contains_key("b"));
-        assert!(cache.map.contains_key("c"));
-    }
-
-    #[test]
-    fn access_refreshes_recency() {
-        let mut cache: LruCache<&str, i32> = LruCache::new(2);
-        cache.get_or_insert_with("a", || 1);
-        cache.get_or_insert_with("b", || 2);
-
-        // Touch "a" so "b" becomes the least-recently-used.
-        cache.get_or_insert_with("a", || panic!("should not build"));
-
-        let (_, evicted) = cache.get_or_insert_with("c", || 3);
-        assert_eq!(evicted, Some(2));
-        assert!(cache.map.contains_key("a"));
-        assert!(!cache.map.contains_key("b"));
-        assert!(cache.map.contains_key("c"));
-    }
-
-    #[test]
-    fn never_evicts_the_just_inserted_entry() {
-        let mut cache: LruCache<i32, i32> = LruCache::new(1);
-        let (_, evicted) = cache.get_or_insert_with(1, || 10);
-        assert!(evicted.is_none());
-        // With capacity 1, inserting a new key evicts the previous one, never
-        // the entry just added.
-        let (v, evicted) = cache.get_or_insert_with(2, || 20);
-        assert_eq!(v, 20);
-        assert_eq!(evicted, Some(10));
-        assert!(cache.map.contains_key(&2));
-        assert!(!cache.map.contains_key(&1));
-    }
-
-    #[test]
-    fn remove_if_respects_predicate() {
-        let mut cache: LruCache<&str, i32> = LruCache::new(2);
-        cache.get_or_insert_with("a", || 1);
-
-        // Predicate false: entry stays.
-        assert!(!cache.remove_if(&"a", |v| *v == 999));
-        assert!(cache.map.contains_key("a"));
-
-        // Missing key: nothing removed.
-        assert!(!cache.remove_if(&"missing", |_| true));
-
-        // Predicate true: entry removed.
-        assert!(cache.remove_if(&"a", |v| *v == 1));
-        assert!(!cache.map.contains_key("a"));
-    }
 
     #[tokio::test]
     async fn take_when_unique_reclaims_sole_owner() {
