@@ -105,6 +105,28 @@ pub fn resolve_parallelism_mode(
     }
 }
 
+/// Validate options that only make sense for partitioned execution.
+pub fn validate_parallelism_options(
+    parallelism_mode: ParallelismMode,
+    use_data_boost: bool,
+    max_parallelism: Option<i64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if use_data_boost && parallelism_mode != ParallelismMode::Required {
+        return Err("use_data_boost=true requires parallelism_mode='required'".into());
+    }
+
+    if let Some(max_parallelism) = max_parallelism {
+        if max_parallelism <= 0 {
+            return Err("max_parallelism must be greater than zero".into());
+        }
+        if parallelism_mode == ParallelismMode::Off {
+            return Err("max_parallelism requires parallelism_mode='auto' or 'required'".into());
+        }
+    }
+
+    Ok(())
+}
+
 /// Parse a priority string ("low", "medium", "high") into a Spanner Priority enum.
 pub fn parse_priority(s: &str) -> Result<Priority, Box<dyn std::error::Error>> {
     match s.to_ascii_lowercase().as_str() {
@@ -268,7 +290,7 @@ pub fn resolve_admin_endpoint(bind: &BindInfo) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_parallelism_mode, ParallelismMode};
+    use super::{resolve_parallelism_mode, validate_parallelism_options, ParallelismMode};
 
     #[test]
     fn parallelism_mode_accepts_documented_values_case_insensitively() {
@@ -325,5 +347,32 @@ mod tests {
         assert!(!ParallelismMode::Auto.allows_fallback(true));
         assert!(!ParallelismMode::Required.allows_fallback(false));
         assert!(!ParallelismMode::Off.allows_fallback(false));
+    }
+
+    #[test]
+    fn data_boost_requires_partitioned_execution_without_fallback() {
+        let off = validate_parallelism_options(ParallelismMode::Off, true, None).unwrap_err();
+        assert!(off.to_string().contains("parallelism_mode='required'"));
+
+        let auto = validate_parallelism_options(ParallelismMode::Auto, true, None).unwrap_err();
+        assert!(auto.to_string().contains("parallelism_mode='required'"));
+
+        assert!(validate_parallelism_options(ParallelismMode::Required, true, None).is_ok());
+    }
+
+    #[test]
+    fn max_parallelism_must_be_positive_and_partitioned() {
+        let zero =
+            validate_parallelism_options(ParallelismMode::Required, false, Some(0)).unwrap_err();
+        assert!(zero.to_string().contains("greater than zero"));
+
+        let negative =
+            validate_parallelism_options(ParallelismMode::Required, false, Some(-1)).unwrap_err();
+        assert!(negative.to_string().contains("greater than zero"));
+
+        let off = validate_parallelism_options(ParallelismMode::Off, false, Some(1)).unwrap_err();
+        assert!(off
+            .to_string()
+            .contains("parallelism_mode='auto' or 'required'"));
     }
 }

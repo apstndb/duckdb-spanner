@@ -212,6 +212,7 @@ SELECT * FROM spanner_query(
     'SELECT * FROM Users WHERE Age > @min_age',
     params := {'min_age': spanner_value(21::BIGINT)},
     exact_staleness_secs := 10,
+    parallelism_mode := 'required',
     use_data_boost := true
 );
 ```
@@ -305,8 +306,8 @@ Both functions accept the following named parameters:
 | `endpoint` | VARCHAR | (config) | Custom gRPC endpoint (e.g., `localhost:9010` for the emulator) |
 | `parallelism_mode` | VARCHAR | `off` | `'auto'` (pre-row fallback), `'required'` (no fallback), or `'off'` (single API only) |
 | `use_parallelism` | BOOLEAN | `false` | Legacy compatibility option: `true` maps to `'auto'`, `false` maps to `'off'` |
-| `use_data_boost` | BOOLEAN | `false` | Enable [Data Boost](https://cloud.google.com/spanner/docs/databoost/databoost-overview) |
-| `max_parallelism` | INTEGER | (default) | Maximum number of partitions |
+| `use_data_boost` | BOOLEAN | `false` | Enable [Data Boost](https://cloud.google.com/spanner/docs/databoost/databoost-overview); requires `parallelism_mode := 'required'` |
+| `max_parallelism` | INTEGER | (default) | Positive partition-count hint and local partition-worker cap |
 | `exact_staleness_secs` | BIGINT | | Read at an exact staleness (seconds ago) |
 | `max_staleness_secs` | BIGINT | | Read with bounded staleness (at most N seconds ago) |
 | `read_timestamp` | VARCHAR | | Read at a specific timestamp ([RFC 3339](https://datatracker.ietf.org/doc/html/rfc3339), e.g., `'2024-01-15T10:30:00Z'`) |
@@ -315,7 +316,7 @@ Both functions accept the following named parameters:
 
 At most one timestamp bound parameter can be specified. If none is set, Spanner uses a [strong read](https://cloud.google.com/spanner/docs/timestamp-bounds#strong) (the default).
 
-When both `parallelism_mode` and `use_parallelism` are supplied, `parallelism_mode` takes precedence. `use_data_boost` and `max_parallelism` apply only to partitioned modes; `parallelism_mode := 'off'` uses the single query/read API.
+When both `parallelism_mode` and `use_parallelism` are supplied, `parallelism_mode` takes precedence. `use_data_boost := true` requires `parallelism_mode := 'required'`, so Data Boost never falls back to a non-Data-Boost request. `max_parallelism` must be positive and requires a partitioned mode; it limits both Spanner's partition-count hint and local concurrent partition execution. `parallelism_mode := 'off'` uses the single query/read API.
 
 `spanner_query` additionally accepts:
 

@@ -13,6 +13,7 @@ mod runtime;
 mod scalars;
 mod scan;
 mod schema;
+mod streaming;
 mod tables;
 mod types;
 mod vector_size;

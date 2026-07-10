@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::error::SpannerError;
 use crate::schema::ColumnInfo;
-use crate::{client, convert, runtime, schema, types, vector_size};
+use crate::{client, convert, runtime, schema, streaming, types, vector_size};
 
 pub struct QueryBindData {
     database: String,
@@ -27,10 +27,8 @@ pub struct QueryBindData {
     columns: Vec<ColumnInfo>,
 }
 
-/// Streaming init data: rows arrive via an mpsc channel from a background tokio task.
 pub struct QueryInitData {
-    receiver: Mutex<mpsc::Receiver<Result<Row, SpannerError>>>,
-    vector_size: usize,
+    streaming: streaming::StreamingState<Row>,
 }
 
 pub struct SpannerQueryVTab;
@@ -52,6 +50,11 @@ impl VTab for SpannerQueryVTab {
         )?;
         let use_data_boost = crate::bind_utils::get_named_bool(bind, "use_data_boost", false);
         let max_parallelism = crate::bind_utils::get_named_int64(bind, "max_parallelism");
+        crate::bind_utils::validate_parallelism_options(
+            parallelism_mode,
+            use_data_boost,
+            max_parallelism,
+        )?;
         let timestamp_bound = crate::bind_utils::resolve_timestamp_bound(
             crate::bind_utils::get_named_int64(bind, "exact_staleness_secs"),
             crate::bind_utils::get_named_int64(bind, "max_staleness_secs"),
@@ -93,8 +96,6 @@ impl VTab for SpannerQueryVTab {
         let bind_data = unsafe { &*init.get_bind_data::<QueryBindData>() };
         let vector_size = vector_size::runtime_vector_size();
 
-        let (tx, rx) = mpsc::channel(vector_size);
-
         // Clone bind data fields for the spawned task ('static requirement)
         let database = bind_data.database.clone();
         let endpoint = bind_data.endpoint.clone();
@@ -106,60 +107,49 @@ impl VTab for SpannerQueryVTab {
         let timestamp_bound = bind_data.timestamp_bound.clone();
         let priority = bind_data.priority.clone();
 
-        runtime::spawn(async move {
+        let streaming = streaming::StreamingState::spawn(vector_size, move |tx| async move {
             let rows_delivered = Arc::new(AtomicBool::new(false));
-            let result: Result<(), SpannerError> = async {
-                let client =
-                    client::get_or_create_client(&database, endpoint.as_deref()).await?;
+            let client = client::get_or_create_client(&database, endpoint.as_deref()).await?;
 
-                if parallelism_mode.uses_partitioned_api() {
-                    let partition_options =
-                        max_parallelism.map(|max| PartitionOptions::new().set_max_partitions(max));
-
-                    let stmt =
-                        crate::params::create_statement_with_priority(&sql, params_json.as_deref(), priority.clone())?;
-                    match stream_partitioned_query(
-                        &client,
-                        &tx,
-                        stmt,
-                        timestamp_bound.as_ref(),
-                        use_data_boost,
-                        partition_options,
-                        rows_delivered.clone(),
-                    )
-                    .await
-                    {
-                        Ok(()) => return Ok(()),
-                        Err(e) if parallelism_mode.allows_fallback(rows_delivered.load(Ordering::SeqCst)) => {
-                            eprintln!("[duckdb-spanner] Partitioned query failed: {e}, falling back to single query");
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-
-                let stmt =
-                    crate::params::create_statement_with_priority(&sql, params_json.as_deref(), priority.clone())?;
-                stream_single_query(
+            if parallelism_mode.uses_partitioned_api() {
+                let stmt = crate::params::create_statement_with_priority(
+                    &sql,
+                    params_json.as_deref(),
+                    priority.clone(),
+                )?;
+                match stream_partitioned_query(
                     &client,
                     &tx,
                     stmt,
                     timestamp_bound.as_ref(),
+                    use_data_boost,
+                    max_parallelism,
+                    rows_delivered.clone(),
                 )
                 .await
+                {
+                    Ok(()) => return Ok(()),
+                    Err(e)
+                        if parallelism_mode
+                            .allows_fallback(rows_delivered.load(Ordering::SeqCst)) =>
+                    {
+                        eprintln!("[duckdb-spanner] Partitioned query failed: {e}, falling back to single query");
+                    }
+                    Err(e) => return Err(e),
+                }
             }
-            .await;
 
-            if let Err(e) = result {
-                let _ = tx.send(Err(e)).await;
-            }
+            let stmt = crate::params::create_statement_with_priority(
+                &sql,
+                params_json.as_deref(),
+                priority.clone(),
+            )?;
+            stream_single_query(&client, &tx, stmt, timestamp_bound.as_ref()).await
         })?;
 
         init.set_max_threads(1);
 
-        Ok(QueryInitData {
-            receiver: Mutex::new(rx),
-            vector_size,
-        })
+        Ok(QueryInitData { streaming })
     }
 
     fn func(
@@ -169,30 +159,13 @@ impl VTab for SpannerQueryVTab {
         let bind_data = func.get_bind_data();
         let init_data = func.get_init_data();
 
-        let mut rx = init_data.receiver.lock().unwrap_or_else(|e| e.into_inner());
-
-        // Block for the first row to ensure forward progress
-        let first = match rx.blocking_recv() {
-            Some(Ok(row)) => row,
-            Some(Err(e)) => return Err(e.into()),
+        let batch = match init_data.streaming.next_batch()? {
+            Some(batch) => batch,
             None => {
                 output.set_len(0);
                 return Ok(());
             }
         };
-
-        let mut batch = Vec::with_capacity(init_data.vector_size);
-        batch.push(first);
-
-        // Fill the rest of the batch non-blocking
-        while batch.len() < init_data.vector_size {
-            match rx.try_recv() {
-                Ok(Ok(row)) => batch.push(row),
-                Ok(Err(e)) => return Err(e.into()),
-                Err(_) => break, // Empty or Disconnected
-            }
-        }
-        drop(rx);
 
         convert::write_rows_to_chunk(output, &batch, &bind_data.columns)?;
         Ok(())
@@ -280,7 +253,7 @@ async fn stream_partitioned_query(
     stmt: Statement,
     timestamp_bound: Option<&crate::bind_utils::TimestampBoundConfig>,
     data_boost_enabled: bool,
-    partition_options: Option<PartitionOptions>,
+    max_parallelism: Option<i64>,
     rows_delivered: Arc<AtomicBool>,
 ) -> Result<(), SpannerError> {
     let mut builder = client.batch_read_only_transaction();
@@ -290,27 +263,26 @@ async fn stream_partitioned_query(
     let batch_tx = builder.build().await?;
 
     let partitions = batch_tx
-        .partition_query(stmt, partition_options.unwrap_or_default())
+        .partition_query(
+            stmt,
+            max_parallelism
+                .map(|max| PartitionOptions::new().set_max_partitions(max))
+                .unwrap_or_default(),
+        )
         .await?;
 
     // Execute partitions concurrently, each with its own session from the pool.
     // Partitions embed the transaction selector, so any session can execute them
-    // against the same consistent snapshot. Concurrency is capped by a semaphore
-    // sized to the shared runtime's worker threads so we don't oversubscribe it
-    // (max_parallelism above only bounds partition *creation*, not execution).
-    let permits = runtime::worker_threads().min(partitions.len().max(1));
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(permits));
-    let mut join_set = tokio::task::JoinSet::new();
-    for partition in partitions {
+    // against the same consistent snapshot. `max_parallelism` is both the
+    // partition-count hint above and a local worker cap.
+    let permits = runtime::partition_worker_limit(partitions.len(), max_parallelism);
+    let tx = tx.clone();
+    let client = client.clone();
+    runtime::run_bounded_partitions(partitions, permits, move |partition| {
         let tx = tx.clone();
         let client = client.clone();
         let rows_delivered = rows_delivered.clone();
-        let semaphore = semaphore.clone();
-        join_set.spawn(async move {
-            let _permit = semaphore
-                .acquire()
-                .await
-                .map_err(|e| SpannerError::Other(format!("Semaphore closed: {e}")))?;
+        async move {
             let partition = partition.set_data_boost(data_boost_enabled);
             let mut iter = partition.execute(&client).await?;
             while let Some(row) = iter.next().await.transpose()? {
@@ -320,17 +292,18 @@ async fn stream_partitioned_query(
                 }
             }
             Ok::<(), SpannerError>(())
-        });
-    }
+        }
+    })
+    .await
 
     // Invariant: partition tasks must be fully terminated before this function
     // returns. Client eviction close relies on Arc uniqueness => quiescence, so a
     // task still holding a `Client` clone and `ManagedSession` must not outlive
-    // the streamer. `join_partitions` drains (aborts + awaits) every task on
+    // the streamer. The bounded runner drains (aborts + awaits) every task on
     // error before returning; the caller reads `rows_delivered` only after we
     // return, so an aborted straggler can no longer emit a row past the fallback
-    // decision.
-    runtime::join_partitions(join_set).await
+    // decision. If StreamingState drops this outer producer task, Tokio drops
+    // this JoinSet and aborts every remaining partition task.
 }
 
 async fn stream_single_query(
