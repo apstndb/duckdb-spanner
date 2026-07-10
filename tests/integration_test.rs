@@ -1474,6 +1474,7 @@ fn get_pg_copy_db() -> &'static spanemuboost::SpanEmuDatabase {
 
 fn pg_vtab_query_sql(spanner_sql: &str) -> String {
     let db = get_pg_db();
+    let spanner_sql = spanner_sql.replace('\'', "''");
     format!(
         "SELECT * FROM spanner_query('{}', database_path := '{}', endpoint := '{}')",
         spanner_sql,
@@ -1484,6 +1485,7 @@ fn pg_vtab_query_sql(spanner_sql: &str) -> String {
 
 fn pg_vtab_query_sql_with(spanner_sql: &str, extra_params: &str) -> String {
     let db = get_pg_db();
+    let spanner_sql = spanner_sql.replace('\'', "''");
     format!(
         "SELECT * FROM spanner_query('{}', database_path := '{}', endpoint := '{}', {})",
         spanner_sql,
@@ -1581,6 +1583,21 @@ fn test_pg_vtab_query_types() {
     assert!((f4 - 1.5).abs() < 0.001);
     assert!((f8 - 3.125).abs() < 0.001);
     assert_eq!(s, "hello");
+}
+
+#[test]
+fn test_pg_vtab_query_numeric_special_values() {
+    let conn = create_pg_duckdb_connection();
+    let sql = pg_vtab_query_sql(
+        "SELECT 'NaN'::numeric AS nan_value, \
+         '123456789012345678901234567890123456789.123456789'::numeric AS wide_value",
+    );
+    let (nan, wide): (String, String) = conn
+        .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+
+    assert_eq!(nan, "NaN");
+    assert_eq!(wide, "123456789012345678901234567890123456789.123456789");
 }
 
 #[test]

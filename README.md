@@ -511,7 +511,8 @@ STRUCT parameters are not supported.
 | INT64 | BIGINT |
 | FLOAT32 | FLOAT |
 | FLOAT64 | DOUBLE |
-| NUMERIC | DECIMAL(38,9) |
+| NUMERIC (GoogleSQL) | DECIMAL(38,9) |
+| numeric (PostgreSQL) | VARCHAR |
 | STRING | VARCHAR |
 | JSON | VARCHAR (aliased as JSON) |
 | BYTES | BLOB |
@@ -523,6 +524,12 @@ STRUCT parameters are not supported.
 | STRUCT\<...\> | STRUCT(...) |
 | PROTO | BLOB |
 | ENUM | BIGINT |
+
+GoogleSQL `NUMERIC` uses the compatible fixed `DECIMAL(38,9)` representation.
+PostgreSQL `numeric` is returned as its exact string representation because it
+can be `NaN` or exceed DuckDB DECIMAL's 38-digit precision and 9-digit scale.
+Cast those VARCHAR results explicitly when a value fits the desired DuckDB
+DECIMAL type.
 
 ## Testing
 
