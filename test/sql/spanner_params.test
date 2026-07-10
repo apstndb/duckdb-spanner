@@ -47,3 +47,10 @@ SELECT IF(interval_to_iso8601(MixedDate) = 'P1M-1D', 1, error('expected mixed-si
 
 statement ok
 SELECT IF(interval_to_iso8601(MixedTime) = 'P1DT-1H', 1, error('expected mixed-sign time interval round-trip')) FROM spanner_query('SELECT @v AS MixedTime', params := {'v': spanner_typed(INTERVAL '1 day -1 hour', 'INTERVAL')});
+
+# Send an invalid mixed-sign wire string directly. A component sign must
+# precede its value; the emulator rejects a sign placed after the day value.
+statement error
+SELECT * FROM spanner_query('SELECT @v AS InvalidMixedSign', params := {'v': spanner_typed('P1M1-D', 'INTERVAL')});
+----
+Unexpected '-' in the date portion of interval
