@@ -146,16 +146,12 @@ fn add_scalar_param(
             builder.add_typed_param(key, &i, spanner_type)
         }
         TypeCode::Float32 => {
-            let f = value
-                .as_f64()
-                .ok_or_else(|| param_err(key, "FLOAT32", value))? as f32;
-            builder.add_typed_param(key, &f, spanner_type)
+            let value = float_param_value(key, "FLOAT32", value, true)?;
+            builder.add_typed_param(key, &value, spanner_type)
         }
         TypeCode::Float64 => {
-            let f = value
-                .as_f64()
-                .ok_or_else(|| param_err(key, "FLOAT64", value))?;
-            builder.add_typed_param(key, &f, spanner_type)
+            let value = float_param_value(key, "FLOAT64", value, false)?;
+            builder.add_typed_param(key, &value, spanner_type)
         }
         TypeCode::String => {
             let s = json_to_string_coerce(value);
@@ -245,16 +241,11 @@ fn add_array_param(
             builder.add_typed_param(key, &v, spanner_type)
         }
         TypeCode::Float32 => {
-            let v = parse_array(key, arr, |_, v| {
-                let f = v.as_f64().ok_or_else(|| param_err(key, "FLOAT32", v))?;
-                Ok(f as f32)
-            })?;
+            let v = parse_float_array(key, arr, "FLOAT32", true)?;
             builder.add_typed_param(key, &v, spanner_type)
         }
         TypeCode::Float64 => {
-            let v = parse_array(key, arr, |_, v| {
-                v.as_f64().ok_or_else(|| param_err(key, "FLOAT64", v))
-            })?;
+            let v = parse_float_array(key, arr, "FLOAT64", false)?;
             builder.add_typed_param(key, &v, spanner_type)
         }
         TypeCode::String => {
@@ -317,6 +308,57 @@ fn add_array_param(
         }
     };
     Ok(builder)
+}
+
+fn float_param_value(
+    key: &str,
+    type_name: &str,
+    value: &serde_json::Value,
+    narrow_to_f32: bool,
+) -> Result<prost_types::Value, SpannerError> {
+    use prost_types::value::Kind;
+
+    let kind = match value {
+        serde_json::Value::Number(number) => {
+            let parsed = number
+                .as_f64()
+                .ok_or_else(|| param_err(key, type_name, value))?;
+            if narrow_to_f32 {
+                let narrowed = parsed as f32;
+                if parsed.is_finite() && !narrowed.is_finite() {
+                    return Err(param_err(key, type_name, value));
+                }
+                Kind::NumberValue(narrowed as f64)
+            } else {
+                Kind::NumberValue(parsed)
+            }
+        }
+        serde_json::Value::String(s) if matches!(s.as_str(), "NaN" | "Infinity" | "-Infinity") => {
+            Kind::StringValue(s.clone())
+        }
+        _ => return Err(param_err(key, type_name, value)),
+    };
+    Ok(prost_types::Value { kind: Some(kind) })
+}
+
+fn parse_float_array(
+    key: &str,
+    values: &[serde_json::Value],
+    type_name: &str,
+    narrow_to_f32: bool,
+) -> Result<Vec<prost_types::Value>, SpannerError> {
+    values
+        .iter()
+        .map(|value| {
+            if value.is_null() {
+                Ok(prost_types::Value {
+                    kind: Some(prost_types::value::Kind::NullValue(0)),
+                })
+            } else {
+                float_param_value(key, type_name, value, narrow_to_f32)
+            }
+        })
+        .collect()
 }
 
 fn parse_array<T>(
@@ -408,6 +450,33 @@ mod tests {
             Some(r#"{"v":{"value":["a",null,"c"],"type":"ARRAY<STRING>"}}"#),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn test_typed_non_finite_float_values() {
+        create_statement(
+            "SELECT @f32_nan, @f64_inf",
+            Some(
+                r#"{"f32_nan":{"value":"NaN","type":"FLOAT32"},"f64_inf":{"value":"Infinity","type":"FLOAT64"}}"#,
+            ),
+        )
+        .unwrap();
+        create_statement(
+            "SELECT @f32_values, @f64_values",
+            Some(
+                r#"{"f32_values":{"value":["NaN",1.5,null,"-Infinity"],"type":"ARRAY<FLOAT32>"},"f64_values":{"value":["Infinity",-1.5],"type":"ARRAY<FLOAT64>"}}"#,
+            ),
+        )
+        .unwrap();
+
+        for special in ["NaN", "Infinity", "-Infinity"] {
+            let json = serde_json::Value::String(special.to_string());
+            let value = float_param_value("v", "FLOAT64", &json, false).unwrap();
+            assert!(matches!(
+                value.kind,
+                Some(prost_types::value::Kind::StringValue(ref actual)) if actual == special
+            ));
+        }
     }
 
     #[test]

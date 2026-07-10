@@ -6,7 +6,8 @@ use duckdb::core::{
     DataChunkHandle, FlatVector, ListVector, LogicalTypeHandle, LogicalTypeId, StructVector,
 };
 use duckdb::ffi::{
-    duckdb_date, duckdb_hugeint, duckdb_interval, duckdb_string_t, duckdb_timestamp,
+    duckdb_date, duckdb_hugeint, duckdb_interval, duckdb_string_t, duckdb_time, duckdb_time_ns,
+    duckdb_timestamp, duckdb_uhugeint,
 };
 use duckdb::types::DuckString;
 use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
@@ -101,13 +102,26 @@ unsafe fn register_nullable_scalar<S: VScalar>(
                 ptr: input,
                 owned: false,
             });
-            let result = S::invoke(state, &mut chunk, &mut output);
-            if let Err(e) = result {
-                if let Ok(msg) = CString::new(e.to_string()) {
-                    duckdb_scalar_function_set_error(info, msg.as_ptr());
-                }
-            }
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                S::invoke(state, &mut chunk, &mut output)
+            }));
+            // DataChunkHandle's layout is private in duckdb-rs. This wrapper is borrowed
+            // from DuckDB, so it must never run Drop, including after a caught panic.
             std::mem::forget(chunk);
+
+            let error = match result {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(e.to_string()),
+                Err(payload) => Some(format!(
+                    "Rust panic in DuckDB scalar function: {}",
+                    panic_payload_message(payload.as_ref())
+                )),
+            };
+            if let Some(error) = error {
+                let msg = CString::new(error.replace('\0', "\\0"))
+                    .expect("escaped scalar error cannot contain NUL");
+                duckdb_scalar_function_set_error(info, msg.as_ptr());
+            }
         }
     }
 
@@ -143,6 +157,16 @@ unsafe fn register_nullable_scalar<S: VScalar>(
     duckdb_destroy_scalar_function_set(&mut { set });
 }
 
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "non-string panic payload"
+    }
+}
+
 fn varchar_sig(params: Vec<LogicalTypeHandle>) -> ScalarFunctionSignature {
     ScalarFunctionSignature::exact(params, LogicalTypeHandle::from(LogicalTypeId::Varchar))
 }
@@ -157,6 +181,8 @@ impl VScalar for SpannerValueScalar {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let logical_type = input.flat_vector(0).logical_type();
         let len = input.len();
+
+        validate_spanner_value_type(&logical_type, "spanner_value", false)?;
 
         if logical_type.id() == LogicalTypeId::Interval {
             let vec = input.flat_vector(0);
@@ -199,6 +225,8 @@ impl VScalar for SpannerTypedScalar {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let value_type = input.flat_vector(0).logical_type();
         let len = input.len();
+
+        validate_spanner_value_type(&value_type, "spanner_typed", true)?;
 
         if value_type.id() == LogicalTypeId::Interval {
             let value_vec = input.flat_vector(0);
@@ -268,8 +296,9 @@ impl VScalar for SpannerParamsScalar {
         output: &mut dyn WritableVector,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let len = input.len();
+        let struct_ty = input.flat_vector(0).logical_type();
+        validate_params_struct_type(&struct_ty)?;
         let struct_vec = input.struct_vector(0);
-        let struct_ty = struct_vec.logical_type();
 
         let mut strings = Vec::with_capacity(len);
         for row in 0..len {
@@ -347,13 +376,84 @@ fn scalar_type_name(id: LogicalTypeId) -> Option<&'static str> {
         LogicalTypeId::Varchar => Some("STRING"),
         LogicalTypeId::Blob | LogicalTypeId::Bit => Some("BYTES"),
         LogicalTypeId::Date => Some("DATE"),
-        LogicalTypeId::Timestamp | LogicalTypeId::TimestampTZ => Some("TIMESTAMP"),
+        LogicalTypeId::Timestamp
+        | LogicalTypeId::TimestampS
+        | LogicalTypeId::TimestampMs
+        | LogicalTypeId::TimestampNs
+        | LogicalTypeId::TimestampTZ => Some("TIMESTAMP"),
         LogicalTypeId::Uuid => Some("UUID"),
         LogicalTypeId::Interval => Some("INTERVAL"),
-        LogicalTypeId::Time => Some("STRING"),
+        LogicalTypeId::Time | LogicalTypeId::TimeNs => Some("STRING"),
         LogicalTypeId::Decimal => Some("NUMERIC"),
         _ => None,
     }
+}
+
+fn logical_scalar_type_name(ty: &LogicalTypeHandle) -> Option<&'static str> {
+    if is_json_type(ty) {
+        Some("JSON")
+    } else {
+        scalar_type_name(ty.id())
+    }
+}
+
+fn is_json_type(ty: &LogicalTypeHandle) -> bool {
+    ty.id() == LogicalTypeId::Varchar
+        && ty
+            .get_alias()
+            .is_some_and(|alias| alias.eq_ignore_ascii_case("JSON"))
+}
+
+fn validate_spanner_value_type(
+    ty: &LogicalTypeHandle,
+    function: &str,
+    allow_sql_null: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match ty.id() {
+        LogicalTypeId::List | LogicalTypeId::Array => {
+            let child = ty.child(0);
+            if logical_scalar_type_name(&child).is_some()
+                || (allow_sql_null && child.id() == LogicalTypeId::SqlNull)
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "Unsupported nested DuckDB type {:?} for {function}; LIST and ARRAY elements must be supported scalar types",
+                    child.id()
+                )
+                .into())
+            }
+        }
+        LogicalTypeId::SqlNull if allow_sql_null => Ok(()),
+        _ if logical_scalar_type_name(ty).is_some() => Ok(()),
+        id => Err(format!(
+            "Unsupported DuckDB type {id:?} for {function}; supported inputs are scalar, LIST, and ARRAY values with scalar elements"
+        )
+        .into()),
+    }
+}
+
+fn validate_params_struct_type(ty: &LogicalTypeHandle) -> Result<(), Box<dyn std::error::Error>> {
+    if ty.id() != LogicalTypeId::Struct {
+        return Err(format!(
+            "spanner_params requires a STRUCT argument, got {:?}",
+            ty.id()
+        )
+        .into());
+    }
+
+    for field_idx in 0..ty.num_children() {
+        let name = ty.child_name(field_idx);
+        let child = ty.child(field_idx);
+        if logical_scalar_type_name(&child).is_none() && child.id() != LogicalTypeId::SqlNull {
+            return Err(format!(
+                "Unsupported DuckDB type {:?} for spanner_params field '{name}'; plain fields must be supported scalar values, or use spanner_value/spanner_typed for arrays",
+                child.id()
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 fn spanner_type_name(ty: &LogicalTypeHandle) -> Option<String> {
@@ -362,10 +462,10 @@ fn spanner_type_name(ty: &LogicalTypeHandle) -> Option<String> {
             let child = ty.child(0);
             Some(format!(
                 "ARRAY<{}>",
-                scalar_type_name(child.id()).unwrap_or("UNKNOWN")
+                logical_scalar_type_name(&child).unwrap_or("UNKNOWN")
             ))
         }
-        _ => scalar_type_name(ty.id()).map(str::to_string),
+        _ => logical_scalar_type_name(ty).map(str::to_string),
     }
 }
 
@@ -409,6 +509,10 @@ fn vector_to_json_value(
     row: usize,
     ty: &LogicalTypeHandle,
 ) -> Result<Value, Box<dyn std::error::Error>> {
+    if input.flat_vector(col).row_is_null(row as u64) {
+        return Ok(Value::Null);
+    }
+
     match ty.id() {
         LogicalTypeId::List => {
             let list_vec = input.list_vector(col);
@@ -468,6 +572,12 @@ fn flat_vector_to_json_value(
         return Ok(Value::Null);
     }
 
+    if is_json_type(ty) {
+        let json_text = read_varchar_at(vec, row)?;
+        return serde_json::from_str(&json_text)
+            .map_err(|e| format!("Invalid DuckDB JSON value: {e}").into());
+    }
+
     match ty.id() {
         LogicalTypeId::Boolean => Ok(json!(unsafe {
             vec.as_slice_with_len::<bool>(row + 1)[row]
@@ -492,10 +602,13 @@ fn flat_vector_to_json_value(
         LogicalTypeId::UBigint => Ok(Value::String(
             unsafe { vec.as_slice_with_len::<u64>(row + 1)[row] }.to_string(),
         )),
-        LogicalTypeId::Hugeint | LogicalTypeId::UHugeint => {
-            Ok(Value::String(hugeint_to_string(unsafe {
-                vec.as_slice_with_len::<duckdb_hugeint>(row + 1)[row]
-            })))
+        LogicalTypeId::Hugeint => {
+            let raw = unsafe { vec.as_slice_with_len::<duckdb_hugeint>(row + 1)[row] };
+            Ok(Value::String(hugeint_to_i128(raw).to_string()))
+        }
+        LogicalTypeId::UHugeint => {
+            let raw = unsafe { vec.as_slice_with_len::<duckdb_uhugeint>(row + 1)[row] };
+            Ok(Value::String(uhugeint_to_u128(raw).to_string()))
         }
         LogicalTypeId::Decimal => Ok(Value::String(decimal_vector_to_string(vec, row, ty)?)),
         LogicalTypeId::Date => {
@@ -506,16 +619,52 @@ fn flat_vector_to_json_value(
             let micros = unsafe { vec.as_slice_with_len::<duckdb_timestamp>(row + 1)[row].micros };
             Ok(Value::String(micros_to_spanner_timestamp_string(micros)?))
         }
+        LogicalTypeId::TimestampS => {
+            let seconds = unsafe { vec.as_slice_with_len::<i64>(row + 1)[row] };
+            let micros = seconds
+                .checked_mul(1_000_000)
+                .ok_or_else(|| format!("TIMESTAMP_S overflow for seconds {seconds}"))?;
+            Ok(Value::String(micros_to_spanner_timestamp_string(micros)?))
+        }
+        LogicalTypeId::TimestampMs => {
+            let millis = unsafe { vec.as_slice_with_len::<i64>(row + 1)[row] };
+            let micros = millis
+                .checked_mul(1_000)
+                .ok_or_else(|| format!("TIMESTAMP_MS overflow for milliseconds {millis}"))?;
+            Ok(Value::String(micros_to_spanner_timestamp_string(micros)?))
+        }
+        LogicalTypeId::TimestampNs => {
+            let nanos = unsafe { vec.as_slice_with_len::<i64>(row + 1)[row] };
+            let timestamp = OffsetDateTime::from_unix_timestamp_nanos(nanos as i128)?;
+            Ok(Value::String(
+                timestamp.format(&time::format_description::well_known::Rfc3339)?,
+            ))
+        }
         LogicalTypeId::Blob | LogicalTypeId::Bit => {
             let bytes = read_blob_at(vec, row)?;
             Ok(Value::String(
                 base64::engine::general_purpose::STANDARD.encode(bytes),
             ))
         }
-        LogicalTypeId::Float => Ok(json!(unsafe { vec.as_slice_with_len::<f32>(row + 1)[row] })),
-        LogicalTypeId::Double => Ok(json!(unsafe { vec.as_slice_with_len::<f64>(row + 1)[row] })),
-        LogicalTypeId::Varchar | LogicalTypeId::Uuid | LogicalTypeId::Time => {
-            Ok(Value::String(read_varchar_at(vec, row)?))
+        LogicalTypeId::Float => {
+            float_to_json_value(unsafe { vec.as_slice_with_len::<f32>(row + 1)[row] } as f64)
+        }
+        LogicalTypeId::Double => {
+            float_to_json_value(unsafe { vec.as_slice_with_len::<f64>(row + 1)[row] })
+        }
+        LogicalTypeId::Varchar => Ok(Value::String(read_varchar_at(vec, row)?)),
+        LogicalTypeId::Uuid => {
+            let raw = unsafe { vec.as_slice_with_len::<duckdb_hugeint>(row + 1)[row] };
+            let uuid_bits = (hugeint_to_i128(raw) as u128) ^ (1u128 << 127);
+            Ok(Value::String(uuid::Uuid::from_u128(uuid_bits).to_string()))
+        }
+        LogicalTypeId::Time => {
+            let micros = unsafe { vec.as_slice_with_len::<duckdb_time>(row + 1)[row].micros };
+            Ok(Value::String(micros_to_time_string(micros)?))
+        }
+        LogicalTypeId::TimeNs => {
+            let nanos = unsafe { vec.as_slice_with_len::<duckdb_time_ns>(row + 1)[row].nanos };
+            Ok(Value::String(nanos_to_time_string(nanos)?))
         }
         LogicalTypeId::Interval => {
             let interval = unsafe { vec.as_slice_with_len::<duckdb_interval>(row + 1)[row] };
@@ -525,7 +674,7 @@ fn flat_vector_to_json_value(
                 interval.micros,
             )))
         }
-        _ => Ok(Value::String(read_varchar_at(vec, row)?)),
+        id => Err(format!("Unsupported DuckDB physical vector type {id:?}").into()),
     }
 }
 
@@ -538,10 +687,52 @@ fn epoch_days_to_date_string(days: i32) -> Result<String, Box<dyn std::error::Er
     Ok(format!("{:04}-{:02}-{:02}", year, month as u8, day))
 }
 
-fn hugeint_to_string(value: duckdb_hugeint) -> String {
-    let lower = value.lower as i128;
-    let upper = value.upper as i128;
-    ((upper << 64) | (lower & 0xFFFF_FFFF_FFFF_FFFF)).to_string()
+fn float_to_json_value(value: f64) -> Result<Value, Box<dyn std::error::Error>> {
+    if value.is_finite() {
+        let number = serde_json::Number::from_f64(value)
+            .ok_or_else(|| format!("Invalid JSON number: {value}"))?;
+        Ok(Value::Number(number))
+    } else if value.is_nan() {
+        Ok(Value::String("NaN".to_string()))
+    } else if value.is_sign_positive() {
+        Ok(Value::String("Infinity".to_string()))
+    } else {
+        Ok(Value::String("-Infinity".to_string()))
+    }
+}
+
+fn hugeint_to_i128(value: duckdb_hugeint) -> i128 {
+    ((value.upper as i128) << 64) | value.lower as i128
+}
+
+fn uhugeint_to_u128(value: duckdb_uhugeint) -> u128 {
+    ((value.upper as u128) << 64) | value.lower as u128
+}
+
+fn micros_to_time_string(micros: i64) -> Result<String, Box<dyn std::error::Error>> {
+    const MICROS_PER_DAY: i64 = 86_400_000_000;
+    if !(0..MICROS_PER_DAY).contains(&micros) {
+        return Err(format!("TIME value is outside one day: {micros} microseconds").into());
+    }
+
+    let hour = micros / 3_600_000_000;
+    let minute = micros % 3_600_000_000 / 60_000_000;
+    let second = micros % 60_000_000 / 1_000_000;
+    let fractional = micros % 1_000_000;
+    Ok(format!("{hour:02}:{minute:02}:{second:02}.{fractional:06}"))
+}
+
+fn nanos_to_time_string(nanos: i64) -> Result<String, Box<dyn std::error::Error>> {
+    const NANOS_PER_DAY: i64 = 86_400_000_000_000;
+    if !(0..NANOS_PER_DAY).contains(&nanos) {
+        return Err(format!("TIME_NS value is outside one day: {nanos} nanoseconds").into());
+    }
+
+    let hour = nanos / 3_600_000_000_000;
+    let minute = nanos % 3_600_000_000_000 / 60_000_000_000;
+    let second = nanos % 60_000_000_000 / 1_000_000_000;
+    let fractional = nanos % 1_000_000_000;
+    Ok(format!("{hour:02}:{minute:02}:{second:02}.{fractional:09}"))
 }
 
 fn decimal_vector_to_string(
@@ -576,7 +767,7 @@ unsafe fn read_decimal_raw(
         duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT => *data.cast::<i16>().add(row_idx) as i128,
         duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER => *data.cast::<i32>().add(row_idx) as i128,
         duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT => *data.cast::<i64>().add(row_idx) as i128,
-        _ => *data.cast::<i128>().add(row_idx),
+        _ => hugeint_to_i128(*data.cast::<duckdb_hugeint>().add(row_idx)),
     }
 }
 
@@ -595,6 +786,10 @@ fn read_varchar_at(vec: &FlatVector, row: usize) -> Result<String, Box<dyn std::
 }
 
 fn struct_field_to_param_json(value: Value, ty: &LogicalTypeHandle) -> Value {
+    if is_json_type(ty) {
+        return json!({"value": value, "type": "JSON"});
+    }
+
     if ty.id() == LogicalTypeId::Varchar {
         if let Value::String(s) = value {
             if let Ok(parsed) = serde_json::from_str::<Value>(&s) {
@@ -605,14 +800,26 @@ fn struct_field_to_param_json(value: Value, ty: &LogicalTypeHandle) -> Value {
             return Value::String(s);
         }
     }
-    if ty.id() == LogicalTypeId::Decimal {
-        if let Value::String(s) = &value {
-            if let Ok(n) = s.parse::<f64>() {
-                if let Some(num) = serde_json::Number::from_f64(n) {
-                    return Value::Number(num);
-                }
-            }
-        }
+
+    if matches!(
+        ty.id(),
+        LogicalTypeId::Decimal
+            | LogicalTypeId::UBigint
+            | LogicalTypeId::Hugeint
+            | LogicalTypeId::UHugeint
+    ) {
+        return json!({"value": value, "type": "NUMERIC"});
+    }
+
+    if matches!(ty.id(), LogicalTypeId::Float | LogicalTypeId::Double)
+        && matches!(&value, Value::String(s) if matches!(s.as_str(), "NaN" | "Infinity" | "-Infinity"))
+    {
+        let type_name = if ty.id() == LogicalTypeId::Float {
+            "FLOAT32"
+        } else {
+            "FLOAT64"
+        };
+        return json!({"value": value, "type": type_name});
     }
     value
 }
@@ -709,6 +916,26 @@ mod tests {
     use super::*;
     use duckdb::Connection;
 
+    struct PanickingScalar;
+
+    impl VScalar for PanickingScalar {
+        type State = ();
+
+        fn invoke(
+            _: &Self::State,
+            _: &mut DataChunkHandle,
+            _: &mut dyn WritableVector,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            panic!("intentional scalar panic")
+        }
+
+        fn signatures() -> Vec<ScalarFunctionSignature> {
+            vec![varchar_sig(vec![LogicalTypeHandle::from(
+                LogicalTypeId::Integer,
+            )])]
+        }
+    }
+
     fn open_test_connection() -> Connection {
         use duckdb::ffi::{self, DuckDBSuccess};
         unsafe {
@@ -724,9 +951,31 @@ mod tests {
             let rc = ffi::duckdb_connect(db, &mut raw_con);
             assert_eq!(rc, DuckDBSuccess, "duckdb_connect failed");
             register_scalars_c_api(raw_con);
+            register_nullable_scalar::<PanickingScalar>(
+                raw_con,
+                "test_panicking_scalar",
+                &[ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER],
+            );
             ffi::duckdb_disconnect(&mut raw_con);
             Connection::open_from_raw(db).unwrap()
         }
+    }
+
+    fn query_string(conn: &Connection, expression: &str) -> String {
+        conn.query_row(&format!("SELECT {expression}"), [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn assert_query_error(conn: &Connection, expression: &str, expected: &str) {
+        let error = conn
+            .query_row(&format!("SELECT {expression}"), [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(expected),
+            "expected error containing {expected:?}, got {error}"
+        );
     }
 
     #[test]
@@ -839,6 +1088,194 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["type"], "INT64");
         assert_eq!(parsed["value"], 42);
+    }
+
+    #[test]
+    fn test_spanner_value_exact_physical_types() {
+        let conn = open_test_connection();
+        let cases = [
+            (
+                "spanner_value('340282366920938463463374607431768211455'::UHUGEINT)",
+                r#"{"type":"NUMERIC","value":"340282366920938463463374607431768211455"}"#,
+            ),
+            (
+                "spanner_value(UUID '550e8400-e29b-41d4-a716-446655440000')",
+                r#"{"type":"UUID","value":"550e8400-e29b-41d4-a716-446655440000"}"#,
+            ),
+            (
+                "spanner_value(TIME '12:34:56.123456')",
+                r#"{"type":"STRING","value":"12:34:56.123456"}"#,
+            ),
+            (
+                "spanner_value('12345678901234567890123456789.123456789'::DECIMAL(38,9))",
+                r#"{"type":"NUMERIC","value":"12345678901234567890123456789.123456789"}"#,
+            ),
+            (
+                "spanner_value('2024-01-15 12:34:56'::TIMESTAMP_S)",
+                r#"{"type":"TIMESTAMP","value":"2024-01-15T12:34:56.000000Z"}"#,
+            ),
+        ];
+
+        for (expression, expected) in cases {
+            assert_eq!(query_string(&conn, expression), expected, "{expression}");
+        }
+    }
+
+    #[test]
+    fn test_spanner_value_distinguishes_null_and_empty_containers() {
+        let conn = open_test_connection();
+        let cases = [
+            (
+                "spanner_value(NULL::BIGINT[])",
+                r#"{"type":"ARRAY<INT64>","value":null}"#,
+            ),
+            (
+                "spanner_value([]::BIGINT[])",
+                r#"{"type":"ARRAY<INT64>","value":[]}"#,
+            ),
+            (
+                "spanner_value(NULL::BIGINT[2])",
+                r#"{"type":"ARRAY<INT64>","value":null}"#,
+            ),
+            (
+                "spanner_value([NULL, NULL]::BIGINT[2])",
+                r#"{"type":"ARRAY<INT64>","value":[null,null]}"#,
+            ),
+        ];
+
+        for (expression, expected) in cases {
+            assert_eq!(query_string(&conn, expression), expected, "{expression}");
+        }
+    }
+
+    #[test]
+    fn test_spanner_value_non_finite_floats() {
+        let conn = open_test_connection();
+        let cases = [
+            (
+                "spanner_value('NaN'::FLOAT)",
+                r#"{"type":"FLOAT32","value":"NaN"}"#,
+            ),
+            (
+                "spanner_value('Infinity'::FLOAT)",
+                r#"{"type":"FLOAT32","value":"Infinity"}"#,
+            ),
+            (
+                "spanner_value('-Infinity'::FLOAT)",
+                r#"{"type":"FLOAT32","value":"-Infinity"}"#,
+            ),
+            (
+                "spanner_value('NaN'::DOUBLE)",
+                r#"{"type":"FLOAT64","value":"NaN"}"#,
+            ),
+            (
+                "spanner_value('Infinity'::DOUBLE)",
+                r#"{"type":"FLOAT64","value":"Infinity"}"#,
+            ),
+            (
+                "spanner_value('-Infinity'::DOUBLE)",
+                r#"{"type":"FLOAT64","value":"-Infinity"}"#,
+            ),
+        ];
+
+        for (expression, expected) in cases {
+            assert_eq!(query_string(&conn, expression), expected, "{expression}");
+        }
+    }
+
+    #[test]
+    fn test_spanner_value_json_alias_preserves_structure() {
+        let conn = open_test_connection();
+
+        assert_eq!(
+            query_string(&conn, r#"spanner_value(json('{"a":1}'))"#),
+            r#"{"type":"JSON","value":{"a":1}}"#
+        );
+        assert_eq!(
+            query_string(
+                &conn,
+                r#"spanner_params({'x': spanner_value(json('{"a":1}'))})"#,
+            ),
+            r#"{"x":{"type":"JSON","value":{"a":1}}}"#
+        );
+        let plain_json = query_string(&conn, r#"spanner_params({'x': json('{"a":1}')})"#);
+        assert_eq!(plain_json, r#"{"x":{"type":"JSON","value":{"a":1}}}"#);
+        crate::params::create_statement("SELECT @x", Some(&plain_json)).unwrap();
+    }
+
+    #[test]
+    fn test_spanner_params_preserves_exact_numeric_types() {
+        let conn = open_test_connection();
+
+        assert_eq!(
+            query_string(
+                &conn,
+                "spanner_params({'x': '12345678901234567890123456789.123456789'::DECIMAL(38,9)})",
+            ),
+            r#"{"x":{"type":"NUMERIC","value":"12345678901234567890123456789.123456789"}}"#
+        );
+        assert_eq!(
+            query_string(
+                &conn,
+                "spanner_params({'x': '18446744073709551615'::UBIGINT})",
+            ),
+            r#"{"x":{"type":"NUMERIC","value":"18446744073709551615"}}"#
+        );
+        assert_eq!(
+            query_string(&conn, "spanner_params({'x': spanner_value([1, 2])})"),
+            r#"{"x":{"type":"ARRAY<INT64>","value":[1,2]}}"#
+        );
+
+        let non_finite = query_string(&conn, "spanner_params({'x': 'NaN'::DOUBLE})");
+        assert_eq!(non_finite, r#"{"x":{"type":"FLOAT64","value":"NaN"}}"#);
+        crate::params::create_statement("SELECT @x", Some(&non_finite)).unwrap();
+    }
+
+    #[test]
+    fn test_unsupported_physical_types_return_errors() {
+        let conn = open_test_connection();
+
+        assert_query_error(
+            &conn,
+            "spanner_value({'a': 1})",
+            "Unsupported DuckDB type Struct for spanner_value",
+        );
+        assert_query_error(
+            &conn,
+            "spanner_typed({'a': 1}, 'JSON')",
+            "Unsupported DuckDB type Struct for spanner_typed",
+        );
+        assert_query_error(
+            &conn,
+            "spanner_value([[1, 2]])",
+            "Unsupported nested DuckDB type List for spanner_value",
+        );
+        assert_query_error(
+            &conn,
+            "spanner_value([{'a': 1}])",
+            "Unsupported nested DuckDB type Struct for spanner_value",
+        );
+        assert_query_error(
+            &conn,
+            "spanner_params({'x': [1, 2]})",
+            "Unsupported DuckDB type List for spanner_params field 'x'",
+        );
+        assert_query_error(
+            &conn,
+            "spanner_params({'x': {'a': 1}})",
+            "Unsupported DuckDB type Struct for spanner_params field 'x'",
+        );
+    }
+
+    #[test]
+    fn test_scalar_callback_catches_panics() {
+        let conn = open_test_connection();
+
+        assert_query_error(
+            &conn,
+            "test_panicking_scalar(1)",
+            "Rust panic in DuckDB scalar function: intentional scalar panic",
+        );
     }
 
     #[test]

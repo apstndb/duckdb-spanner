@@ -81,6 +81,95 @@ SELECT IF(
 	error('expected spanner_typed INT64 JSON')
 );
 
+query T
+SELECT spanner_value('340282366920938463463374607431768211455'::UHUGEINT);
+----
+{"type":"NUMERIC","value":"340282366920938463463374607431768211455"}
+
+query T
+SELECT spanner_value(UUID '550e8400-e29b-41d4-a716-446655440000');
+----
+{"type":"UUID","value":"550e8400-e29b-41d4-a716-446655440000"}
+
+query T
+SELECT spanner_value(TIME '12:34:56.123456');
+----
+{"type":"STRING","value":"12:34:56.123456"}
+
+query T
+SELECT spanner_value('2024-01-15 12:34:56'::TIMESTAMP_S);
+----
+{"type":"TIMESTAMP","value":"2024-01-15T12:34:56.000000Z"}
+
+query TTTT
+SELECT spanner_value(NULL::BIGINT[]), spanner_value([]::BIGINT[]), spanner_value(NULL::BIGINT[2]), spanner_value([NULL, NULL]::BIGINT[2]);
+----
+{"type":"ARRAY<INT64>","value":null}	{"type":"ARRAY<INT64>","value":[]}	{"type":"ARRAY<INT64>","value":null}	{"type":"ARRAY<INT64>","value":[null,null]}
+
+query T
+SELECT spanner_params({'x': '12345678901234567890123456789.123456789'::DECIMAL(38,9)});
+----
+{"x":{"type":"NUMERIC","value":"12345678901234567890123456789.123456789"}}
+
+query T
+SELECT spanner_value(value) FROM (VALUES ('NaN'::FLOAT), ('Infinity'::FLOAT), ('-Infinity'::FLOAT)) values_table(value);
+----
+{"type":"FLOAT32","value":"NaN"}
+{"type":"FLOAT32","value":"Infinity"}
+{"type":"FLOAT32","value":"-Infinity"}
+
+query T
+SELECT spanner_value(value) FROM (VALUES ('NaN'::DOUBLE), ('Infinity'::DOUBLE), ('-Infinity'::DOUBLE)) values_table(value);
+----
+{"type":"FLOAT64","value":"NaN"}
+{"type":"FLOAT64","value":"Infinity"}
+{"type":"FLOAT64","value":"-Infinity"}
+
+query T
+SELECT spanner_params({'x': 'NaN'::DOUBLE});
+----
+{"x":{"type":"FLOAT64","value":"NaN"}}
+
+query T
+SELECT spanner_value(json('{"a":1}'));
+----
+{"type":"JSON","value":{"a":1}}
+
+query T
+SELECT spanner_params({'x': spanner_value(json('{"a":1}'))});
+----
+{"x":{"type":"JSON","value":{"a":1}}}
+
+query T
+SELECT spanner_params({'x': json('{"a":1}')});
+----
+{"x":{"type":"JSON","value":{"a":1}}}
+
+statement error
+SELECT spanner_value({'a': 1});
+----
+Unsupported DuckDB type Struct for spanner_value
+
+statement error
+SELECT spanner_typed({'a': 1}, 'JSON');
+----
+Unsupported DuckDB type Struct for spanner_typed
+
+statement error
+SELECT spanner_value([[1, 2]]);
+----
+Unsupported nested DuckDB type List for spanner_value
+
+statement error
+SELECT spanner_value([{'a': 1}]);
+----
+Unsupported nested DuckDB type Struct for spanner_value
+
+statement error
+SELECT spanner_params({'x': [1, 2]});
+----
+Unsupported DuckDB type List for spanner_params field 'x'
+
 statement ok
 SELECT IF(
 	strpos(spanner_params({'age': spanner_value(25::BIGINT), 'name': 'Alice'}), 'Alice') > 0
