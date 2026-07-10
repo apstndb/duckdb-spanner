@@ -82,6 +82,10 @@ cargo build --features loadable-extension --release
 
 The built extension is `spanner.duckdb_extension` (via `make extension`) or `target/release/libduckdb_spanner.dylib` (macOS) / `libduckdb_spanner.so` (Linux).
 
+### Published Release Assets
+
+Publishing a GitHub Release builds the supported DuckDB `v1.5.4` distributions and attaches them to that release. Each asset name includes its target platform, for example `spanner-v1.5.4-linux_amd64.duckdb_extension`. Draft releases do not build assets until they are published.
+
 ### Loading the Extension
 
 This is an unsigned extension, so DuckDB must be started with the `-unsigned` flag:
