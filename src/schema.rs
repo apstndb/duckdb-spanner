@@ -1,29 +1,33 @@
-use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex};
+use std::future::Future;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::model::execute_sql_request::QueryMode;
 use google_cloud_spanner::statement::Statement;
 use google_cloud_spanner::types::Type;
 use google_cloud_spanner_admin_database_v1::model::DatabaseDialect;
+use tokio::sync::OnceCell;
 
+use crate::cache::LruCache;
 use crate::error::SpannerError;
 use crate::types;
+
+/// Keep the dialect cache aligned with the client cache in `client.rs`.
+const DIALECT_CACHE_CAPACITY: usize = 8;
+
+type DialectSlot = Arc<OnceCell<DatabaseDialect>>;
+type DialectCache = LruCache<String, DialectSlot>;
 
 /// Cache of detected dialects, keyed by the same `(database, endpoint)` key
 /// used by the client cache in `client.rs` (see `client::cache_key`).
 ///
 /// `detect_dialect` issues a query, so callers that run it on every bind
 /// (`spanner_scan`, `COPY TO ... (FORMAT spanner)`) look here first to avoid
-/// a redundant round-trip against the same database.
-///
-/// TODO: this cache is unbounded — connecting to many distinct databases in a
-/// long-running process grows it without limit (same class of issue as the old
-/// client cache, #5). The payload is tiny (one enum per database) so bounding
-/// it is not urgent, but it should eventually share the client cache's LRU
-/// eviction (or be folded into it).
-static DIALECT_CACHE: LazyLock<Mutex<HashMap<String, DatabaseDialect>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// a redundant round-trip against the same database. Each slot is a `OnceCell`
+/// so concurrent misses for one key share the primary metadata query. Failed
+/// queries do not populate the cell and retry normally on the next bind.
+static DIALECT_CACHE: LazyLock<Mutex<DialectCache>> =
+    LazyLock::new(|| Mutex::new(LruCache::new(DIALECT_CACHE_CAPACITY)));
 
 /// Column metadata discovered from Spanner schema.
 #[derive(Debug, Clone)]
@@ -55,11 +59,12 @@ pub fn parse_dialect(s: &str) -> Result<DatabaseDialect, Box<dyn std::error::Err
 /// `information_schema` views), so a single query form works regardless of
 /// the (as yet unknown) dialect.
 ///
-/// Fallback: if that query errors (e.g. an older emulator that doesn't
-/// support `DATABASE_OPTIONS`), fall back to the previous heuristic of
-/// checking for a `public` schema in `INFORMATION_SCHEMA.SCHEMATA`. This
-/// heuristic can misdetect a GoogleSQL database with a user-created `public`
-/// schema, so it's only used as a last resort.
+/// If `DATABASE_OPTIONS` cannot be queried, this preserves the original error.
+/// In particular, it does not infer a dialect from a `public` schema: a
+/// GoogleSQL database can have a user-created schema with that name. Callers
+/// targeting an endpoint without `DATABASE_OPTIONS` support must use an
+/// explicit dialect where that option is available. Other callers return the
+/// original discovery error instead of guessing.
 ///
 /// Results are cached per `(database, endpoint)` key (see `client::cache_key`)
 /// since callers such as `spanner_scan` and `COPY TO ... (FORMAT spanner)`
@@ -70,42 +75,33 @@ pub async fn detect_dialect(
     endpoint: Option<&str>,
 ) -> Result<DatabaseDialect, SpannerError> {
     let key = crate::client::cache_key(database, endpoint);
-    // Copy the cached value out before the `if let` so the MutexGuard is
-    // dropped immediately rather than held across the block.
-    let cached = DIALECT_CACHE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&key)
-        .cloned();
-    if let Some(dialect) = cached {
-        return Ok(dialect);
-    }
+    let (slot, _) = get_or_insert_dialect_slot(&DIALECT_CACHE, key);
+    get_or_detect_dialect(&slot, || detect_dialect_via_database_options(client)).await
+}
 
-    match detect_dialect_via_database_options(client).await {
-        Ok(dialect) => {
-            // Only DATABASE_OPTIONS-derived results are cached. The value is an
-            // authoritative, immutable database property, so caching it for the
-            // process lifetime is safe.
-            DIALECT_CACHE
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(key, dialect.clone());
-            Ok(dialect)
-        }
-        Err(e) => {
-            // The primary query failed — this may be a transient error
-            // (e.g. UNAVAILABLE) rather than an unsupported-feature error, so
-            // do NOT cache the heuristic result: caching a misdetection from a
-            // transient blip would permanently poison the dialect for the
-            // process (the exact bug #7 fixes). Return the heuristic result but
-            // leave the cache empty so the next bind retries the primary path.
-            eprintln!(
-                "[duckdb-spanner] dialect detection via DATABASE_OPTIONS failed ({e}), \
-                 falling back to schema heuristic"
-            );
-            detect_dialect_via_public_schema(client).await
-        }
-    }
+/// Look up or create a bounded cache slot without holding the mutex during
+/// database I/O. Recovering a poisoned mutex is intentional: this cache is an
+/// optimization and must not unwind through DuckDB's FFI boundary.
+fn get_or_insert_dialect_slot(
+    cache: &Mutex<DialectCache>,
+    key: String,
+) -> (DialectSlot, Option<DialectSlot>) {
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    cache.get_or_insert_with(key, || Arc::new(OnceCell::new()))
+}
+
+/// Run dialect discovery once for a cache slot. `OnceCell` stores only a
+/// successful result, so RPC, authentication, transport, and response errors
+/// remain retryable and are returned unchanged to the caller.
+async fn get_or_detect_dialect<F, Fut>(
+    slot: &DialectSlot,
+    detect: F,
+) -> Result<DatabaseDialect, SpannerError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<DatabaseDialect, SpannerError>>,
+{
+    Ok(slot.get_or_try_init(detect).await?.clone())
 }
 
 /// Query `INFORMATION_SCHEMA.DATABASE_OPTIONS` for the `database_dialect` option.
@@ -143,26 +139,6 @@ fn parse_database_dialect_option(value: &str) -> Result<DatabaseDialect, Spanner
         other => Err(SpannerError::Other(format!(
             "Unrecognized database_dialect option value: {other}"
         ))),
-    }
-}
-
-/// Fallback heuristic: PostgreSQL-dialect databases have a 'public' schema;
-/// GoogleSQL databases do not (unless the user created one, in which case
-/// this misdetects -- see `detect_dialect_via_database_options` above, which
-/// is tried first).
-async fn detect_dialect_via_public_schema(
-    client: &DatabaseClient,
-) -> Result<DatabaseDialect, SpannerError> {
-    let stmt = Statement::builder(
-        "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = 'public'",
-    )
-    .build();
-    let tx = client.single_use().build();
-    let mut iter = tx.execute_query(stmt).await?;
-    if iter.next().await.transpose()?.is_some() {
-        Ok(DatabaseDialect::Postgresql)
-    } else {
-        Ok(DatabaseDialect::GoogleStandardSql)
     }
 }
 
@@ -207,7 +183,8 @@ pub async fn discover_query_schema(
 ///
 /// If `dialect` is `Unspecified`, auto-detects via `detect_dialect` (one extra
 /// round-trip, cached per `(database, endpoint)`). Specify `GoogleStandardSql`
-/// or `Postgresql` to skip detection.
+/// or `Postgresql` to skip detection, including for endpoints that do not
+/// support `INFORMATION_SCHEMA.DATABASE_OPTIONS`.
 ///
 /// The `table` parameter can be:
 /// - `"MyTable"` — resolves to the default schema ('' for GoogleSQL, 'public' for PG)
@@ -333,7 +310,27 @@ fn split_schema_table(qualified_name: &str) -> (&str, &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use google_cloud_gax::error::rpc::{Code, Status};
+    use google_cloud_spanner::Error as SpannerClientError;
+
     use super::*;
+
+    fn rpc_error(code: Code) -> SpannerError {
+        SpannerError::GoogleCloud(SpannerClientError::service(
+            Status::default().set_code(code).set_message("test"),
+        ))
+    }
+
+    fn status_code(error: &SpannerError) -> Option<Code> {
+        match error {
+            SpannerError::GoogleCloud(error) => error.status().map(|status| status.code),
+            _ => None,
+        }
+    }
 
     #[test]
     fn parse_database_dialect_option_recognizes_known_values() {
@@ -425,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn dialect_cache_is_keyed_like_client_cache() {
+    fn dialect_cache_key_matches_client_cache() {
         // Sanity check that the same (database, endpoint) pair used to key
         // the client cache also keys the dialect cache, so a cached client
         // and its cached dialect stay associated.
@@ -435,14 +432,139 @@ mod tests {
 
         let key_c = crate::client::cache_key("db2", Some("localhost:9010"));
         assert_ne!(key_a, key_c);
+    }
 
-        DIALECT_CACHE
-            .lock()
-            .unwrap()
-            .insert(key_a.clone(), DatabaseDialect::Postgresql);
-        assert_eq!(
-            DIALECT_CACHE.lock().unwrap().get(&key_b),
-            Some(&DatabaseDialect::Postgresql)
+    #[tokio::test]
+    async fn database_options_caches_postgresql_discovery() {
+        let slot = Arc::new(OnceCell::new());
+        let primary_calls = AtomicUsize::new(0);
+        let cached_calls = AtomicUsize::new(0);
+
+        let dialect = get_or_detect_dialect(&slot, || async {
+            primary_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(DatabaseDialect::Postgresql)
+        })
+        .await
+        .unwrap();
+        assert_eq!(dialect, DatabaseDialect::Postgresql);
+
+        let cached = get_or_detect_dialect(&slot, || async {
+            cached_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(DatabaseDialect::GoogleStandardSql)
+        })
+        .await
+        .unwrap();
+        assert_eq!(cached, DatabaseDialect::Postgresql);
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cached_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn database_options_caches_googlesql_discovery() {
+        let slot = Arc::new(OnceCell::new());
+
+        let dialect =
+            get_or_detect_dialect(&slot, || async { Ok(DatabaseDialect::GoogleStandardSql) })
+                .await
+                .unwrap();
+
+        assert_eq!(dialect, DatabaseDialect::GoogleStandardSql);
+        assert_eq!(slot.get(), Some(&DatabaseDialect::GoogleStandardSql));
+    }
+
+    #[tokio::test]
+    async fn concurrent_dialect_cache_misses_share_one_discovery() {
+        let slot = Arc::new(OnceCell::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let (first, second) = tokio::join!(
+            get_or_detect_dialect(&slot, || {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    Ok(DatabaseDialect::GoogleStandardSql)
+                }
+            }),
+            get_or_detect_dialect(&slot, || {
+                let calls = Arc::clone(&calls);
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(DatabaseDialect::GoogleStandardSql)
+                }
+            }),
         );
+
+        assert_eq!(first.unwrap(), DatabaseDialect::GoogleStandardSql);
+        assert_eq!(second.unwrap(), DatabaseDialect::GoogleStandardSql);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn database_options_errors_are_propagated_without_fallback_or_cache() {
+        for code in [
+            Code::Unavailable,
+            Code::Unauthenticated,
+            Code::PermissionDenied,
+            Code::ResourceExhausted,
+            Code::DeadlineExceeded,
+            Code::InvalidArgument,
+        ] {
+            let slot = Arc::new(OnceCell::new());
+            let returned = get_or_detect_dialect(&slot, || async move {
+                Err::<DatabaseDialect, SpannerError>(rpc_error(code))
+            })
+            .await
+            .unwrap_err();
+
+            assert_eq!(status_code(&returned), Some(code));
+            assert!(slot.get().is_none());
+        }
+
+        let slot = Arc::new(OnceCell::new());
+        let returned = get_or_detect_dialect(&slot, || async {
+            Err::<DatabaseDialect, SpannerError>(SpannerError::Other(
+                "malformed database_dialect response".to_string(),
+            ))
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            returned,
+            SpannerError::Other(message) if message == "malformed database_dialect response"
+        ));
+        assert!(slot.get().is_none());
+    }
+
+    #[test]
+    fn dialect_cache_evicts_the_least_recently_used_slot() {
+        let cache = Mutex::new(DialectCache::new(2));
+        let (first, evicted) = get_or_insert_dialect_slot(&cache, "first".to_string());
+        assert!(evicted.is_none());
+        let (second, evicted) = get_or_insert_dialect_slot(&cache, "second".to_string());
+        assert!(evicted.is_none());
+
+        let (first_hit, evicted) = get_or_insert_dialect_slot(&cache, "first".to_string());
+        assert!(evicted.is_none());
+        assert!(Arc::ptr_eq(&first, &first_hit));
+
+        let (_, evicted) = get_or_insert_dialect_slot(&cache, "third".to_string());
+        let evicted = evicted.expect("the full cache must evict one slot");
+        assert!(Arc::ptr_eq(&evicted, &second));
+    }
+
+    #[test]
+    fn dialect_cache_recovers_from_a_poisoned_mutex() {
+        let cache = Mutex::new(DialectCache::new(1));
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = cache.lock().unwrap();
+            panic!("poison the dialect cache mutex");
+        }));
+        assert!(panic.is_err());
+
+        let (slot, evicted) = get_or_insert_dialect_slot(&cache, "database".to_string());
+        assert!(evicted.is_none());
+        assert!(slot.get().is_none());
     }
 }
