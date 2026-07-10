@@ -1,6 +1,10 @@
+use std::sync::LazyLock;
+
 use duckdb::core::{LogicalTypeHandle, LogicalTypeId};
 use google_cloud_spanner::model;
 use google_cloud_spanner::types::{self as spanner_types, Type, TypeCode};
+
+static PG_NUMERIC_TYPE: LazyLock<Type> = LazyLock::new(spanner_types::pg_numeric);
 
 /// Convert a Spanner Type to a DuckDB LogicalTypeHandle.
 pub fn spanner_type_to_logical(spanner_type: &Type) -> LogicalTypeHandle {
@@ -9,6 +13,12 @@ pub fn spanner_type_to_logical(spanner_type: &Type) -> LogicalTypeHandle {
         TypeCode::Int64 => LogicalTypeHandle::from(LogicalTypeId::Bigint),
         TypeCode::Float32 => LogicalTypeHandle::from(LogicalTypeId::Float),
         TypeCode::Float64 => LogicalTypeHandle::from(LogicalTypeId::Double),
+        // PostgreSQL `numeric` has arbitrary precision and admits `NaN`, while
+        // DuckDB DECIMAL is limited to a fixed precision and scale. Preserve
+        // the wire string rather than truncating, overflowing, or rejecting it.
+        TypeCode::Numeric if is_pg_numeric(spanner_type) => {
+            LogicalTypeHandle::from(LogicalTypeId::Varchar)
+        }
         TypeCode::Numeric => LogicalTypeHandle::decimal(38, 9),
         TypeCode::String => LogicalTypeHandle::from(LogicalTypeId::Varchar),
         TypeCode::Json => {
@@ -59,6 +69,14 @@ pub fn spanner_type_to_logical(spanner_type: &Type) -> LogicalTypeHandle {
             LogicalTypeHandle::from(LogicalTypeId::Varchar)
         }
     }
+}
+
+/// Whether a NUMERIC Type uses PostgreSQL semantics.
+///
+/// The official client exposes the dialect distinction through the generated
+/// type annotation, while both dialects share `TypeCode::Numeric`.
+pub fn is_pg_numeric(spanner_type: &Type) -> bool {
+    spanner_type == &*PG_NUMERIC_TYPE
 }
 
 /// Parse a PG dialect SPANNER_TYPE string from INFORMATION_SCHEMA.COLUMNS.
@@ -420,6 +438,23 @@ mod tests {
         assert_eq!(
             boolean.type_annotation,
             model::TypeAnnotationCode::Unspecified
+        );
+    }
+
+    #[test]
+    fn pg_numeric_maps_to_varchar_to_preserve_special_and_wide_values() {
+        let pg_numeric = parse_pg_spanner_type("numeric");
+        assert!(is_pg_numeric(&pg_numeric));
+        assert_eq!(
+            spanner_type_to_logical(&pg_numeric).id(),
+            LogicalTypeId::Varchar
+        );
+
+        let googlesql_numeric = parse_spanner_type("NUMERIC");
+        assert!(!is_pg_numeric(&googlesql_numeric));
+        assert_eq!(
+            spanner_type_to_logical(&googlesql_numeric).id(),
+            LogicalTypeId::Decimal
         );
     }
 

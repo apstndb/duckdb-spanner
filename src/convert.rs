@@ -8,6 +8,7 @@ use time::OffsetDateTime;
 
 use crate::error::SpannerError;
 use crate::schema::ColumnInfo;
+use crate::types::is_pg_numeric;
 
 const EPOCH_DATE: time::Date = time::macros::date!(1970 - 01 - 01);
 
@@ -145,7 +146,7 @@ pub fn write_column_from_rows(
             output_col_idx,
             rows,
             spanner_col_idx,
-            type_code,
+            spanner_type,
             column_name,
         ),
     }
@@ -157,7 +158,7 @@ fn write_scalar_column(
     output_col_idx: usize,
     rows: &[Row],
     spanner_col_idx: usize,
-    type_code: TypeCode,
+    spanner_type: &Type,
     column_name: &str,
 ) -> Result<(), SpannerError> {
     let mut vector = output.flat_vector(output_col_idx);
@@ -166,7 +167,7 @@ fn write_scalar_column(
         if val.kind() == Kind::Null {
             vector.set_null(i);
         } else {
-            write_raw_scalar_to_flat(&mut vector, i, val, type_code, &|| {
+            write_raw_scalar_to_flat(&mut vector, i, val, spanner_type, &|| {
                 format!("column '{column_name}', row {i}")
             })?;
         }
@@ -304,7 +305,7 @@ fn write_array_column(
             for (row_idx, values) in raw_values.iter().enumerate() {
                 let Some(values) = values else { continue };
                 for (elem_idx, val) in values.iter().enumerate() {
-                    write_raw_scalar_to_flat(&mut child, flat_idx, val, elem_type_code, &|| {
+                    write_raw_scalar_to_flat(&mut child, flat_idx, val, &element_type, &|| {
                         format!("column '{column_name}', row {row_idx}, array element {elem_idx}")
                     })?;
                     flat_idx += 1;
@@ -411,7 +412,7 @@ fn write_raw_struct_value(
                         &mut child,
                         row_idx,
                         val,
-                        field_type_code,
+                        &field_type,
                         &field_context,
                     )?;
                 } else {
@@ -478,7 +479,7 @@ fn write_raw_list_value(
                     &mut child,
                     current_len + j,
                     val,
-                    elem_type_code,
+                    element_type,
                     &elem_context,
                 )?;
             }
@@ -504,7 +505,7 @@ fn write_raw_scalar_to_flat(
     vector: &mut FlatVector<'_>,
     idx: usize,
     value: &SpannerValue,
-    type_code: TypeCode,
+    spanner_type: &Type,
     context: &dyn Fn() -> String,
 ) -> Result<(), SpannerError> {
     // Null is legitimate regardless of expected type, never a mismatch.
@@ -513,7 +514,7 @@ fn write_raw_scalar_to_flat(
         return Ok(());
     }
 
-    match type_code {
+    match spanner_type.code() {
         TypeCode::Bool => {
             if let Some(v) = value.try_as_bool() {
                 unsafe { *vector.as_mut_ptr::<bool>().add(idx) = v }
@@ -528,7 +529,7 @@ fn write_raw_scalar_to_flat(
                     .map_err(|e| SpannerError::Conversion(format!("INT64 parse error: {e}")))?;
                 unsafe { *vector.as_mut_ptr::<i64>().add(idx) = v }
             } else {
-                let expected = if type_code == TypeCode::Enum {
+                let expected = if spanner_type.code() == TypeCode::Enum {
                     "ENUM (String)"
                 } else {
                     "INT64 (String)"
@@ -571,6 +572,14 @@ fn write_raw_scalar_to_flat(
         }
         TypeCode::Numeric => {
             if let Some(s) = value.try_as_string() {
+                if is_pg_numeric(spanner_type) {
+                    // PostgreSQL numeric can be NaN or exceed DuckDB's
+                    // DECIMAL(38,9) precision and scale. The bind path maps
+                    // this annotated type to VARCHAR, preserving the exact
+                    // server representation for callers to cast deliberately.
+                    unsafe { unsafe_assign_string(vector, idx, s) }
+                    return Ok(());
+                }
                 use bigdecimal::{BigDecimal, ToPrimitive};
                 use std::str::FromStr;
                 let bd = BigDecimal::from_str(s)
@@ -945,14 +954,14 @@ mod tests {
 
     fn write_scalar_one(
         logical_type: LogicalTypeHandle,
-        type_code: TypeCode,
+        spanner_type: Type,
         value: SpannerValue,
         column_name: &str,
     ) -> (DataChunkHandle, Result<(), SpannerError>) {
         let chunk = DataChunkHandle::new(&[logical_type]);
         let result = {
             let mut vector = chunk.flat_vector(0);
-            write_raw_scalar_to_flat(&mut vector, 0, &value, type_code, &|| {
+            write_raw_scalar_to_flat(&mut vector, 0, &value, &spanner_type, &|| {
                 format!("column '{column_name}', row 0")
             })
         };
@@ -1000,7 +1009,7 @@ mod tests {
         // BOOL column receiving a String value must error, not silently NULL.
         let (_chunk, result) = write_scalar_one(
             LogicalTypeId::Boolean.into(),
-            TypeCode::Bool,
+            scalar_type(TypeCode::Bool),
             value_of(ProtoKind::StringValue("true".to_string())),
             "flag",
         );
@@ -1019,7 +1028,7 @@ mod tests {
         // NullValue is a legitimate NULL, never a mismatch.
         let (chunk, result) = write_scalar_one(
             LogicalTypeId::Boolean.into(),
-            TypeCode::Bool,
+            scalar_type(TypeCode::Bool),
             value_of(ProtoKind::NullValue(0)),
             "flag",
         );
@@ -1035,7 +1044,7 @@ mod tests {
         // `kind: None` (absent) is handled as NULL by write_raw_scalar_to_flat.
         let (chunk, result) = write_scalar_one(
             LogicalTypeId::Boolean.into(),
-            TypeCode::Bool,
+            scalar_type(TypeCode::Bool),
             value_of_absent_kind(),
             "flag",
         );
@@ -1044,6 +1053,25 @@ mod tests {
             chunk.flat_vector(0).row_is_null(0),
             "row 0 should be NULL for absent kind"
         );
+    }
+
+    #[test]
+    fn pg_numeric_special_values_preserve_their_wire_strings() {
+        for value in ["NaN", "123456789012345678901234567890123456789.123456789"] {
+            let (chunk, result) = write_scalar_one(
+                LogicalTypeId::Varchar.into(),
+                google_cloud_spanner::types::pg_numeric(),
+                value_of(ProtoKind::StringValue(value.to_string())),
+                "num",
+            );
+            result.expect("PG numeric should be written as VARCHAR");
+            let vector = chunk.flat_vector(0);
+            let mut string = unsafe { vector.as_mut_ptr::<ffi::duckdb_string_t>().read() };
+            let len = unsafe { ffi::duckdb_string_t_length(string) } as usize;
+            let data = unsafe { ffi::duckdb_string_t_data(&mut string) };
+            let written = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), len) };
+            assert_eq!(written, value.as_bytes());
+        }
     }
 
     #[test]
