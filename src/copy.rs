@@ -92,6 +92,7 @@ struct CopyBindData {
     endpoint: Option<String>,
     mode: MutationMode,
     batch_size: usize,
+    target_columns: Option<Vec<String>>,
     columns: Vec<ColumnMeta>,
 }
 
@@ -228,21 +229,20 @@ unsafe fn copy_bind_inner(info: ffi::duckdb_copy_function_bind_info) -> Result<(
     // Resolve database path: options → component parts → config
     let database_path = resolve_copy_database_path(&opts, &cfg)?;
 
-    let endpoint = opts
-        .get("endpoint")
-        .cloned()
+    let endpoint = option_value(&opts, "endpoint")
+        .map(ToOwned::to_owned)
         .or_else(|| cfg("spanner_endpoint"));
 
     if have_ctx {
         ffi::duckdb_destroy_client_context(&mut { ctx });
     }
 
-    let mode = match opts.get("mode") {
+    let mode = match option_value(&opts, "mode") {
         Some(m) => MutationMode::parse(m)?,
         None => MutationMode::InsertOrUpdate,
     };
 
-    let batch_size = match opts.get("batch_size") {
+    let batch_size = match option_value(&opts, "batch_size") {
         Some(s) => s
             .parse::<usize>()
             .map_err(|e| format!("Invalid batch_size: {e}"))?,
@@ -265,6 +265,7 @@ unsafe fn copy_bind_inner(info: ffi::duckdb_copy_function_bind_info) -> Result<(
         endpoint,
         mode,
         batch_size,
+        target_columns: opts.get("columns").cloned(),
         columns,
     });
 
@@ -319,13 +320,15 @@ unsafe fn copy_global_init_inner(
     // Map the COPY source columns to the writable Spanner target columns,
     // excluding generated columns (Spanner rejects writes to them).
     //
-    // The DuckDB COPY C API does not expose the source column names in this
-    // version (only their types), so `None` is passed and mapping is positional
-    // over the writable target columns in ordinal order. `resolve_copy_columns`
-    // also implements case-insensitive by-name matching for when source names are
-    // available (see its unit tests).
-    let targets =
-        resolve_copy_columns(&schema_columns, None, bind_data.columns.len(), &table_name)?;
+    // The DuckDB COPY C API does not expose source column aliases in this version,
+    // so unnamed COPY operations map positionally. The explicit `columns` COPY
+    // option supplies Spanner target names in source-column order when needed.
+    let targets = resolve_copy_columns(
+        &schema_columns,
+        bind_data.target_columns.as_deref(),
+        bind_data.columns.len(),
+        &table_name,
+    )?;
 
     let column_names: Vec<String> = targets.iter().map(|c| c.name.clone()).collect();
 
@@ -521,11 +524,11 @@ fn apply_spanner_type(col: &mut ColumnMeta, spanner_type: &Type) -> Result<(), S
 /// Generated columns (which Spanner rejects writes to) are always excluded from
 /// the writable target set. Two mapping strategies are supported:
 ///
-/// * **By name** (`source_names = Some(..)` with every entry non-empty): each
+/// * **By name** (`source_names = Some(..)`): each
 ///   source column is matched to a target column case-insensitively. A source
 ///   column with no target match — or one that resolves to a generated column —
 ///   is a hard error listing the available writable target columns.
-/// * **Positional** (`source_names = None`, or any name empty): the source
+/// * **Positional** (`source_names = None`): the source
 ///   columns are mapped to the writable target columns in ordinal order, and only
 ///   the arity is validated. This is the fallback used at runtime because the
 ///   DuckDB COPY C API does not expose source column names in this version.
@@ -545,51 +548,53 @@ fn resolve_copy_columns(
 
     // By-name mapping requires a name for every source column.
     if let Some(names) = source_names {
-        if names.iter().all(|n| !n.is_empty()) {
-            if names.len() != source_count {
+        if names.len() != source_count {
+            return Err(format!(
+                "Column count mismatch: COPY option columns has {} name(s), but source has \
+                 {source_count} column(s)",
+                names.len()
+            ));
+        }
+        if names.iter().any(|n| n.is_empty()) {
+            return Err("COPY option columns must not contain empty column names".to_string());
+        }
+        let mut seen_names = std::collections::HashMap::new();
+        for name in names {
+            let normalized = name.to_ascii_lowercase();
+            if let Some(first_name) = seen_names.insert(normalized, name) {
                 return Err(format!(
-                    "Internal error: {} source names for {source_count} source columns",
-                    names.len()
+                    "COPY source column '{name}' duplicates source column '{first_name}'. \
+                     Source column names must be unique for by-name mapping"
                 ));
             }
-            let mut seen_names = std::collections::HashMap::new();
-            for name in names {
-                let normalized = name.to_ascii_lowercase();
-                if let Some(first_name) = seen_names.insert(normalized, name) {
+        }
+        let mut resolved = Vec::with_capacity(names.len());
+        for name in names {
+            // Match against ALL target columns (including generated ones) so a
+            // source column pointing at a generated column yields a precise
+            // error instead of a generic "no match".
+            match schema_columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(name))
+            {
+                Some(c) if c.is_generated => {
                     return Err(format!(
-                        "COPY source column '{name}' duplicates source column '{first_name}'. \
-                         Source column names must be unique for by-name mapping"
+                        "COPY source column '{name}' maps to generated column '{}' in \
+                         Spanner table '{table}', which cannot be written",
+                        c.name
+                    ));
+                }
+                Some(c) => resolved.push(c.clone()),
+                None => {
+                    return Err(format!(
+                        "COPY source column '{name}' has no matching column in Spanner \
+                         table '{table}'. Available target columns: {}",
+                        join_column_names(&writable)
                     ));
                 }
             }
-            let mut resolved = Vec::with_capacity(names.len());
-            for name in names {
-                // Match against ALL target columns (including generated ones) so a
-                // source column pointing at a generated column yields a precise
-                // error instead of a generic "no match".
-                match schema_columns
-                    .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case(name))
-                {
-                    Some(c) if c.is_generated => {
-                        return Err(format!(
-                            "COPY source column '{name}' maps to generated column '{}' in \
-                             Spanner table '{table}', which cannot be written",
-                            c.name
-                        ));
-                    }
-                    Some(c) => resolved.push(c.clone()),
-                    None => {
-                        return Err(format!(
-                            "COPY source column '{name}' has no matching column in Spanner \
-                             table '{table}'. Available target columns: {}",
-                            join_column_names(&writable)
-                        ));
-                    }
-                }
-            }
-            return Ok(resolved);
         }
+        return Ok(resolved);
     }
 
     // Positional fallback over the writable (non-generated) target columns.
@@ -622,10 +627,11 @@ fn join_column_names(columns: &[&schema::ColumnInfo]) -> String {
 /// Extract options from the COPY statement's options value.
 ///
 /// DuckDB returns options as a STRUCT where each field is a LIST of values.
-/// We take the first element of each list as a string.
+/// Scalar options use their first value, while list-valued options retain every
+/// value. In particular, `columns ['Value', 'Id']` must preserve both names.
 unsafe fn extract_options(
     options_val: ffi::duckdb_value,
-) -> std::collections::HashMap<String, String> {
+) -> std::collections::HashMap<String, Vec<String>> {
     let mut opts = std::collections::HashMap::new();
 
     if options_val.is_null() || ffi::duckdb_is_null_value(options_val) {
@@ -660,15 +666,17 @@ unsafe fn extract_options(
 
                 if child_type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST {
                     let list_size = ffi::duckdb_get_list_size(child_val);
-                    if list_size > 0 {
-                        let elem = ffi::duckdb_get_list_child(child_val, 0);
+                    let mut values = Vec::with_capacity(list_size as usize);
+                    for index in 0..list_size {
+                        let elem = ffi::duckdb_get_list_child(child_val, index);
                         if let Some(s) = value_to_string(elem) {
-                            opts.insert(name, s);
+                            values.push(s);
                         }
                         ffi::duckdb_destroy_value(&mut { elem });
                     }
+                    opts.insert(name, values);
                 } else if let Some(s) = value_to_string(child_val) {
-                    opts.insert(name, s);
+                    opts.insert(name, vec![s]);
                 }
             }
             ffi::duckdb_destroy_value(&mut { child_val });
@@ -680,7 +688,7 @@ unsafe fn extract_options(
             let val = ffi::duckdb_get_map_value(options_val, i);
             if let (Some(k), Some(v)) = (value_to_string(key), value_to_string(val)) {
                 if k.to_lowercase() != "format" {
-                    opts.insert(k.to_lowercase(), v);
+                    opts.insert(k.to_lowercase(), vec![v]);
                 }
             }
             ffi::duckdb_destroy_value(&mut { key });
@@ -690,6 +698,13 @@ unsafe fn extract_options(
 
     // NOTE: options_type is an internal reference from duckdb_get_value_type — do NOT destroy it.
     opts
+}
+
+fn option_value<'a>(
+    opts: &'a std::collections::HashMap<String, Vec<String>>,
+    name: &str,
+) -> Option<&'a str> {
+    opts.get(name)?.first().map(String::as_str)
 }
 
 /// Extract a string from a `duckdb_value`.
@@ -719,12 +734,12 @@ unsafe fn value_to_string(val: ffi::duckdb_value) -> Option<String> {
 /// 4. spanner_database_path config
 /// 5. error
 fn resolve_copy_database_path(
-    opts: &std::collections::HashMap<String, String>,
+    opts: &std::collections::HashMap<String, Vec<String>>,
     cfg: impl Fn(&str) -> Option<String>,
 ) -> Result<String, String> {
-    let project_opt = opts.get("project").cloned();
-    let instance_opt = opts.get("instance").cloned();
-    let database_opt = opts.get("database").cloned();
+    let project_opt = option_value(opts, "project").map(ToOwned::to_owned);
+    let instance_opt = option_value(opts, "instance").map(ToOwned::to_owned);
+    let database_opt = option_value(opts, "database").map(ToOwned::to_owned);
 
     if project_opt.is_some() || instance_opt.is_some() || database_opt.is_some() {
         let project = project_opt.or_else(|| cfg("spanner_project"));
@@ -745,8 +760,8 @@ fn resolve_copy_database_path(
         return Ok(format!("projects/{p}/instances/{i}/databases/{d}"));
     }
 
-    if let Some(path) = opts.get("database_path").cloned() {
-        return Ok(path);
+    if let Some(path) = option_value(opts, "database_path") {
+        return Ok(path.to_owned());
     }
 
     let project = cfg("spanner_project");
@@ -1404,6 +1419,16 @@ mod tests {
     }
 
     #[test]
+    fn explicit_columns_count_must_match_source_count() {
+        let schema = vec![col("Id", false), col("Name", false)];
+        let columns = names(&["Name"]);
+        let err = resolve_copy_columns(&schema, Some(&columns), 2, "T").unwrap_err();
+        assert!(err.contains("Column count mismatch"), "{err}");
+        assert!(err.contains("columns has 1 name(s)"), "{err}");
+        assert!(err.contains("source has 2 column(s)"), "{err}");
+    }
+
+    #[test]
     fn by_name_rejects_duplicate_source_names() {
         let schema = vec![col("Id", false), col("Name", false)];
         let src = names(&["Id", "Id"]);
@@ -1449,13 +1474,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_source_name_falls_back_to_positional() {
+    fn explicit_columns_rejects_empty_name() {
         let schema = vec![col("Id", false), col("Name", false)];
-        // One empty name disables by-name matching; positional arity applies.
         let src = names(&["Id", ""]);
-        let resolved = resolve_copy_columns(&schema, Some(&src), 2, "T").unwrap();
-        let got: Vec<&str> = resolved.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(got, vec!["Id", "Name"]);
+        let err = resolve_copy_columns(&schema, Some(&src), 2, "T").unwrap_err();
+        assert!(err.contains("must not contain empty column names"), "{err}");
     }
 
     #[test]

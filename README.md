@@ -399,8 +399,20 @@ Options:
 | `endpoint` | VARCHAR | (config) | Custom gRPC endpoint |
 | `mode` | VARCHAR | `insert_or_update` | Mutation mode: `insert`, `update`, `insert_or_update`, or `replace` |
 | `batch_size` | VARCHAR | `1000` | Number of rows per commit |
+| `columns` | VARCHAR[] | (none) | Target Spanner column names in source-column order |
 
 The file path argument specifies the target Spanner table name. Source columns are mapped to the table's **writable** Spanner columns by position. Generated columns (`INFORMATION_SCHEMA.IS_GENERATED != 'NEVER'`) are computed by Spanner and reject writes, so they are excluded from the target column list — the source column count must match the number of non-generated columns, not the total column count.
+
+When source order differs from the target table, use the native DuckDB list-valued `columns` option. Names are matched case-insensitively, must be unique, and must name exactly one writable target column per source column:
+
+```sql
+COPY (SELECT source_value, source_id, source_name) TO 'Users' (
+    FORMAT spanner,
+    columns ['Value', 'Id', 'Name']
+);
+```
+
+DuckDB's COPY C API exposes source types but not automatically discovered source aliases, so aliases cannot currently drive mapping automatically. Use `columns [...]` whenever source aliases or ordering differ from the writable Spanner columns.
 
 `COPY TO ... FORMAT spanner` supports scalar columns, DuckDB LIST/ARRAY source columns mapped to Spanner ARRAY targets, and DuckDB STRUCT source columns mapped to Spanner JSON targets.
 

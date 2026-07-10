@@ -46,6 +46,17 @@ COPY (SELECT CAST(902 AS BIGINT) AS Id, 'insert_mode' AS Name, CAST(9.9 AS DOUBL
 statement ok
 SELECT IF(Name = 'insert_mode', 1, error('expected insert_mode row')) FROM spanner_query('SELECT Name FROM CopyTarget WHERE Id = 902');
 
+# --- explicit COPY target column order ---
+# The `columns` option names the target Spanner columns in source-column order.
+# It lets COPY preserve a source query whose aliases or order do not match the
+# target table's writable ordinal order.
+
+statement ok
+COPY (SELECT CAST(4.25 AS DOUBLE), CAST(903 AS BIGINT), 'reordered_columns') TO 'CopyTarget' (FORMAT spanner, columns ['Value', 'Id', 'Name']);
+
+statement ok
+SELECT IF(Name = 'reordered_columns' AND strpos(Value::VARCHAR, '4.25') > 0, 1, error('expected explicit reordered COPY columns')) FROM spanner_query('SELECT Name, Value FROM CopyTarget WHERE Id = 903');
+
 # --- generated columns are excluded from the writable target list ---
 # CopyGenerated has a generated column (Doubled) sitting between the writable
 # columns (Id, Amount, Label). COPY must map the 3 source columns positionally
