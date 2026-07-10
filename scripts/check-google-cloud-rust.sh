@@ -49,10 +49,18 @@ if [[ "$revision_count" != "1" ]]; then
 fi
 
 # Check every target so a target-specific feature cannot break the MinGW build.
+# Inspect the complete normal-edge tree: cargo tree --invert exits successfully
+# with empty output when a package exists only outside the selected edge set.
+normal_dependency_tree="$(
+  cargo tree --locked --edges normal --target all --prefix none --format '{p}'
+)"
 for forbidden_package in aws-lc-rs aws-lc-sys; do
-  if cargo tree --locked --edges normal --target all --invert "$forbidden_package" >/dev/null 2>&1; then
+  matching_packages="$(
+    grep -E "^${forbidden_package} v" <<<"$normal_dependency_tree" || true
+  )"
+  if [[ -n "$matching_packages" ]]; then
     echo "error: normal production dependencies contain $forbidden_package:" >&2
-    cargo tree --locked --edges normal --target all --invert "$forbidden_package" >&2
+    printf '%s\n' "$matching_packages" >&2
     exit 1
   fi
 done
