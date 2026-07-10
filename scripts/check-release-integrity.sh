@@ -21,11 +21,12 @@ while (($# > 0)); do
   esac
 done
 
-# Keep compatibility with macOS /bin/bash 3.2; mapfile/readarray require Bash 4.
+# Keep compatibility with macOS /bin/bash 3.2: mapfile/readarray require Bash 4,
+# and BSD sort has no -z. Workflow order is immaterial, so read find's NUL output.
 workflow_files=()
-while IFS= read -r workflow; do
+while IFS= read -r -d '' workflow; do
   workflow_files+=("$workflow")
-done < <(find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) -print | sort)
+done < <(find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) -print0)
 readonly -a workflow_files
 if ((${#workflow_files[@]} == 0)); then
   echo "error: no GitHub Actions workflows found" >&2
@@ -68,7 +69,7 @@ while IFS= read -r workflow_ref; do
   fi
   ((workflow_ref_count += 1))
 done < <(
-  sed -nE 's/.*duckdb\/extension-ci-tools\/\.github\/workflows\/_extension_distribution\.yml@([0-9a-fA-F]{40}).*/\1/p' "${workflow_files[@]}"
+  sed -nE '/^[[:space:]]*#/!s/.*duckdb\/extension-ci-tools\/\.github\/workflows\/_extension_distribution\.yml@([0-9a-fA-F]{40}).*/\1/p' "${workflow_files[@]}"
 )
 
 if ((workflow_ref_count != 2)); then
@@ -84,7 +85,7 @@ while IFS= read -r ci_tools_version; do
   fi
   ((ci_tools_version_count += 1))
 done < <(
-  sed -nE 's/.*ci_tools_version:[[:space:]]*([0-9a-fA-F]{40}).*/\1/p' "${workflow_files[@]}"
+  sed -nE '/^[[:space:]]*#/!s/.*ci_tools_version:[[:space:]]*([0-9a-fA-F]{40}).*/\1/p' "${workflow_files[@]}"
 )
 
 if ((ci_tools_version_count != 2)); then
