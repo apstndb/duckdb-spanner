@@ -14,6 +14,7 @@ mod scan;
 mod schema;
 mod tables;
 mod types;
+mod vector_size;
 
 pub use config::register_config_options;
 pub use copy::register_copy_function;

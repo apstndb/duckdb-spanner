@@ -74,7 +74,7 @@ impl VTab for SpannerTablesVTab {
             return Ok(());
         }
 
-        let capacity = unsafe { duckdb::ffi::duckdb_vector_size() } as usize;
+        let capacity = crate::vector_size::runtime_vector_size();
         let end = (offset + capacity).min(bind_data.rows.len());
         let count = end - offset;
 

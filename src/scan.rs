@@ -15,9 +15,7 @@ use google_cloud_spanner_admin_database_v1::model::DatabaseDialect;
 
 use crate::error::SpannerError;
 use crate::schema::ColumnInfo;
-use crate::{client, convert, runtime, schema, types};
-
-const BATCH_SIZE: usize = 2048;
+use crate::{client, convert, runtime, schema, types, vector_size};
 
 pub struct ScanBindData {
     database: String,
@@ -37,6 +35,7 @@ pub struct ScanBindData {
 pub struct ScanInitData {
     receiver: Mutex<mpsc::Receiver<Result<Row, SpannerError>>>,
     projected_columns: Vec<usize>,
+    vector_size: usize,
 }
 
 pub struct SpannerScanVTab;
@@ -106,6 +105,7 @@ impl VTab for SpannerScanVTab {
 
     fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
         let bind_data = unsafe { &*init.get_bind_data::<ScanBindData>() };
+        let vector_size = vector_size::runtime_vector_size();
 
         // Get projected column indices (DuckDB tells us which columns it needs)
         let projected_columns: Vec<usize> = init
@@ -120,7 +120,7 @@ impl VTab for SpannerScanVTab {
             .map(|&idx| bind_data.columns[idx].name.clone())
             .collect();
 
-        let (tx, rx) = mpsc::channel(BATCH_SIZE);
+        let (tx, rx) = mpsc::channel(vector_size);
 
         // Clone bind data fields for the spawned task ('static requirement)
         let database = bind_data.database.clone();
@@ -191,6 +191,7 @@ impl VTab for SpannerScanVTab {
         Ok(ScanInitData {
             receiver: Mutex::new(rx),
             projected_columns,
+            vector_size,
         })
     }
 
@@ -213,11 +214,11 @@ impl VTab for SpannerScanVTab {
             }
         };
 
-        let mut batch = Vec::with_capacity(BATCH_SIZE);
+        let mut batch = Vec::with_capacity(init_data.vector_size);
         batch.push(first);
 
         // Fill the rest of the batch non-blocking
-        while batch.len() < BATCH_SIZE {
+        while batch.len() < init_data.vector_size {
             match rx.try_recv() {
                 Ok(Ok(row)) => batch.push(row),
                 Ok(Err(e)) => return Err(e.into()),

@@ -12,9 +12,7 @@ use tokio::sync::mpsc;
 
 use crate::error::SpannerError;
 use crate::schema::ColumnInfo;
-use crate::{client, convert, runtime, schema, types};
-
-const BATCH_SIZE: usize = 2048;
+use crate::{client, convert, runtime, schema, types, vector_size};
 
 pub struct QueryBindData {
     database: String,
@@ -32,6 +30,7 @@ pub struct QueryBindData {
 /// Streaming init data: rows arrive via an mpsc channel from a background tokio task.
 pub struct QueryInitData {
     receiver: Mutex<mpsc::Receiver<Result<Row, SpannerError>>>,
+    vector_size: usize,
 }
 
 pub struct SpannerQueryVTab;
@@ -87,8 +86,9 @@ impl VTab for SpannerQueryVTab {
 
     fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
         let bind_data = unsafe { &*init.get_bind_data::<QueryBindData>() };
+        let vector_size = vector_size::runtime_vector_size();
 
-        let (tx, rx) = mpsc::channel(BATCH_SIZE);
+        let (tx, rx) = mpsc::channel(vector_size);
 
         // Clone bind data fields for the spawned task ('static requirement)
         let database = bind_data.database.clone();
@@ -154,6 +154,7 @@ impl VTab for SpannerQueryVTab {
 
         Ok(QueryInitData {
             receiver: Mutex::new(rx),
+            vector_size,
         })
     }
 
@@ -176,11 +177,11 @@ impl VTab for SpannerQueryVTab {
             }
         };
 
-        let mut batch = Vec::with_capacity(BATCH_SIZE);
+        let mut batch = Vec::with_capacity(init_data.vector_size);
         batch.push(first);
 
         // Fill the rest of the batch non-blocking
-        while batch.len() < BATCH_SIZE {
+        while batch.len() < init_data.vector_size {
             match rx.try_recv() {
                 Ok(Ok(row)) => batch.push(row),
                 Ok(Err(e)) => return Err(e.into()),
