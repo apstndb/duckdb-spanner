@@ -585,7 +585,7 @@ fn read_blob_at(vec: &FlatVector, row: usize) -> Result<Vec<u8>, Box<dyn std::er
     let mut s = strings[row];
     let len = unsafe { duckdb::ffi::duckdb_string_t_length(s) } as usize;
     let data = unsafe { duckdb::ffi::duckdb_string_t_data(&mut s) };
-    Ok(unsafe { std::slice::from_raw_parts(data as *const u8, len).to_vec() })
+    Ok(unsafe { std::slice::from_raw_parts(data.cast::<u8>(), len).to_vec() })
 }
 
 fn read_varchar_at(vec: &FlatVector, row: usize) -> Result<String, Box<dyn std::error::Error>> {

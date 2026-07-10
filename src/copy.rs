@@ -1260,14 +1260,14 @@ unsafe fn read_decimal_raw(data: *mut c_void, row_idx: usize, internal_type: u32
 unsafe fn read_duckdb_string(str_ptr: *mut ffi::duckdb_string_t) -> String {
     let len = ffi::duckdb_string_t_length(*str_ptr) as usize;
     let data = ffi::duckdb_string_t_data(str_ptr);
-    let bytes = std::slice::from_raw_parts(data as *const u8, len);
+    let bytes = std::slice::from_raw_parts(data.cast::<u8>(), len);
     String::from_utf8_lossy(bytes).into_owned()
 }
 
 unsafe fn read_duckdb_bytes(str_ptr: *mut ffi::duckdb_string_t) -> Vec<u8> {
     let len = ffi::duckdb_string_t_length(*str_ptr) as usize;
     let data = ffi::duckdb_string_t_data(str_ptr);
-    std::slice::from_raw_parts(data as *const u8, len).to_vec()
+    std::slice::from_raw_parts(data.cast::<u8>(), len).to_vec()
 }
 
 // ─── Scalar conversion helpers ──────────────────────────────────────────────
