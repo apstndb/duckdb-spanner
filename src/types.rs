@@ -1,6 +1,10 @@
+use std::sync::LazyLock;
+
 use duckdb::core::{LogicalTypeHandle, LogicalTypeId};
 use google_cloud_spanner::model;
 use google_cloud_spanner::types::{self as spanner_types, Type, TypeCode};
+
+static PG_NUMERIC_TYPE: LazyLock<Type> = LazyLock::new(spanner_types::pg_numeric);
 
 /// Convert a Spanner Type to a DuckDB LogicalTypeHandle.
 pub fn spanner_type_to_logical(spanner_type: &Type) -> LogicalTypeHandle {
@@ -72,8 +76,7 @@ pub fn spanner_type_to_logical(spanner_type: &Type) -> LogicalTypeHandle {
 /// The official client exposes the dialect distinction through the generated
 /// type annotation, while both dialects share `TypeCode::Numeric`.
 pub fn is_pg_numeric(spanner_type: &Type) -> bool {
-    let raw: model::Type = spanner_type.clone().into();
-    raw.type_annotation == model::TypeAnnotationCode::PgNumeric
+    spanner_type == &*PG_NUMERIC_TYPE
 }
 
 /// Parse a PG dialect SPANNER_TYPE string from INFORMATION_SCHEMA.COLUMNS.
