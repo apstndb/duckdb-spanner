@@ -125,24 +125,14 @@ pub async fn get_or_create_client(
         let _ = runtime::spawn(close_evicted(evicted, EVICT_CLOSE_TIMEOUT));
     }
 
-    // Single-flight: concurrent callers share this slot's OnceCell, so the client
-    // is built at most once.
-    match slot
+    // Keep a failed cell in the bounded LRU. Removing an empty cell here can
+    // race a waiting caller that has already started retrying initialization,
+    // creating two clients for one key. Tokio OnceCell retries failures on the
+    // same slot, and normal LRU eviction bounds unreachable identities.
+    let client = slot
         .get_or_try_init(|| create_client(database, endpoint))
-        .await
-    {
-        Ok(client) => Ok(Arc::clone(client)),
-        Err(e) => {
-            // Creation failed: the cell stays empty. Drop the empty slot from the
-            // cache so repeated failures against an unreachable target don't
-            // occupy LRU capacity and evict healthy clients. Remove only if it is
-            // still *this* slot and still empty — a concurrent caller may have
-            // retried and successfully initialized it in the meantime.
-            let mut cache = CLIENT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-            cache.remove_if(&cache_key, |s| Arc::ptr_eq(s, &slot) && s.get().is_none());
-            Err(e)
-        }
-    }
+        .await?;
+    Ok(Arc::clone(client))
 }
 
 /// Build a brand-new Spanner client for the given target.

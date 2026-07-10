@@ -35,17 +35,6 @@ fn get_or_insert_cache_slot<T>(
     cache.get_or_insert_with(cache_key, || Arc::new(OnceCell::new()))
 }
 
-fn remove_empty_cache_slot<T>(
-    cache: &Mutex<LruCache<String, CacheSlot<T>>>,
-    cache_key: &String,
-    slot: &CacheSlot<T>,
-) {
-    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
-    cache.remove_if(cache_key, |cached_slot| {
-        Arc::ptr_eq(cached_slot, slot) && cached_slot.get().is_none()
-    });
-}
-
 /// Get or create a Spanner Admin client.
 ///
 /// Admin clients are NOT per-database (unlike data clients). The cache key is
@@ -67,19 +56,13 @@ async fn get_or_create_admin_client(
         drop(evicted);
     }
 
-    match slot
+    // Keep failed cells in the bounded LRU so a waiter that starts a retry uses
+    // this same OnceCell. Removing an empty slot here can race that retry and
+    // break single-flight by allowing a replacement slot to be inserted.
+    let client = slot
         .get_or_try_init(|| create_admin_client(admin_endpoint))
-        .await
-    {
-        Ok(client) => Ok(Arc::clone(client)),
-        Err(error) => {
-            // Failed initialization leaves the cell empty. Remove only this
-            // still-empty slot so failures never consume LRU capacity, without
-            // racing a concurrent retry that has initialized a replacement.
-            remove_empty_cache_slot(&ADMIN_CLIENT_CACHE, &cache_key, &slot);
-            Err(error)
-        }
-    }
+        .await?;
+    Ok(Arc::clone(client))
 }
 
 async fn create_admin_client(
@@ -1000,7 +983,7 @@ mod tests {
     use super::{
         admin_endpoint_url, cached_init_result, database_operation_prefix, ddl_operation_error,
         ddl_statements_from_values, get_or_insert_cache_slot, instance_path_from_database_path,
-        operation_from_json, remove_empty_cache_slot, CacheSlot,
+        operation_from_json, CacheSlot,
     };
 
     #[test]
@@ -1110,9 +1093,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_admin_cache_failed_slot_is_removed() {
-        let cache: Mutex<LruCache<String, CacheSlot<usize>>> = Mutex::new(LruCache::new(1));
-        let key = "unreachable-admin".to_string();
+    async fn test_admin_cache_failed_slot_retries_single_flight() {
+        let cache = Arc::new(Mutex::new(LruCache::new(1)));
+        let key = "shared-admin".to_string();
         let (slot, evicted) = get_or_insert_cache_slot(&cache, key.clone());
         assert!(evicted.is_none());
 
@@ -1122,10 +1105,18 @@ mod tests {
             .unwrap_err();
         assert_eq!(error, "initialization failed");
 
-        remove_empty_cache_slot(&cache, &key, &slot);
-        let (replacement, evicted) = get_or_insert_cache_slot(&cache, key);
+        let (retained, evicted) = get_or_insert_cache_slot(&cache, key);
         assert!(evicted.is_none());
-        assert!(!Arc::ptr_eq(&slot, &replacement));
+        assert!(Arc::ptr_eq(&slot, &retained));
+
+        let constructions = Arc::new(AtomicUsize::new(0));
+        let (first, second) = tokio::join!(
+            initialize_test_cache_slot(Arc::clone(&cache), Arc::clone(&constructions)),
+            initialize_test_cache_slot(Arc::clone(&cache), Arc::clone(&constructions)),
+        );
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(constructions.load(Ordering::SeqCst), 1);
     }
 
     #[test]

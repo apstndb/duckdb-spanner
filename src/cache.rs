@@ -61,18 +61,6 @@ impl<K: Eq + Hash + Clone, V: Clone> LruCache<K, V> {
 
         (value, evicted)
     }
-
-    /// Remove `key` only if it is currently mapped to a value satisfying `pred`.
-    /// Returns whether an entry was removed. Used to drop a slot whose client
-    /// creation failed without clobbering an entry a concurrent caller may have
-    /// since replaced or successfully initialized.
-    pub(crate) fn remove_if<F: FnOnce(&V) -> bool>(&mut self, key: &K, pred: F) -> bool {
-        let matches = self.map.get(key).is_some_and(|(v, _)| pred(v));
-        if matches {
-            self.map.remove(key);
-        }
-        matches
-    }
 }
 
 #[cfg(test)]
@@ -130,17 +118,5 @@ mod tests {
         assert_eq!(evicted, Some(10));
         assert!(cache.map.contains_key(&2));
         assert!(!cache.map.contains_key(&1));
-    }
-
-    #[test]
-    fn remove_if_respects_predicate() {
-        let mut cache: LruCache<&str, i32> = LruCache::new(2);
-        cache.get_or_insert_with("a", || 1);
-
-        assert!(!cache.remove_if(&"a", |v| *v == 999));
-        assert!(cache.map.contains_key("a"));
-        assert!(!cache.remove_if(&"missing", |_| true));
-        assert!(cache.remove_if(&"a", |v| *v == 1));
-        assert!(!cache.map.contains_key("a"));
     }
 }
