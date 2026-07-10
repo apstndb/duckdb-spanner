@@ -1,8 +1,7 @@
 //! Native scalar functions replacing SQL macros for Spanner parameter helpers.
 
 use base64::Engine;
-use duckdb::arrow::array::{Array, AsArray, StringArray};
-use duckdb::arrow::datatypes::{DataType, IntervalMonthDayNanoType, TimeUnit};
+use duckdb::arrow::array::{Array, StringArray};
 use duckdb::core::{
     DataChunkHandle, FlatVector, ListVector, LogicalTypeHandle, LogicalTypeId, StructVector,
 };
@@ -13,7 +12,6 @@ use duckdb::types::DuckString;
 use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
 use duckdb::vtab::arrow::{write_arrow_array_to_vector, WritableVector};
 use serde_json::{json, Map, Value};
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 pub struct SpannerValueScalar;
@@ -371,85 +369,6 @@ fn spanner_type_name(ty: &LogicalTypeHandle) -> Option<String> {
     }
 }
 
-fn encode_spanner_value(
-    array: &dyn Array,
-    idx: usize,
-    ty: &LogicalTypeHandle,
-) -> Result<Value, Box<dyn std::error::Error>> {
-    if array.is_null(idx) {
-        return Ok(Value::Null);
-    }
-
-    match ty.id() {
-        LogicalTypeId::Boolean => Ok(json!(array.as_boolean().value(idx))),
-        LogicalTypeId::Tinyint => Ok(json!(array
-            .as_primitive::<duckdb::arrow::datatypes::Int8Type>()
-            .value(idx))),
-        LogicalTypeId::Smallint => Ok(json!(array
-            .as_primitive::<duckdb::arrow::datatypes::Int16Type>()
-            .value(idx))),
-        LogicalTypeId::Integer => Ok(json!(array
-            .as_primitive::<duckdb::arrow::datatypes::Int32Type>()
-            .value(idx))),
-        LogicalTypeId::Bigint => Ok(json!(array
-            .as_primitive::<duckdb::arrow::datatypes::Int64Type>()
-            .value(idx))),
-        LogicalTypeId::UTinyint => Ok(json!(array
-            .as_primitive::<duckdb::arrow::datatypes::UInt8Type>()
-            .value(idx) as i64)),
-        LogicalTypeId::USmallint => Ok(json!(array
-            .as_primitive::<duckdb::arrow::datatypes::UInt16Type>()
-            .value(idx) as i64)),
-        LogicalTypeId::UInteger => Ok(json!(array
-            .as_primitive::<duckdb::arrow::datatypes::UInt32Type>()
-            .value(idx) as i64)),
-        LogicalTypeId::UBigint
-        | LogicalTypeId::Hugeint
-        | LogicalTypeId::UHugeint
-        | LogicalTypeId::Decimal => Ok(Value::String(array_value_as_string(array, idx, ty)?)),
-        LogicalTypeId::Float => Ok(json!(array
-            .as_primitive::<duckdb::arrow::datatypes::Float32Type>()
-            .value(idx))),
-        LogicalTypeId::Double => Ok(json!(array
-            .as_primitive::<duckdb::arrow::datatypes::Float64Type>()
-            .value(idx))),
-        LogicalTypeId::Varchar
-        | LogicalTypeId::Uuid
-        | LogicalTypeId::Date
-        | LogicalTypeId::Time => Ok(Value::String(
-            string_at(array, idx).unwrap_or_default().to_string(),
-        )),
-        LogicalTypeId::Blob | LogicalTypeId::Bit => {
-            let bytes = binary_at(array, idx)?;
-            Ok(Value::String(
-                base64::engine::general_purpose::STANDARD.encode(bytes),
-            ))
-        }
-        LogicalTypeId::Timestamp | LogicalTypeId::TimestampTZ => {
-            Ok(Value::String(timestamp_to_rfc3339(array, idx)?))
-        }
-        LogicalTypeId::Interval => {
-            let interval = array.as_primitive::<IntervalMonthDayNanoType>().value(idx);
-            Ok(Value::String(duckdb_interval_to_iso8601(
-                interval.months,
-                interval.days,
-                interval.nanoseconds / 1_000,
-            )))
-        }
-        LogicalTypeId::List | LogicalTypeId::Array => {
-            let child_ty = ty.child(0);
-            let list = array.as_list::<i32>();
-            let values = list.value(idx);
-            let mut out = Vec::new();
-            for j in 0..values.len() {
-                out.push(encode_spanner_value(values.as_ref(), j, &child_ty)?);
-            }
-            Ok(Value::Array(out))
-        }
-        _ => Ok(json!(string_at(array, idx).unwrap_or_default())),
-    }
-}
-
 fn struct_row_to_map(
     struct_vec: &StructVector,
     row: usize,
@@ -698,23 +617,6 @@ fn struct_field_to_param_json(value: Value, ty: &LogicalTypeHandle) -> Value {
     value
 }
 
-fn array_value_as_string(
-    array: &dyn Array,
-    idx: usize,
-    ty: &LogicalTypeHandle,
-) -> Result<String, Box<dyn std::error::Error>> {
-    if let Some(s) = string_at(array, idx) {
-        return Ok(s.to_string());
-    }
-    if ty.id() == LogicalTypeId::Decimal {
-        let decimal = array.as_primitive::<duckdb::arrow::datatypes::Decimal128Type>();
-        let value = decimal.value(idx);
-        let scale = ty.decimal_scale() as u32;
-        return Ok(format_decimal128(value, scale));
-    }
-    Ok(string_at(array, idx).unwrap_or_default().to_string())
-}
-
 fn format_decimal128(value: i128, scale: u32) -> String {
     if scale == 0 {
         return value.to_string();
@@ -732,43 +634,6 @@ fn format_decimal128(value: i128, scale: u32) -> String {
     }
 }
 
-fn string_at(array: &dyn Array, idx: usize) -> Option<&str> {
-    match array.data_type() {
-        DataType::Utf8 => Some(array.as_string::<i32>().value(idx)),
-        DataType::LargeUtf8 => Some(array.as_string::<i64>().value(idx)),
-        DataType::Utf8View => Some(array.as_string_view().value(idx)),
-        _ => None,
-    }
-}
-
-fn binary_at(array: &dyn Array, idx: usize) -> Result<&[u8], Box<dyn std::error::Error>> {
-    match array.data_type() {
-        DataType::Binary => Ok(array.as_binary::<i32>().value(idx)),
-        DataType::LargeBinary => Ok(array.as_binary::<i64>().value(idx)),
-        _ => Err(format!("expected binary array, got {:?}", array.data_type()).into()),
-    }
-}
-
-fn timestamp_to_rfc3339(
-    array: &dyn Array,
-    idx: usize,
-) -> Result<String, Box<dyn std::error::Error>> {
-    match array.data_type() {
-        DataType::Timestamp(TimeUnit::Microsecond, _) => {
-            let micros = array.as_primitive::<TimestampMicrosecondType>().value(idx);
-            micros_to_rfc3339(micros)
-        }
-        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
-            let nanos = array.as_primitive::<TimestampNanosecondType>().value(idx);
-            micros_to_rfc3339(nanos / 1_000)
-        }
-        _ => Ok(string_at(array, idx).unwrap_or_default().to_string()),
-    }
-}
-
-type TimestampMicrosecondType = duckdb::arrow::datatypes::TimestampMicrosecondType;
-type TimestampNanosecondType = duckdb::arrow::datatypes::TimestampNanosecondType;
-
 fn micros_to_spanner_timestamp_string(micros: i64) -> Result<String, Box<dyn std::error::Error>> {
     let secs = micros.div_euclid(1_000_000);
     let micros_rem = micros.rem_euclid(1_000_000);
@@ -785,14 +650,6 @@ fn micros_to_spanner_timestamp_string(micros: i64) -> Result<String, Box<dyn std
         second = time.second(),
         micros = micros_rem,
     ))
-}
-
-fn micros_to_rfc3339(micros: i64) -> Result<String, Box<dyn std::error::Error>> {
-    let secs = micros.div_euclid(1_000_000);
-    let micros_rem = micros.rem_euclid(1_000_000);
-    let nanos = (micros_rem * 1_000) as i32;
-    let dt = OffsetDateTime::from_unix_timestamp(secs)?.replace_nanosecond(nanos as u32)?;
-    Ok(dt.format(&Rfc3339)?)
 }
 
 pub fn duckdb_interval_to_iso8601(months: i32, days: i32, micros: i64) -> String {

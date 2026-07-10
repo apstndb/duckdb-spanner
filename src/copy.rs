@@ -227,7 +227,7 @@ unsafe fn copy_bind_inner(info: ffi::duckdb_copy_function_bind_info) -> Result<(
     };
 
     // Resolve database path: options → component parts → config
-    let database_path = resolve_copy_database_path(&opts, &cfg)?;
+    let database_path = resolve_copy_database_path(&opts, cfg)?;
 
     let endpoint = option_value(&opts, "endpoint")
         .map(ToOwned::to_owned)
@@ -382,8 +382,8 @@ unsafe fn copy_sink_inner(
 
     for row_idx in 0..row_count {
         let mut values = Vec::with_capacity(col_count);
-        for col_idx in 0..col_count {
-            let val = read_duckdb_value(vectors[col_idx], row_idx, &state.columns[col_idx])?;
+        for (vector, column) in vectors.iter().zip(&state.columns) {
+            let val = read_duckdb_value(*vector, row_idx, column)?;
             values.push(val);
         }
         state.buffer.push(build_mutation(

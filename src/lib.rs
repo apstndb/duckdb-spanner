@@ -120,6 +120,10 @@ unsafe fn spanner_init_c_api_internal(
 
 #[cfg(feature = "loadable-extension")]
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// `info` and `access` must be valid values supplied by DuckDB's extension loader.
+/// `access` must remain valid for the duration of this call and be compatible with `info`.
 pub unsafe extern "C" fn spanner_init_c_api(
     info: duckdb::ffi::duckdb_extension_info,
     access: *const duckdb::ffi::duckdb_extension_access,

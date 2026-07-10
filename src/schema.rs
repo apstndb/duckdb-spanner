@@ -305,7 +305,7 @@ fn columns_query_template(dialect: DatabaseDialect) -> (&'static str, &'static s
     }
 }
 
-fn schema_value_for_table<'a>(dialect: DatabaseDialect, schema_name: &'a str) -> &'a str {
+fn schema_value_for_table(dialect: DatabaseDialect, schema_name: &str) -> &str {
     if schema_name.is_empty() {
         default_schema_for_dialect(dialect)
     } else {
