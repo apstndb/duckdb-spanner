@@ -35,6 +35,13 @@ readonly full_sha_use_pattern='^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]+[^@
 invalid_uses=0
 for workflow in "${workflow_files[@]}"; do
   while IFS= read -r line; do
+    use_ref=${line#*uses:}
+    use_ref=${use_ref#"${use_ref%%[![:space:]]*}"}
+    use_ref=${use_ref#\"}
+    use_ref=${use_ref#\'}
+    if [[ "$use_ref" == ./* || "$use_ref" == ../* ]]; then
+      continue
+    fi
     if [[ ! "$line" =~ $full_sha_use_pattern ]]; then
       echo "error: direct workflow use is not an annotated full SHA: $line" >&2
       invalid_uses=1
@@ -60,8 +67,7 @@ while IFS= read -r workflow_ref; do
   fi
   ((workflow_ref_count += 1))
 done < <(
-  grep -hE 'duckdb/extension-ci-tools/\.github/workflows/_extension_distribution\.yml@[0-9a-fA-F]{40}' "${workflow_files[@]}" |
-    sed -nE 's/.*duckdb\/extension-ci-tools\/\.github\/workflows\/_extension_distribution\.yml@([0-9a-fA-F]{40}).*/\1/p' || true
+  sed -nE 's/.*duckdb\/extension-ci-tools\/\.github\/workflows\/_extension_distribution\.yml@([0-9a-fA-F]{40}).*/\1/p' "${workflow_files[@]}"
 )
 
 if ((workflow_ref_count != 2)); then
@@ -77,8 +83,7 @@ while IFS= read -r ci_tools_version; do
   fi
   ((ci_tools_version_count += 1))
 done < <(
-  grep -hE 'ci_tools_version:[[:space:]]*[0-9a-fA-F]{40}' "${workflow_files[@]}" |
-    sed -E 's/.*ci_tools_version:[[:space:]]*//' || true
+  sed -nE 's/.*ci_tools_version:[[:space:]]*([0-9a-fA-F]{40}).*/\1/p' "${workflow_files[@]}"
 )
 
 if ((ci_tools_version_count != 2)); then
@@ -89,8 +94,8 @@ fi
 if [[ -n "$release_tag" ]]; then
   package_version="$(
     awk '
-      /^\[package\][[:space:]]*$/ { in_package=1; next }
-      /^\[/ && in_package { exit }
+      /^[[:space:]]*\[package\][[:space:]]*$/ { in_package=1; next }
+      /^[[:space:]]*\[/ && in_package { exit }
       in_package && /^[[:space:]]*version[[:space:]]*=/ {
         line=$0
         sub(/^[^"]*"/, "", line)
