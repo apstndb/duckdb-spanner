@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use duckdb::core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId};
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
-use google_cloud_spanner::client::Client;
+use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::statement::Statement;
 
 use crate::error::SpannerError;
@@ -119,22 +119,23 @@ impl VTab for SpannerTablesVTab {
     }
 }
 
-async fn list_tables(client: &Client) -> Result<Vec<TableRow>, SpannerError> {
-    let mut tx = client.single().await?;
-    let stmt = Statement::new(
+async fn list_tables(client: &DatabaseClient) -> Result<Vec<TableRow>, SpannerError> {
+    let tx = client.single_use().build();
+    let stmt = Statement::builder(
         "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE \
          FROM INFORMATION_SCHEMA.TABLES \
          WHERE TABLE_TYPE = 'BASE TABLE' \
          ORDER BY TABLE_SCHEMA, TABLE_NAME",
-    );
-    let mut iter = tx.query(stmt).await.map_err(SpannerError::Grpc)?;
+    )
+    .build();
+    let mut iter = tx.execute_query(stmt).await?;
 
     let mut rows = Vec::new();
-    while let Some(row) = iter.next().await.map_err(SpannerError::Grpc)? {
+    while let Some(row) = iter.next().await.transpose()? {
         rows.push(TableRow {
-            table_schema: row.column::<String>(0)?,
-            table_name: row.column::<String>(1)?,
-            table_type: row.column::<String>(2)?,
+            table_schema: row.try_get(0)?,
+            table_name: row.try_get(1)?,
+            table_type: row.try_get(2)?,
         });
     }
     Ok(rows)

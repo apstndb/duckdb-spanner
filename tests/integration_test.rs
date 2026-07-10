@@ -6,10 +6,12 @@ use duckdb::Connection;
 use duckdb_spanner::{
     register_c_api_extensions, register_copy_function, register_extension_functions,
 };
-use google_cloud_gax::conn::Environment;
-use google_cloud_googleapis::spanner::admin::database::v1::DatabaseDialect;
-use google_cloud_spanner::client::{Client, ClientConfig};
+use google_cloud_auth::credentials::anonymous::Builder as Anonymous;
+use google_cloud_spanner::client::{DatabaseClient, Spanner};
+use google_cloud_spanner::result::Row as SpannerRow;
 use google_cloud_spanner::statement::Statement;
+use google_cloud_spanner::value::FromValue;
+use google_cloud_spanner_admin_database_v1::model::DatabaseDialect;
 use tokio::runtime::Runtime;
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -19,12 +21,11 @@ use tokio::runtime::Runtime;
 fn ensure_rustls_provider() {
     static PROVIDER: OnceLock<()> = OnceLock::new();
     PROVIDER.get_or_init(|| {
-        // testcontainers/bollard and gcloud-auth enable different rustls providers.
-        // Installing one process-wide provider avoids rustls panicking during tests.
-        #[cfg(windows)]
+        // The library builds the official Google Cloud clients without their
+        // default aws-lc provider so MinGW artifacts link cleanly. Tests install
+        // the same process-wide provider before either testcontainers or the
+        // Spanner clients build TLS configuration.
         let _ = rustls::crypto::ring::default_provider().install_default();
-        #[cfg(not(windows))]
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     });
 }
 
@@ -132,32 +133,59 @@ fn get_gsql_ddl_db() -> &'static spanemuboost::SpanEmuDatabase {
     })
 }
 
+async fn database_client_for(db: &spanemuboost::SpanEmuDatabase) -> DatabaseClient {
+    let spanner = Spanner::builder()
+        .with_endpoint(format!("http://{}", db.emulator_host()))
+        .with_credentials(Anonymous::new().build())
+        .build()
+        .await
+        .unwrap();
+    spanner
+        .database_client(db.database_path())
+        .build()
+        .await
+        .unwrap()
+}
+
+trait RowColumnExt {
+    fn column<T: FromValue>(&self, idx: usize) -> google_cloud_spanner::Result<T>;
+}
+
+impl RowColumnExt for SpannerRow {
+    fn column<T: FromValue>(&self, idx: usize) -> google_cloud_spanner::Result<T> {
+        self.try_get(idx)
+    }
+}
+
+fn numeric_column(row: &SpannerRow, idx: usize) -> bigdecimal::BigDecimal {
+    row.raw_values()
+        .get(idx)
+        .and_then(|value| value.try_as_string())
+        .expect("NUMERIC value should be encoded as string")
+        .parse()
+        .expect("valid NUMERIC decimal")
+}
+
 /// Get a shared Spanner data client connected to the GoogleSQL read database.
-fn spanner_client() -> Arc<Client> {
-    static CLIENT: OnceLock<Arc<Client>> = OnceLock::new();
+fn spanner_client() -> Arc<DatabaseClient> {
+    static CLIENT: OnceLock<Arc<DatabaseClient>> = OnceLock::new();
     CLIENT
         .get_or_init(|| {
             let db = get_gsql_db();
-            test_runtime().block_on(async {
-                let config = ClientConfig {
-                    environment: Environment::Emulator(db.emulator_host().to_string()),
-                    ..Default::default()
-                };
-                Arc::new(Client::new(db.database_path(), config).await.unwrap())
-            })
+            test_runtime().block_on(async { Arc::new(database_client_for(db).await) })
         })
         .clone()
 }
 
 /// Execute a Spanner SQL query and return all rows.
-fn exec_spanner(sql: &str) -> Vec<google_cloud_spanner::row::Row> {
+fn exec_spanner(sql: &str) -> Vec<SpannerRow> {
     let client = spanner_client();
     test_runtime().block_on(async {
-        let mut tx = client.single().await.unwrap();
-        let stmt = Statement::new(sql);
-        let mut iter = tx.query(stmt).await.unwrap();
+        let tx = client.single_use().build();
+        let stmt = Statement::builder(sql).build();
+        let mut iter = tx.execute_query(stmt).await.unwrap();
         let mut rows = Vec::new();
-        while let Some(row) = iter.next().await.unwrap() {
+        while let Some(row) = iter.next().await.transpose().unwrap() {
             rows.push(row);
         }
         rows
@@ -165,7 +193,7 @@ fn exec_spanner(sql: &str) -> Vec<google_cloud_spanner::row::Row> {
 }
 
 /// Execute a Spanner SQL query expecting exactly one row.
-fn exec_spanner_one(sql: &str) -> google_cloud_spanner::row::Row {
+fn exec_spanner_one(sql: &str) -> SpannerRow {
     let rows = exec_spanner(sql);
     assert_eq!(
         rows.len(),
@@ -176,21 +204,14 @@ fn exec_spanner_one(sql: &str) -> google_cloud_spanner::row::Row {
     rows.into_iter().next().unwrap()
 }
 
-fn exec_spanner_on(
-    db: &spanemuboost::SpanEmuDatabase,
-    sql: &str,
-) -> Vec<google_cloud_spanner::row::Row> {
+fn exec_spanner_on(db: &spanemuboost::SpanEmuDatabase, sql: &str) -> Vec<SpannerRow> {
     test_runtime().block_on(async {
-        let config = ClientConfig {
-            environment: Environment::Emulator(db.emulator_host().to_string()),
-            ..Default::default()
-        };
-        let client = Client::new(db.database_path(), config).await.unwrap();
-        let mut tx = client.single().await.unwrap();
-        let stmt = Statement::new(sql);
-        let mut iter = tx.query(stmt).await.unwrap();
+        let client = database_client_for(db).await;
+        let tx = client.single_use().build();
+        let stmt = Statement::builder(sql).build();
+        let mut iter = tx.execute_query(stmt).await.unwrap();
         let mut rows = Vec::new();
-        while let Some(row) = iter.next().await.unwrap() {
+        while let Some(row) = iter.next().await.transpose().unwrap() {
             rows.push(row);
         }
         rows
@@ -367,12 +388,12 @@ fn test_spanner_timestamp() {
 #[test]
 fn test_spanner_numeric() {
     let row = exec_spanner_one("SELECT NUMERIC '123.456789' AS col");
-    let bd = row.column::<bigdecimal::BigDecimal>(0).unwrap();
+    let bd = numeric_column(&row, 0);
     let expected: bigdecimal::BigDecimal = "123.456789".parse().unwrap();
     assert_eq!(bd, expected);
 
     let row = exec_spanner_one("SELECT NUMERIC '-99999.999999999' AS col");
-    let bd = row.column::<bigdecimal::BigDecimal>(0).unwrap();
+    let bd = numeric_column(&row, 0);
     let expected: bigdecimal::BigDecimal = "-99999.999999999".parse().unwrap();
     assert_eq!(bd, expected);
 }
@@ -526,7 +547,7 @@ fn test_spanner_table_date_timestamp() {
 #[test]
 fn test_spanner_table_numeric_json() {
     let row = exec_spanner_one("SELECT NumCol, JsonCol FROM NumericTypes WHERE Id = 1");
-    let bd = row.column::<bigdecimal::BigDecimal>(0).unwrap();
+    let bd = numeric_column(&row, 0);
     let expected: bigdecimal::BigDecimal = "123.456789".parse().unwrap();
     assert_eq!(bd, expected);
     let json = row.column::<String>(1).unwrap();
@@ -901,15 +922,16 @@ fn test_vtab_scan_exact_staleness() {
 fn test_spanner_query_params() {
     let client = spanner_client();
     let rows = test_runtime().block_on(async {
-        let mut tx = client.single().await.unwrap();
-        let mut stmt = Statement::new(
+        let tx = client.single_use().build();
+        let stmt = Statement::builder(
             "SELECT Id, StringCol FROM ScalarTypes WHERE Id = @id AND StringCol = @name",
-        );
-        stmt.add_param("id", &1_i64);
-        stmt.add_param("name", &"hello".to_string());
-        let mut iter = tx.query(stmt).await.unwrap();
+        )
+        .add_param("id", &1_i64)
+        .add_param("name", &"hello".to_string())
+        .build();
+        let mut iter = tx.execute_query(stmt).await.unwrap();
         let mut rows = Vec::new();
-        while let Some(row) = iter.next().await.unwrap() {
+        while let Some(row) = iter.next().await.transpose().unwrap() {
             rows.push(row);
         }
         rows
@@ -1037,6 +1059,7 @@ roundtrip_tests! {
     test_roundtrip_e2e_timestamp:         "spanner_value('2024-06-15T10:30:00Z'::TIMESTAMPTZ)" => Timestamp("2024-06-15T10:30:00Z");
     test_roundtrip_e2e_bytes:             "spanner_value('\\xDEAD'::BLOB)"                     => Base64("3kFE");
     test_roundtrip_e2e_numeric:           "spanner_value(123.456789::DECIMAL(38,9))"            => Value("DECIMAL(38,9)", "123.456789000");
+    test_roundtrip_e2e_plain_null:        "NULL"                                                => Null("VARCHAR");
     test_roundtrip_e2e_null_int64:        "spanner_value(NULL::BIGINT)"                        => Null("BIGINT");
     test_roundtrip_e2e_null_date:         "spanner_value(NULL::DATE)"                          => Null("DATE");
     test_roundtrip_e2e_spanner_typed:     "spanner_typed(42, 'INT64')"                         => Value("BIGINT", "42");
@@ -1128,20 +1151,24 @@ fn test_error_invalid_sql_query() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn make_ddl_sql(db: &spanemuboost::SpanEmuDatabase, ddl: &str) -> String {
+    // Testcontainers maps the emulator gRPC and REST ports independently, so
+    // pass both endpoints while keeping `endpoint` on the public gRPC contract.
     format!(
-        "SELECT * FROM spanner_ddl('{}', database_path := '{}', endpoint := '{}')",
+        "SELECT * FROM spanner_ddl('{}', database_path := '{}', endpoint := '{}', admin_endpoint := '{}')",
         ddl.replace('\'', "''"),
         db.database_path(),
-        db.emulator_host()
+        db.emulator_host(),
+        db.admin_host()
     )
 }
 
 fn make_ddl_async_sql(db: &spanemuboost::SpanEmuDatabase, ddl: &str) -> String {
     format!(
-        "SELECT * FROM spanner_ddl_async('{}', database_path := '{}', endpoint := '{}')",
+        "SELECT * FROM spanner_ddl_async('{}', database_path := '{}', endpoint := '{}', admin_endpoint := '{}')",
         ddl.replace('\'', "''"),
         db.database_path(),
-        db.emulator_host()
+        db.emulator_host(),
+        db.admin_host()
     )
 }
 
@@ -1252,9 +1279,10 @@ fn test_ddl_operations() {
 
     // 6. List operations via spanner_operations
     let ops_sql = format!(
-        "SELECT * FROM spanner_operations(database_path := '{}', endpoint := '{}')",
+        "SELECT * FROM spanner_operations(database_path := '{}', endpoint := '{}', admin_endpoint := '{}')",
         db.database_path(),
-        db.emulator_host()
+        db.emulator_host(),
+        db.admin_host()
     );
     let mut stmt = conn.prepare(&ops_sql).unwrap();
     let rows: Vec<(String, bool)> = stmt
@@ -1572,6 +1600,10 @@ fn create_duckdb_connection_with_copy() -> Connection {
 fn test_copy_to_registration() {
     // Verify the copy function is registered and DuckDB can parse COPY TO spanner syntax.
     // Uses raw C API to avoid Rust exception handling issues.
+    //
+    // Point `endpoint` at a closed local port so the client fails fast without
+    // ADC / metadata-server waits. Omitting endpoint hangs CI runners that have
+    // no credentials and try the default Spanner path indefinitely.
     unsafe {
         let mut db: duckdb::ffi::duckdb_database = std::ptr::null_mut();
         let r = duckdb::ffi::duckdb_open(c":memory:".as_ptr(), &mut db);
@@ -1583,19 +1615,36 @@ fn test_copy_to_registration() {
 
         register_copy_function(con, false);
 
-        // Try COPY with invalid database — should fail with Spanner connection error, not crash
+        // Try COPY with unreachable endpoint — should fail with Spanner connection
+        // error, not crash or hang waiting for ADC.
         let sql = std::ffi::CString::new(
-            "COPY (SELECT CAST(1 AS BIGINT) AS a) TO 'T' (FORMAT spanner, database_path 'projects/p/instances/i/databases/d')"
-        ).unwrap();
+            "COPY (SELECT CAST(1 AS BIGINT) AS a) TO 'T' (\
+                FORMAT spanner, \
+                database_path 'projects/p/instances/i/databases/d', \
+                endpoint '127.0.0.1:1'\
+            )",
+        )
+        .unwrap();
         let mut result = std::mem::MaybeUninit::zeroed();
         let r = duckdb::ffi::duckdb_query(con, sql.as_ptr(), result.as_mut_ptr());
         let mut result = result.assume_init();
-        if r != duckdb::ffi::DuckDBSuccess {
-            let err = duckdb::ffi::duckdb_result_error(&mut result);
-            assert!(!err.is_null(), "error message should not be null");
-            let err_str = std::ffi::CStr::from_ptr(err).to_string_lossy();
-            eprintln!("Expected COPY error: {err_str}");
-        }
+        assert_ne!(
+            r,
+            duckdb::ffi::DuckDBSuccess,
+            "COPY to unreachable endpoint should fail"
+        );
+        let err = duckdb::ffi::duckdb_result_error(&mut result);
+        assert!(!err.is_null(), "error message should not be null");
+        let err_str = std::ffi::CStr::from_ptr(err).to_string_lossy();
+        eprintln!("Expected COPY error: {err_str}");
+        assert!(
+            err_str.contains("Failed to connect to Spanner")
+                || err_str.contains("Timed out connecting")
+                || err_str.contains("connection")
+                || err_str.contains("connect")
+                || err_str.contains("error"),
+            "unexpected COPY error: {err_str}"
+        );
         duckdb::ffi::duckdb_destroy_result(&mut result);
         duckdb::ffi::duckdb_disconnect(&mut con);
         duckdb::ffi::duckdb_close(&mut db);
@@ -1892,9 +1941,10 @@ fn test_pg_ddl_operations() {
 
     // 6. spanner_operations
     let ops_sql = format!(
-        "SELECT * FROM spanner_operations(database_path := '{}', endpoint := '{}')",
+        "SELECT * FROM spanner_operations(database_path := '{}', endpoint := '{}', admin_endpoint := '{}')",
         db.database_path(),
-        db.emulator_host()
+        db.emulator_host(),
+        db.admin_host()
     );
     let mut stmt = conn.prepare(&ops_sql).unwrap();
     let rows: Vec<(String, bool)> = stmt

@@ -14,9 +14,14 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Spread jobs across free public-runner pools so PR starts don't all queue on
+  # ubuntu-latest (x64). Specs are the same (4 CPU / 16 GB) for ubuntu-24.04 and
+  # ubuntu-24.04-arm; the win is less contention. See:
+  # https://docs.github.com/en/actions/reference/runners/github-hosted-runners#standard-github-hosted-runners-for-public-repositories
   changes:
     name: Detect changed files
-    runs-on: ubuntu-latest
+    # Lightweight git-diff only; slim frees a full 4-CPU runner for builds/tests.
+    runs-on: ubuntu-slim
     outputs:
       run_distribution: ${{ steps.changed.outputs.run_distribution }}
       run_emulator: ${{ steps.changed.outputs.run_emulator }}
@@ -68,8 +73,9 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   lint:
-    name: Format and Clippy
-    runs-on: ubuntu-latest
+    name: Format, Clippy, and Unit Tests
+    # arm64 pool: same 4/16 as ubuntu-latest, separate queue from linux_amd64 builds.
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
         with:
@@ -85,6 +91,7 @@ jobs:
 
       - run: cargo fmt --check
       - run: cargo clippy --features loadable-extension
+      - run: cargo test --lib
 
   duckdb-stable-build:
     name: Build extension binaries
@@ -107,7 +114,8 @@ jobs:
     name: SQLLogicTest
     needs: changes
     if: ${{ needs.changes.outputs.run_emulator == 'true' }}
-    runs-on: ubuntu-latest
+    # Spanner emulator is multi-arch; run on arm to leave x64 for linux_amd64 builds.
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
         with:
@@ -126,7 +134,8 @@ jobs:
     name: Rust integration tests
     needs: changes
     if: ${{ needs.changes.outputs.run_emulator == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -134,9 +143,23 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Free disk space
+        run: |
+          sudo rm -rf \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/.ghcup \
+            /usr/local/lib/android \
+            /usr/share/dotnet
+          docker system prune -af || true
+          df -h
+
+      - name: Pre-pull Spanner emulator image
+        run: docker pull gcr.io/cloud-spanner-emulator/emulator:1.5.51
+
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
 
       - name: Rust integration tests
-        run: cargo test
+        run: cargo test --test integration_test

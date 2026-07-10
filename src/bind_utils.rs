@@ -1,6 +1,6 @@
 use duckdb::vtab::BindInfo;
-use google_cloud_googleapis::spanner::v1::request_options::Priority;
-use google_cloud_spanner::value::TimestampBound;
+use google_cloud_spanner::model::request_options::Priority;
+use google_cloud_spanner::transaction::TimestampBound;
 
 use crate::config;
 
@@ -18,7 +18,6 @@ pub enum TimestampBoundConfig {
 
 impl TimestampBoundConfig {
     pub fn to_timestamp_bound(&self) -> TimestampBound {
-        use google_cloud_spanner::value::Timestamp;
         match self {
             Self::ExactStaleness { secs } => {
                 TimestampBound::exact_staleness(std::time::Duration::from_secs(*secs))
@@ -26,15 +25,11 @@ impl TimestampBoundConfig {
             Self::MaxStaleness { secs } => {
                 TimestampBound::max_staleness(std::time::Duration::from_secs(*secs))
             }
-            Self::ReadTimestamp { seconds, nanos } => TimestampBound::read_timestamp(Timestamp {
-                seconds: *seconds,
-                nanos: *nanos,
-            }),
+            Self::ReadTimestamp { seconds, nanos } => {
+                TimestampBound::read_timestamp(wkt::Timestamp::clamp(*seconds, *nanos))
+            }
             Self::MinReadTimestamp { seconds, nanos } => {
-                TimestampBound::min_read_timestamp(Timestamp {
-                    seconds: *seconds,
-                    nanos: *nanos,
-                })
+                TimestampBound::min_read_timestamp(wkt::Timestamp::clamp(*seconds, *nanos))
             }
         }
     }
@@ -219,4 +214,10 @@ pub fn resolve_database_path(bind: &BindInfo) -> Result<String, Box<dyn std::err
 pub fn resolve_endpoint(bind: &BindInfo) -> Option<String> {
     get_named_string(bind, "endpoint")
         .or_else(|| config::get_config_string(bind, "spanner_endpoint"))
+}
+
+/// Resolve the Spanner admin REST endpoint from named arg or config option.
+pub fn resolve_admin_endpoint(bind: &BindInfo) -> Option<String> {
+    get_named_string(bind, "admin_endpoint")
+        .or_else(|| config::get_config_string(bind, "spanner_admin_endpoint"))
 }

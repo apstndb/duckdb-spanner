@@ -1,20 +1,13 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use duckdb::core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId};
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab, Value};
-use google_cloud_gax::conn::Environment;
-use google_cloud_gax::grpc::transport::Channel;
-use google_cloud_googleapis::longrunning::operation;
-use google_cloud_googleapis::longrunning::operations_client::OperationsClient;
-use google_cloud_googleapis::longrunning::ListOperationsRequest;
-use google_cloud_googleapis::longrunning::Operation as InternalOperation;
-use google_cloud_googleapis::spanner::admin::database::v1::{
-    ListDatabaseOperationsRequest, UpdateDatabaseDdlRequest,
-};
-use google_cloud_spanner::admin::client::Client as AdminClient;
-use google_cloud_spanner::admin::AdminClientConfig;
+use google_cloud_auth::credentials::anonymous::Builder as Anonymous;
+use google_cloud_gax::paginator::ItemPaginator;
+use google_cloud_longrunning::model::{operation, Operation as InternalOperation};
+use google_cloud_spanner_admin_database_v1::client::DatabaseAdmin;
 
 use crate::error::SpannerError;
 use crate::{bind_utils, runtime};
@@ -23,9 +16,7 @@ use crate::{bind_utils, runtime};
 // Admin client cache
 // ---------------------------------------------------------------------------
 
-static ADMIN_CLIENT_CACHE: LazyLock<Mutex<HashMap<String, Arc<AdminClient>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-static EMULATOR_OPERATIONS_CHANNEL_CACHE: LazyLock<Mutex<HashMap<String, Channel>>> =
+static ADMIN_CLIENT_CACHE: LazyLock<Mutex<HashMap<String, Arc<DatabaseAdmin>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Get or create a Spanner Admin client.
@@ -33,9 +24,9 @@ static EMULATOR_OPERATIONS_CHANNEL_CACHE: LazyLock<Mutex<HashMap<String, Channel
 /// Admin clients are NOT per-database (unlike data clients). The cache key is
 /// the endpoint string (or empty for default).
 async fn get_or_create_admin_client(
-    endpoint: Option<&str>,
-) -> Result<Arc<AdminClient>, SpannerError> {
-    let cache_key = endpoint.unwrap_or("").to_string();
+    admin_endpoint: Option<&str>,
+) -> Result<Arc<DatabaseAdmin>, SpannerError> {
+    let cache_key = admin_endpoint.unwrap_or("").to_string();
 
     {
         let cache = ADMIN_CLIENT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
@@ -44,26 +35,17 @@ async fn get_or_create_admin_client(
         }
     }
 
-    let config = match endpoint {
-        Some(ep) => AdminClientConfig {
-            environment: Environment::Emulator(ep.to_string()),
-            ..Default::default()
-        },
-        None => {
-            if std::env::var("SPANNER_EMULATOR_HOST").is_ok() {
-                AdminClientConfig::default()
-            } else {
-                AdminClientConfig::default()
-                    .with_auth()
-                    .await
-                    .map_err(|e| SpannerError::Other(format!("Auth error: {e}")))?
-            }
-        }
-    };
+    let mut builder = DatabaseAdmin::builder();
+    let emulator_endpoint = admin_endpoint
+        .map(str::to_owned)
+        .or_else(|| std::env::var("SPANNER_EMULATOR_HOST").ok());
+    if let Some(ep) = emulator_endpoint {
+        builder = builder
+            .with_endpoint(admin_endpoint_url(&ep))
+            .with_credentials(Anonymous::new().build());
+    }
 
-    let client = AdminClient::new(config)
-        .await
-        .map_err(|e| SpannerError::Other(format!("Admin client error: {e}")))?;
+    let client = builder.build().await?;
     let client = Arc::new(client);
 
     let mut cache = ADMIN_CLIENT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
@@ -71,6 +53,180 @@ async fn get_or_create_admin_client(
         .entry(cache_key)
         .or_insert_with(|| Arc::clone(&client));
     Ok(Arc::clone(entry))
+}
+
+fn emulator_endpoint(endpoint: Option<&str>) -> Option<String> {
+    endpoint
+        .map(str::to_owned)
+        .or_else(|| std::env::var("SPANNER_EMULATOR_HOST").ok())
+}
+
+fn emulator_admin_endpoint(endpoint: Option<&str>, admin_endpoint: Option<&str>) -> Option<String> {
+    admin_endpoint
+        .map(admin_endpoint_url)
+        .or_else(|| emulator_endpoint(endpoint).map(|ep| admin_endpoint_url(&ep)))
+}
+
+async fn update_database_ddl(
+    admin: &DatabaseAdmin,
+    database_path: String,
+    statements: Vec<String>,
+    endpoint: Option<&str>,
+    admin_endpoint: Option<&str>,
+) -> Result<InternalOperation, SpannerError> {
+    if let Some(admin_endpoint) = emulator_admin_endpoint(endpoint, admin_endpoint) {
+        return update_emulator_database_ddl(&admin_endpoint, &database_path, statements).await;
+    }
+
+    Ok(admin
+        .update_database_ddl()
+        .set_database(database_path)
+        .set_statements(statements)
+        .send()
+        .await?)
+}
+
+async fn wait_database_operation(
+    admin: &DatabaseAdmin,
+    operation_name: &str,
+    endpoint: Option<&str>,
+    admin_endpoint: Option<&str>,
+) -> Result<InternalOperation, SpannerError> {
+    if let Some(admin_endpoint) = emulator_admin_endpoint(endpoint, admin_endpoint) {
+        return wait_emulator_operation(&admin_endpoint, operation_name).await;
+    }
+
+    wait_operation(admin, operation_name).await
+}
+
+async fn update_emulator_database_ddl(
+    admin_endpoint: &str,
+    database_path: &str,
+    statements: Vec<String>,
+) -> Result<InternalOperation, SpannerError> {
+    // google-cloud-rust's generated REST client currently sends system query
+    // parameters that the Spanner emulator rejects for UpdateDatabaseDdl.
+    let url = format!(
+        "{}/v1/{}/ddl",
+        admin_endpoint.trim_end_matches('/'),
+        database_path
+    );
+    let client = reqwest::Client::new();
+    let payload = serde_json::json!({ "statements": statements });
+    const MAX_ATTEMPTS: u32 = 25;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        let response = client
+            .patch(&url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| SpannerError::Other(format!("Failed to update emulator DDL: {e:?}")))?;
+        let status = response.status();
+        let body = response.text().await.map_err(|e| {
+            SpannerError::Other(format!("Failed to read emulator DDL response: {e}"))
+        })?;
+
+        if status.is_success() {
+            return operation_from_json(&body);
+        }
+
+        if body.contains("\"code\":9")
+            && body.contains("Schema change operation rejected")
+            && attempt < MAX_ATTEMPTS
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+
+        return Err(SpannerError::Other(format!(
+            "Failed to update emulator DDL: status={status}, body={body}"
+        )));
+    }
+
+    Err(SpannerError::Other(
+        "Failed to update emulator DDL: retry loop exhausted".to_string(),
+    ))
+}
+
+async fn wait_emulator_operation(
+    admin_endpoint: &str,
+    operation_name: &str,
+) -> Result<InternalOperation, SpannerError> {
+    let url = format!(
+        "{}/v1/{}",
+        admin_endpoint.trim_end_matches('/'),
+        operation_name
+    );
+    let client = reqwest::Client::new();
+
+    loop {
+        let response = client.get(&url).send().await.map_err(|e| {
+            SpannerError::Other(format!("Failed to fetch emulator operation: {e:?}"))
+        })?;
+        let status = response.status();
+        let body = response.text().await.map_err(|e| {
+            SpannerError::Other(format!("Failed to read emulator operation response: {e}"))
+        })?;
+
+        if !status.is_success() {
+            return Err(SpannerError::Other(format!(
+                "Failed to fetch emulator operation: status={status}, body={body}"
+            )));
+        }
+
+        let op = operation_from_json(&body)?;
+        if op.done {
+            return Ok(op);
+        }
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+fn operation_from_json(body: &str) -> Result<InternalOperation, SpannerError> {
+    let json: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| SpannerError::Other(format!("Failed to parse emulator operation: {e}")))?;
+    let name = json
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            SpannerError::Other(format!(
+                "Emulator operation response is missing a string name: {body}"
+            ))
+        })?;
+    let done = json
+        .get("done")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    let mut op = InternalOperation::new().set_name(name).set_done(done);
+    if let Some(error) = json.get("error") {
+        let code = error
+            .get("code")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or_default() as i32;
+        let message = error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Spanner DDL operation failed");
+        op = op.set_error(
+            google_cloud_rpc::model::Status::new()
+                .set_code(code)
+                .set_message(message),
+        );
+    }
+
+    Ok(op)
+}
+
+fn ddl_operation_error(op: &InternalOperation) -> Option<String> {
+    op.error().map(|status| {
+        format!(
+            "Spanner DDL operation {} failed: code={}, message={}",
+            op.name, status.code, status.message
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -97,6 +253,10 @@ fn database_named_parameters() -> Vec<(String, LogicalTypeHandle)> {
         ),
         (
             "endpoint".to_string(),
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        ),
+        (
+            "admin_endpoint".to_string(),
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
         ),
     ]
@@ -209,6 +369,7 @@ pub struct DdlBindData {
     database_path: String,
     statements: Vec<String>,
     endpoint: Option<String>,
+    admin_endpoint: Option<String>,
     // DuckDB may call init() more than once for one bound table function.
     // Cache the full init outcome so repeated callers do not resend DDL and
     // see the same success or error from the first execution.
@@ -236,6 +397,7 @@ impl VTab for SpannerDdlVTab {
         let statements = ddl_statements_from_bind(bind)?;
         let database_path = bind_utils::resolve_database_path(bind)?;
         let endpoint = bind_utils::resolve_endpoint(bind);
+        let admin_endpoint = bind_utils::resolve_admin_endpoint(bind);
 
         bind.add_result_column(
             "operation_name",
@@ -251,6 +413,7 @@ impl VTab for SpannerDdlVTab {
             database_path,
             statements,
             endpoint,
+            admin_endpoint,
             cached_result: Arc::new(Mutex::new(None)),
         })
     }
@@ -262,35 +425,40 @@ impl VTab for SpannerDdlVTab {
             let database_path = bind_data.database_path.clone();
             let statements = bind_data.statements.clone();
             let endpoint = bind_data.endpoint.clone();
+            let admin_endpoint = bind_data.admin_endpoint.clone();
+            let effective_admin_endpoint =
+                emulator_admin_endpoint(endpoint.as_deref(), admin_endpoint.as_deref());
 
             runtime::block_on(async {
-                let admin = get_or_create_admin_client(endpoint.as_deref()).await?;
-
-                let req = UpdateDatabaseDdlRequest {
-                    database: database_path,
-                    statements,
-                    operation_id: String::new(),
-                    proto_descriptors: vec![],
-                    ..Default::default()
-                };
+                let admin = get_or_create_admin_client(effective_admin_endpoint.as_deref()).await?;
 
                 let start = Instant::now();
-                let mut op = admin
-                    .database()
-                    .update_database_ddl(req, None)
-                    .await
-                    .map_err(SpannerError::Grpc)?;
+                let op = update_database_ddl(
+                    &admin,
+                    database_path,
+                    statements,
+                    endpoint.as_deref(),
+                    admin_endpoint.as_deref(),
+                )
+                .await?;
 
-                let operation_name = op.name().to_string();
-
-                // Wait for completion
-                op.wait(None).await.map_err(SpannerError::Grpc)?;
+                let operation_name = op.name.clone();
+                let op = wait_database_operation(
+                    &admin,
+                    &operation_name,
+                    endpoint.as_deref(),
+                    admin_endpoint.as_deref(),
+                )
+                .await?;
+                if let Some(err) = ddl_operation_error(&op) {
+                    return Err(SpannerError::Other(err));
+                }
 
                 let duration_secs = start.elapsed().as_secs_f64();
 
                 Ok::<DdlResult, SpannerError>(DdlResult {
                     operation_name,
-                    done: true,
+                    done: op.done,
                     duration_secs,
                 })
             })?
@@ -358,6 +526,7 @@ pub struct DdlAsyncBindData {
     database_path: String,
     statements: Vec<String>,
     endpoint: Option<String>,
+    admin_endpoint: Option<String>,
     // See the comment on `DdlBindData::cached_result`.
     cached_result: Arc<Mutex<Option<Result<DdlAsyncResult, String>>>>,
 }
@@ -382,6 +551,7 @@ impl VTab for SpannerDdlAsyncVTab {
         let statements = ddl_statements_from_bind(bind)?;
         let database_path = bind_utils::resolve_database_path(bind)?;
         let endpoint = bind_utils::resolve_endpoint(bind);
+        let admin_endpoint = bind_utils::resolve_admin_endpoint(bind);
 
         bind.add_result_column(
             "operation_name",
@@ -393,6 +563,7 @@ impl VTab for SpannerDdlAsyncVTab {
             database_path,
             statements,
             endpoint,
+            admin_endpoint,
             cached_result: Arc::new(Mutex::new(None)),
         })
     }
@@ -404,27 +575,28 @@ impl VTab for SpannerDdlAsyncVTab {
             let database_path = bind_data.database_path.clone();
             let statements = bind_data.statements.clone();
             let endpoint = bind_data.endpoint.clone();
+            let admin_endpoint = bind_data.admin_endpoint.clone();
+            let effective_admin_endpoint =
+                emulator_admin_endpoint(endpoint.as_deref(), admin_endpoint.as_deref());
 
             runtime::block_on(async {
-                let admin = get_or_create_admin_client(endpoint.as_deref()).await?;
+                let admin = get_or_create_admin_client(effective_admin_endpoint.as_deref()).await?;
 
-                let req = UpdateDatabaseDdlRequest {
-                    database: database_path,
+                let op = update_database_ddl(
+                    &admin,
+                    database_path,
                     statements,
-                    operation_id: String::new(),
-                    proto_descriptors: vec![],
-                    ..Default::default()
-                };
-
-                let op = admin
-                    .database()
-                    .update_database_ddl(req, None)
-                    .await
-                    .map_err(SpannerError::Grpc)?;
+                    endpoint.as_deref(),
+                    admin_endpoint.as_deref(),
+                )
+                .await?;
+                if let Some(err) = ddl_operation_error(&op) {
+                    return Err(SpannerError::Other(err));
+                }
 
                 Ok::<DdlAsyncResult, SpannerError>(DdlAsyncResult {
-                    operation_name: op.name().to_string(),
-                    done: op.done(),
+                    operation_name: op.name,
+                    done: op.done,
                 })
             })?
             .map_err(Into::into)
@@ -488,6 +660,7 @@ impl VTab for SpannerDdlAsyncVTab {
 pub struct OperationsBindData {
     database_path: String,
     endpoint: Option<String>,
+    admin_endpoint: Option<String>,
     filter: Option<String>,
 }
 
@@ -514,6 +687,7 @@ impl VTab for SpannerOperationsVTab {
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
         let database_path = bind_utils::resolve_database_path(bind)?;
         let endpoint = bind_utils::resolve_endpoint(bind);
+        let admin_endpoint = bind_utils::resolve_admin_endpoint(bind);
         let filter = bind_utils::get_named_string(bind, "filter");
 
         bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
@@ -534,6 +708,7 @@ impl VTab for SpannerOperationsVTab {
         Ok(OperationsBindData {
             database_path,
             endpoint,
+            admin_endpoint,
             filter,
         })
     }
@@ -543,10 +718,17 @@ impl VTab for SpannerOperationsVTab {
 
         let database_path = bind_data.database_path.clone();
         let endpoint = bind_data.endpoint.clone();
+        let admin_endpoint = bind_data.admin_endpoint.clone();
         let filter = bind_data.filter.clone();
 
         let ops = runtime::block_on(async {
-            list_database_operations(&database_path, endpoint.as_deref(), filter.as_deref()).await
+            list_database_operations(
+                &database_path,
+                endpoint.as_deref(),
+                admin_endpoint.as_deref(),
+                filter.as_deref(),
+            )
+            .await
         })??;
 
         init.set_max_threads(1);
@@ -628,7 +810,7 @@ fn operation_to_row(op: InternalOperation) -> OperationRow {
     let metadata_type = op
         .metadata
         .as_ref()
-        .map(|m| m.type_url.clone())
+        .and_then(|m| m.type_url().map(str::to_string))
         .unwrap_or_default();
 
     let (error_code, error_message) = match &op.result {
@@ -645,19 +827,37 @@ fn operation_to_row(op: InternalOperation) -> OperationRow {
     }
 }
 
+async fn wait_operation(
+    admin: &DatabaseAdmin,
+    operation_name: &str,
+) -> Result<InternalOperation, SpannerError> {
+    let mut op = admin
+        .get_operation()
+        .set_name(operation_name)
+        .send()
+        .await?;
+    while !op.done {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        op = admin
+            .get_operation()
+            .set_name(operation_name)
+            .send()
+            .await?;
+    }
+    Ok(op)
+}
+
 async fn list_database_operations(
     database_path: &str,
     endpoint: Option<&str>,
+    admin_endpoint: Option<&str>,
     filter: Option<&str>,
 ) -> Result<Vec<OperationRow>, SpannerError> {
     // The emulator only implements google.longrunning.Operations/ListOperations,
     // while real Spanner exposes DatabaseAdmin/ListDatabaseOperations with auth.
-    let mut operations = match endpoint
-        .map(str::to_owned)
-        .or_else(|| std::env::var("SPANNER_EMULATOR_HOST").ok())
-    {
-        Some(emulator_endpoint) => {
-            list_emulator_database_operations(database_path, &emulator_endpoint, filter).await?
+    let mut operations = match emulator_admin_endpoint(endpoint, admin_endpoint) {
+        Some(admin_endpoint) => {
+            list_emulator_database_operations(database_path, &admin_endpoint, filter).await?
         }
         None => list_real_database_operations(database_path, filter).await?,
     };
@@ -675,19 +875,17 @@ async fn list_real_database_operations(
     filter: Option<&str>,
 ) -> Result<Vec<InternalOperation>, SpannerError> {
     let admin = get_or_create_admin_client(None).await?;
-    let req = ListDatabaseOperationsRequest {
-        parent: instance_path_from_database_path(database_path)?.to_string(),
-        filter: filter.unwrap_or_default().to_string(),
-        page_size: 0,
-        page_token: String::new(),
-    };
-    // The gcloud-spanner admin helper eagerly follows next_page_token and
-    // returns a flattened Vec<Operation>, so no extra pagination loop is needed here.
-    admin
-        .database()
-        .list_database_operations(req, None)
-        .await
-        .map_err(SpannerError::Grpc)
+    let mut items = admin
+        .list_database_operations()
+        .set_parent(instance_path_from_database_path(database_path)?.to_string())
+        .set_filter(filter.unwrap_or_default())
+        .by_item();
+
+    let mut operations = Vec::new();
+    while let Some(op) = items.next().await.transpose()? {
+        operations.push(op);
+    }
+    Ok(operations)
 }
 
 async fn list_emulator_database_operations(
@@ -695,66 +893,31 @@ async fn list_emulator_database_operations(
     endpoint: &str,
     filter: Option<&str>,
 ) -> Result<Vec<InternalOperation>, SpannerError> {
-    let channel = get_or_create_emulator_operations_channel(endpoint).await?;
-    let mut client = OperationsClient::new(channel);
-    let mut all_operations = Vec::new();
-    let mut page_token = String::new();
+    let admin = get_or_create_admin_client(Some(endpoint)).await?;
+    let mut items = admin
+        .list_operations()
+        .set_name(format!("{database_path}/operations"))
+        .set_filter(filter.unwrap_or_default())
+        .by_item();
 
-    loop {
-        let req = ListOperationsRequest {
-            name: format!("{database_path}/operations"),
-            filter: filter.unwrap_or_default().to_string(),
-            page_size: 0,
-            page_token: page_token.clone(),
-        };
-
-        let response = client
-            .list_operations(req)
-            .await
-            .map_err(SpannerError::Grpc)?
-            .into_inner();
-
-        all_operations.extend(response.operations);
-
-        if response.next_page_token.is_empty() {
-            break;
-        }
-        page_token = response.next_page_token;
+    let mut operations = Vec::new();
+    while let Some(op) = items.next().await.transpose()? {
+        operations.push(op);
     }
 
-    Ok(all_operations)
+    Ok(operations)
 }
 
-async fn get_or_create_emulator_operations_channel(
-    endpoint: &str,
-) -> Result<Channel, SpannerError> {
-    let cache_key = emulator_endpoint_url(endpoint);
-
-    {
-        let cache = EMULATOR_OPERATIONS_CHANNEL_CACHE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(channel) = cache.get(&cache_key) {
-            return Ok(channel.clone());
-        }
-    }
-
-    let channel = Channel::from_shared(cache_key.clone())
-        .map_err(|e| SpannerError::Other(format!("Invalid endpoint: {e}")))?
-        .connect()
-        .await
-        .map_err(|e| SpannerError::Other(format!("Connect error: {e}")))?;
-
-    let mut cache = EMULATOR_OPERATIONS_CHANNEL_CACHE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let entry = cache.entry(cache_key).or_insert_with(|| channel.clone());
-    Ok(entry.clone())
-}
-
-fn emulator_endpoint_url(endpoint: &str) -> String {
-    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+fn admin_endpoint_url(endpoint: &str) -> String {
+    let endpoint = endpoint.trim_end_matches('/');
+    let endpoint = if endpoint.ends_with(":9010") {
+        format!("{}:9020", endpoint.trim_end_matches(":9010"))
+    } else {
         endpoint.to_string()
+    };
+
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        endpoint
     } else {
         format!("http://{endpoint}")
     }
@@ -787,11 +950,11 @@ mod tests {
         duckdb_destroy_value, duckdb_value, DUCKDB_TYPE_DUCKDB_TYPE_BIGINT,
         DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
     };
-    use google_cloud_googleapis::longrunning::Operation as InternalOperation;
+    use google_cloud_longrunning::model::Operation as InternalOperation;
 
     use super::{
-        cached_init_result, database_operation_prefix, ddl_statements_from_values,
-        instance_path_from_database_path,
+        admin_endpoint_url, cached_init_result, database_operation_prefix, ddl_operation_error,
+        ddl_statements_from_values, instance_path_from_database_path, operation_from_json,
     };
 
     #[test]
@@ -904,18 +1067,41 @@ mod tests {
     }
 
     #[test]
+    fn test_admin_endpoint_url_maps_default_emulator_port_and_trims_slash() {
+        assert_eq!(
+            admin_endpoint_url("localhost:9010/"),
+            "http://localhost:9020"
+        );
+        assert_eq!(
+            admin_endpoint_url("http://127.0.0.1:9010/"),
+            "http://127.0.0.1:9020"
+        );
+        assert_eq!(
+            admin_endpoint_url("localhost:19020"),
+            "http://localhost:19020"
+        );
+    }
+
+    #[test]
+    fn test_operation_from_json_preserves_error() {
+        let op = operation_from_json(
+            r#"{"name":"projects/p/instances/i/databases/d/operations/op1","done":true,"error":{"code":3,"message":"bad ddl"}}"#,
+        )
+        .unwrap();
+
+        let err = ddl_operation_error(&op).unwrap();
+        assert!(err.contains("code=3"));
+        assert!(err.contains("bad ddl"));
+    }
+
+    #[test]
     fn test_database_operation_prefix_filters_other_databases() {
         let database_path = "projects/p/instances/i/databases/d";
         let prefix = database_operation_prefix(database_path);
         let operations = vec![
-            InternalOperation {
-                name: format!("{database_path}/operations/op-1"),
-                ..Default::default()
-            },
-            InternalOperation {
-                name: "projects/p/instances/i/databases/other/operations/op-2".to_string(),
-                ..Default::default()
-            },
+            InternalOperation::new().set_name(format!("{database_path}/operations/op-1")),
+            InternalOperation::new()
+                .set_name("projects/p/instances/i/databases/other/operations/op-2"),
         ];
 
         let matching_names: Vec<_> = operations

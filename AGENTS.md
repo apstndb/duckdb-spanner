@@ -45,15 +45,12 @@ Docker (Colima on macOS) must be running. `RUST_TEST_THREADS=4` is set in `.carg
 - Manual C API init in `src/lib.rs` (not using `#[duckdb_entrypoint_c_api]` macro because raw `duckdb_connection` is needed for config/copy registration)
 - Scalars register via `register_scalars_c_api` (null-input special handling); VTabs/macros via `register_extension_functions`
 
-## gcloud-spanner fork
+## Google Cloud Rust client
 
-`Cargo.toml` patches gcloud-spanner to a fork with:
-- `Client::get_session` made public
-- `RowIterator::new` made public
+`Cargo.toml` depends on the official `googleapis/google-cloud-rust` Spanner crates.
+Partitioned reads and queries use the official partition APIs in `src/query.rs` and `src/scan.rs`; no local client fork is required.
 
-These enable concurrent partition execution (`src/query.rs`, `src/scan.rs`).
-The fork lives at `../google-cloud-rust` on branch `feat/concurrent-partition-execution`.
-Use local path patches during development, git rev patches for commits/CI.
+The upstream crates are currently consumed from a pinned git revision. Keep all `google-cloud-*` crate revisions aligned when updating them.
 
 ## Test infrastructure
 

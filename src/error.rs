@@ -2,14 +2,11 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum SpannerError {
-    #[error("Spanner client error: {0}")]
-    Client(#[from] google_cloud_spanner::client::Error),
+    #[error("Google Cloud error: {0}")]
+    GoogleCloud(#[from] google_cloud_gax::error::Error),
 
-    #[error("Spanner error: {0}")]
-    Grpc(#[from] google_cloud_gax::grpc::Status),
-
-    #[error("Spanner row error: {0}")]
-    Row(#[from] google_cloud_spanner::row::Error),
+    #[error("Google Cloud client builder error: {0}")]
+    GoogleCloudClientBuilder(#[from] google_cloud_gax::client_builder::Error),
 
     #[error("Type conversion error: {0}")]
     Conversion(String),
