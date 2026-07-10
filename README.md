@@ -514,16 +514,6 @@ make test               # alias for test_release
 
 Requires Docker (Colima on macOS). Emulator tests use `SPANNER_EMULATOR_HOST` (default `localhost:9010`).
 
-### Shell integration tests
-
-The legacy shell harness (`tests/integration.sh`) remains available and mirrors the `spanner_query` / `spanner_scan` coverage in `test/sql/`:
-
-```bash
-make test-integration
-```
-
-Requires Docker, DuckDB CLI, and `curl`.
-
 ### Rust Integration Tests
 
 Rust integration tests use testcontainers to start the emulator automatically. You only need a running Docker daemon:

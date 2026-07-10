@@ -6,7 +6,7 @@
 #   - SPANNER_EMULATOR_HOST set or default localhost:9010
 #
 # Creates projects/test-project/instances/test-instance/databases/test-db with
-# the same tables and seed data as tests/integration.sh.
+# the tables and seed data used by the SQLLogicTest files.
 
 set -euo pipefail
 

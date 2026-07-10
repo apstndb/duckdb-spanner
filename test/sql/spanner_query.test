@@ -1,5 +1,5 @@
 # name: test/sql/spanner_query.test
-# description: spanner_query table function (ported from tests/integration.sh)
+# description: spanner_query table function
 # group: [spanner]
 #
 # Prerequisites:

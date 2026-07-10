@@ -1,5 +1,5 @@
 # name: test/sql/spanner_scan.test
-# description: spanner_scan table function (ported from tests/integration.sh)
+# description: spanner_scan table function
 # group: [spanner]
 #
 # Prerequisites:
