@@ -12,6 +12,15 @@ use crate::types::is_pg_numeric;
 
 const EPOCH_DATE: time::Date = time::macros::date!(1970 - 01 - 01);
 
+// DuckDB 1.5.0 caps a single vector allocation at 128 GiB. Result conversion
+// can write any supported physical type, whose widest inline representation is
+// 16 bytes (including LIST entries, VARCHAR, INTERVAL, and HUGEINT). Keeping the
+// element count within this conservative bound prevents the C++ reserve path
+// from throwing across the C API boundary.
+const DUCKDB_MAX_VECTOR_BYTES: u64 = 1 << 37;
+const DUCKDB_MAX_RESULT_CHILDREN: u64 =
+    DUCKDB_MAX_VECTOR_BYTES / std::mem::size_of::<ffi::duckdb_list_entry>() as u64;
+
 /// Extract the raw `duckdb_vector` handle from a FlatVector.
 ///
 /// duckdb-rs 1.10504.0 does not expose the underlying `duckdb_vector` handle,
@@ -29,6 +38,22 @@ unsafe fn flat_vector_raw(vector: &FlatVector<'_>) -> ffi::duckdb_vector {
     candidate
 }
 
+/// Extract the raw `duckdb_vector` handle from a ListVector.
+///
+/// duckdb-rs 1.10504.0 does not expose a capacity-aware nested-list accessor.
+/// `ListVector<'_>` stores its entries `FlatVector` first, whose raw pointer is
+/// also its first field. This is the same pinned layout dependency used by
+/// [`flat_vector_raw`].
+unsafe fn list_vector_raw(vector: &ListVector<'_>) -> ffi::duckdb_vector {
+    let candidate = *(vector as *const _ as *const ffi::duckdb_vector);
+    debug_assert_eq!(
+        ffi::duckdb_list_vector_get_size(candidate) as usize,
+        vector.len(),
+        "ListVector field layout assumption violated - entries are not at offset 0"
+    );
+    candidate
+}
+
 /// Assign a string to a FlatVector without UTF-8 validation.
 ///
 /// Spanner guarantees that STRING and JSON values are valid UTF-8, so we can
@@ -37,6 +62,7 @@ unsafe fn flat_vector_raw(vector: &FlatVector<'_>) -> ffi::duckdb_vector {
 ///
 /// # Safety
 /// - `idx` must be within the vector's allocated capacity
+/// - `idx` and `s.len()` must be representable by DuckDB's `idx_t`
 /// - The caller must guarantee the input bytes are valid UTF-8 (Spanner does this)
 unsafe fn unsafe_assign_string(vector: &mut FlatVector<'_>, idx: usize, s: &str) {
     let raw_vector = flat_vector_raw(vector);
@@ -46,6 +72,132 @@ unsafe fn unsafe_assign_string(vector: &mut FlatVector<'_>, idx: usize, s: &str)
         s.as_ptr() as *const _,
         s.len() as u64,
     );
+}
+
+fn checked_duckdb_index(
+    value: usize,
+    description: &str,
+    context: &dyn Fn() -> String,
+) -> Result<ffi::idx_t, SpannerError> {
+    ffi::idx_t::try_from(value).map_err(|_| {
+        SpannerError::Conversion(format!(
+            "{description} {value} is not representable by DuckDB idx_t ({})",
+            context()
+        ))
+    })
+}
+
+fn checked_child_count(
+    current: usize,
+    additional: usize,
+    context: &dyn Fn() -> String,
+) -> Result<usize, SpannerError> {
+    let total = current.checked_add(additional).ok_or_else(|| {
+        SpannerError::Conversion(format!("nested child count overflow ({})", context()))
+    })?;
+    let total_idx = checked_duckdb_index(total, "nested child count", context)?;
+    if total_idx > DUCKDB_MAX_RESULT_CHILDREN {
+        return Err(SpannerError::Conversion(format!(
+            "nested child count {total} exceeds DuckDB's safe result-vector capacity of {DUCKDB_MAX_RESULT_CHILDREN} ({})",
+            context()
+        )));
+    }
+    Ok(total)
+}
+
+fn ensure_vector_index(
+    idx: usize,
+    capacity: usize,
+    context: &dyn Fn() -> String,
+) -> Result<(), SpannerError> {
+    checked_duckdb_index(idx, "vector index", context)?;
+    if idx >= capacity {
+        return Err(SpannerError::Conversion(format!(
+            "vector index {idx} exceeds allocated capacity {capacity} ({})",
+            context()
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_row_count(row_count: usize, context: &dyn Fn() -> String) -> Result<(), SpannerError> {
+    checked_duckdb_index(row_count, "row count", context)?;
+    let capacity = rows_capacity_hint();
+    if row_count > capacity {
+        return Err(SpannerError::Conversion(format!(
+            "row count {row_count} exceeds DuckDB vector capacity {capacity} ({})",
+            context()
+        )));
+    }
+    Ok(())
+}
+
+fn set_list_entry_checked(
+    list_vector: &mut ListVector<'_>,
+    row_capacity: usize,
+    row_idx: usize,
+    offset: usize,
+    length: usize,
+    context: &dyn Fn() -> String,
+) -> Result<(), SpannerError> {
+    ensure_vector_index(row_idx, row_capacity, context)?;
+    let offset_idx = checked_duckdb_index(offset, "list child offset", context)?;
+    let length_idx = checked_duckdb_index(length, "list entry length", context)?;
+    checked_child_count(offset, length, context)?;
+
+    let raw_vector = unsafe { list_vector_raw(list_vector) };
+    let data = unsafe { ffi::duckdb_vector_get_data(raw_vector) };
+    if data.is_null() {
+        return Err(SpannerError::Conversion(format!(
+            "DuckDB returned a null LIST entry buffer ({})",
+            context()
+        )));
+    }
+    let entries = unsafe {
+        std::slice::from_raw_parts_mut(data.cast::<ffi::duckdb_list_entry>(), row_capacity)
+    };
+    entries[row_idx] = ffi::duckdb_list_entry {
+        offset: offset_idx,
+        length: length_idx,
+    };
+    Ok(())
+}
+
+fn reserve_list_child(
+    list_vector: &ListVector<'_>,
+    required_capacity: usize,
+    context: &dyn Fn() -> String,
+) -> Result<(), SpannerError> {
+    checked_child_count(0, required_capacity, context)?;
+    let required_capacity =
+        checked_duckdb_index(required_capacity, "required list child capacity", context)?;
+
+    let state =
+        unsafe { ffi::duckdb_list_vector_reserve(list_vector_raw(list_vector), required_capacity) };
+    if state != ffi::DuckDBSuccess {
+        return Err(SpannerError::Conversion(format!(
+            "DuckDB failed to reserve {required_capacity} list child values ({})",
+            context()
+        )));
+    }
+    Ok(())
+}
+
+fn set_list_len_after_reserve(
+    list_vector: &ListVector<'_>,
+    new_len: usize,
+    context: &dyn Fn() -> String,
+) -> Result<(), SpannerError> {
+    reserve_list_child(list_vector, new_len, context)?;
+    let new_len = checked_duckdb_index(new_len, "list child length", context)?;
+    let state = unsafe { ffi::duckdb_list_vector_set_size(list_vector_raw(list_vector), new_len) };
+    if state != ffi::DuckDBSuccess {
+        return Err(SpannerError::Conversion(format!(
+            "DuckDB failed to set list child length to {new_len} ({})",
+            context()
+        )));
+    }
+    Ok(())
 }
 
 /// Human-readable name for an official Spanner `Value` kind, for error messages.
@@ -96,6 +248,7 @@ pub fn write_rows_to_chunk(
         output.set_len(0);
         return Ok(());
     }
+    ensure_row_count(rows.len(), &|| "result batch".to_string())?;
 
     for (col_idx, col) in columns.iter().enumerate() {
         write_column_from_rows(output, col_idx, rows, col_idx, &col.spanner_type, &col.name)?;
@@ -122,6 +275,8 @@ pub fn write_column_from_rows(
     spanner_type: &Type,
     column_name: &str,
 ) -> Result<(), SpannerError> {
+    ensure_row_count(rows.len(), &|| format!("column '{column_name}'"))?;
+
     let type_code = spanner_type.code();
 
     match type_code {
@@ -200,7 +355,9 @@ fn write_array_column(
         if val.kind() == Kind::Null {
             raw_values.push(None);
         } else if let Some(list) = val.try_as_list() {
-            total_children += list.len();
+            total_children = checked_child_count(total_children, list.len(), &|| {
+                format!("column '{column_name}', row {i}")
+            })?;
             raw_values.push(Some(list.iter().cloned().collect()));
         } else {
             return Err(type_mismatch_error(
@@ -211,67 +368,73 @@ fn write_array_column(
         }
     }
 
-    // Set list entries and write child values
+    // Set list entries before obtaining the child. Parent entries use the
+    // regular DuckDB row-vector capacity; flattened children are reserved
+    // separately below.
     let mut offset = 0usize;
+    let row_capacity = rows_capacity_hint();
+    for (i, opt_values) in raw_values.iter().enumerate() {
+        let length = opt_values.as_ref().map_or(0, Vec::len);
+        set_list_entry_checked(&mut list_vector, row_capacity, i, offset, length, &|| {
+            format!("column '{column_name}', row {i}")
+        })?;
+        if opt_values.is_none() {
+            list_vector.set_null(i);
+        }
+        offset = checked_child_count(offset, length, &|| {
+            format!("column '{column_name}', row {i}")
+        })?;
+    }
+
+    debug_assert_eq!(offset, total_children);
     let elem_type_code = element_type.code();
 
-    // For nested types, handle differently
     match elem_type_code {
         TypeCode::Struct => {
-            for (i, opt_values) in raw_values.iter().enumerate() {
-                match opt_values {
-                    None => {
-                        list_vector.set_entry(i, offset, 0);
-                        list_vector.set_null(i);
-                    }
-                    Some(values) => {
-                        list_vector.set_entry(i, offset, values.len());
-                        offset += values.len();
-                    }
-                }
-            }
-            list_vector.set_len(total_children);
-            // Write struct children
             let struct_type = element_type.struct_type().ok_or_else(|| {
                 SpannerError::Conversion("STRUCT without struct_type".to_string())
             })?;
+            set_list_len_after_reserve(&list_vector, total_children, &|| {
+                format!("column '{column_name}' ARRAY<STRUCT> child")
+            })?;
             let mut child_struct = list_vector.struct_child(total_children);
+            reset_struct_list_sizes(&child_struct, struct_type)?;
             let mut flat_idx = 0usize;
             for (row_idx, values) in raw_values.iter().enumerate() {
                 let Some(values) = values else { continue };
                 for (elem_idx, val) in values.iter().enumerate() {
-                    write_raw_struct_value(&mut child_struct, flat_idx, val, struct_type, &|| {
-                        format!("column '{column_name}', row {row_idx}, array element {elem_idx}")
-                    })?;
+                    write_raw_struct_value(
+                        &mut child_struct,
+                        total_children,
+                        flat_idx,
+                        val,
+                        struct_type,
+                        &|| {
+                            format!(
+                                "column '{column_name}', row {row_idx}, array element {elem_idx}"
+                            )
+                        },
+                    )?;
                     flat_idx += 1;
                 }
             }
         }
         TypeCode::Array => {
-            // Nested arrays - write each element as a list within the child
-            for (i, opt_values) in raw_values.iter().enumerate() {
-                match opt_values {
-                    None => {
-                        list_vector.set_entry(i, offset, 0);
-                        list_vector.set_null(i);
-                    }
-                    Some(values) => {
-                        list_vector.set_entry(i, offset, values.len());
-                        offset += values.len();
-                    }
-                }
-            }
-            list_vector.set_len(total_children);
             let inner_elem_type = element_type.array_element_type().ok_or_else(|| {
                 SpannerError::Conversion("Nested ARRAY without element type".to_string())
             })?;
+            set_list_len_after_reserve(&list_vector, total_children, &|| {
+                format!("column '{column_name}' nested ARRAY child")
+            })?;
             let mut child_list = list_vector.list_child();
+            child_list.set_len(0);
             let mut flat_idx = 0usize;
             for (row_idx, values) in raw_values.iter().enumerate() {
                 let Some(values) = values else { continue };
                 for (elem_idx, val) in values.iter().enumerate() {
                     write_raw_list_value(
                         &mut child_list,
+                        total_children,
                         flat_idx,
                         val,
                         &inner_elem_type,
@@ -286,20 +449,9 @@ fn write_array_column(
             }
         }
         _ => {
-            // Scalar element type - use FlatVector child
-            for (i, opt_values) in raw_values.iter().enumerate() {
-                match opt_values {
-                    None => {
-                        list_vector.set_entry(i, offset, 0);
-                        list_vector.set_null(i);
-                    }
-                    Some(values) => {
-                        list_vector.set_entry(i, offset, values.len());
-                        offset += values.len();
-                    }
-                }
-            }
-            list_vector.set_len(total_children);
+            set_list_len_after_reserve(&list_vector, total_children, &|| {
+                format!("column '{column_name}' ARRAY child")
+            })?;
             let mut child = list_vector.child(total_children);
             let mut flat_idx = 0usize;
             for (row_idx, values) in raw_values.iter().enumerate() {
@@ -330,15 +482,56 @@ fn write_struct_column(
         .ok_or_else(|| SpannerError::Conversion("STRUCT without struct_type".to_string()))?;
 
     let mut struct_vector = output.struct_vector(output_col_idx);
+    let row_capacity = rows_capacity_hint();
+    reset_struct_list_sizes(&struct_vector, struct_type)?;
 
     for (i, row) in rows.iter().enumerate() {
         let val = row_value(row, spanner_col_idx, column_name, i)?;
         if val.kind() == Kind::Null {
-            struct_vector.set_null(i);
-        } else {
-            write_raw_struct_value(&mut struct_vector, i, val, struct_type, &|| {
+            ensure_vector_index(i, row_capacity, &|| {
                 format!("column '{column_name}', row {i}")
             })?;
+            struct_vector.set_null(i);
+        } else {
+            write_raw_struct_value(
+                &mut struct_vector,
+                row_capacity,
+                i,
+                val,
+                struct_type,
+                &|| format!("column '{column_name}', row {i}"),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Reset flattened list lengths retained by a reused DuckDB chunk.
+///
+/// Reserving a struct vector recursively resizes list-entry storage, but list
+/// child lengths are independent append cursors and survive cardinality changes.
+fn reset_struct_list_sizes(
+    struct_vector: &StructVector<'_>,
+    struct_type: &model::StructType,
+) -> Result<(), SpannerError> {
+    for (field_idx, field) in struct_type.fields.iter().enumerate() {
+        let field_type = field
+            .r#type
+            .as_ref()
+            .ok_or_else(|| SpannerError::Conversion("STRUCT field without type".to_string()))?;
+        let field_type = Type::from((**field_type).clone());
+        match field_type.code() {
+            TypeCode::Struct => {
+                let nested_type = field_type.struct_type().ok_or_else(|| {
+                    SpannerError::Conversion("Nested STRUCT without struct_type".to_string())
+                })?;
+                let child = struct_vector.struct_vector_child(field_idx);
+                reset_struct_list_sizes(&child, nested_type)?;
+            }
+            TypeCode::Array => {
+                struct_vector.list_vector_child(field_idx).set_len(0);
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -351,11 +544,14 @@ fn write_struct_column(
 /// of per-row string allocation.
 fn write_raw_struct_value(
     struct_vector: &mut StructVector<'_>,
+    row_capacity: usize,
     row_idx: usize,
     value: &SpannerValue,
     struct_type: &model::StructType,
     context: &dyn Fn() -> String,
 ) -> Result<(), SpannerError> {
+    ensure_vector_index(row_idx, row_capacity, context)?;
+
     if value.kind() == Kind::Null {
         struct_vector.set_null(row_idx);
         return Ok(());
@@ -385,6 +581,7 @@ fn write_raw_struct_value(
                     })?;
                     write_raw_struct_value(
                         &mut child,
+                        row_capacity,
                         row_idx,
                         val,
                         inner_struct_type,
@@ -400,13 +597,20 @@ fn write_raw_struct_value(
                     let elem_type = field_type.array_element_type().ok_or_else(|| {
                         SpannerError::Conversion("ARRAY without element type".to_string())
                     })?;
-                    write_raw_list_value(&mut child, row_idx, val, &elem_type, &field_context)?;
+                    write_raw_list_value(
+                        &mut child,
+                        row_capacity,
+                        row_idx,
+                        val,
+                        &elem_type,
+                        &field_context,
+                    )?;
                 } else {
                     child.set_null(row_idx);
                 }
             }
             _ => {
-                let mut child = struct_vector.child(field_idx, rows_capacity_hint());
+                let mut child = struct_vector.child(field_idx, row_capacity);
                 if let Some(val) = field_value {
                     write_raw_scalar_to_flat(
                         &mut child,
@@ -430,14 +634,18 @@ fn write_raw_struct_value(
 /// messages; it is only invoked on a type mismatch.
 fn write_raw_list_value(
     list_vector: &mut ListVector<'_>,
+    row_capacity: usize,
     row_idx: usize,
     value: &SpannerValue,
     element_type: &Type,
     context: &dyn Fn() -> String,
 ) -> Result<(), SpannerError> {
+    ensure_vector_index(row_idx, row_capacity, context)?;
+
     if value.kind() == Kind::Null {
+        let current_len = list_vector.len();
+        set_list_entry_checked(list_vector, row_capacity, row_idx, current_len, 0, context)?;
         list_vector.set_null(row_idx);
-        list_vector.set_entry(row_idx, 0, 0);
         return Ok(());
     }
 
@@ -445,23 +653,32 @@ fn write_raw_list_value(
         .try_as_list()
         .ok_or_else(|| type_mismatch_error("ARRAY (List)", value.kind(), &context()))?;
 
-    let elem_type_code = element_type.code();
-
     let current_len = list_vector.len();
-    list_vector.set_entry(row_idx, current_len, values.len());
+    let new_len = checked_child_count(current_len, values.len(), context)?;
+    set_list_entry_checked(
+        list_vector,
+        row_capacity,
+        row_idx,
+        current_len,
+        values.len(),
+        context,
+    )?;
 
-    match elem_type_code {
+    match element_type.code() {
         TypeCode::Struct => {
             let struct_type = element_type.struct_type().ok_or_else(|| {
                 SpannerError::Conversion("STRUCT without struct_type".to_string())
             })?;
-            let new_len = current_len + values.len();
-            list_vector.set_len(new_len);
+            set_list_len_after_reserve(list_vector, new_len, context)?;
             let mut child_struct = list_vector.struct_child(new_len);
+            if current_len == 0 {
+                reset_struct_list_sizes(&child_struct, struct_type)?;
+            }
             for (j, val) in values.iter().enumerate() {
                 let elem_context = || format!("{}, array element {j}", context());
                 write_raw_struct_value(
                     &mut child_struct,
+                    new_len,
                     current_len + j,
                     val,
                     struct_type,
@@ -469,9 +686,29 @@ fn write_raw_list_value(
                 )?;
             }
         }
+        TypeCode::Array => {
+            let inner_element_type = element_type.array_element_type().ok_or_else(|| {
+                SpannerError::Conversion("Nested ARRAY without element type".to_string())
+            })?;
+            set_list_len_after_reserve(list_vector, new_len, context)?;
+            let mut child_list = list_vector.list_child();
+            if current_len == 0 {
+                child_list.set_len(0);
+            }
+            for (j, val) in values.iter().enumerate() {
+                let elem_context = || format!("{}, array element {j}", context());
+                write_raw_list_value(
+                    &mut child_list,
+                    new_len,
+                    current_len + j,
+                    val,
+                    &inner_element_type,
+                    &elem_context,
+                )?;
+            }
+        }
         _ => {
-            let new_len = current_len + values.len();
-            list_vector.set_len(new_len);
+            set_list_len_after_reserve(list_vector, new_len, context)?;
             let mut child = list_vector.child(new_len);
             for (j, val) in values.iter().enumerate() {
                 let elem_context = || format!("{}, array element {j}", context());
@@ -494,10 +731,9 @@ fn write_raw_list_value(
 ///
 /// # Safety of raw pointer writes
 ///
-/// Uses `unsafe { *vector.as_mut_ptr::<T>().add(idx) = v }` for numeric types because
-/// duckdb-rs does not provide a safe setter for fixed-size types (only `insert()` for
-/// varchar/blob). The caller guarantees `idx < batch_size` where batch_size was set via
-/// `output.set_len()`, so the write is within the vector's allocated capacity.
+/// Uses typed mutable slices for fixed-size types because duckdb-rs does not
+/// provide safe setters for them. The index is validated against the wrapper's
+/// allocation capacity before any validity or data write.
 ///
 /// TODO: Replace with safe API when duckdb-rs provides a safe setter for
 /// fixed-size types. See duckdb/duckdb-rs#414 (vtab safety RFC).
@@ -508,6 +744,8 @@ fn write_raw_scalar_to_flat(
     spanner_type: &Type,
     context: &dyn Fn() -> String,
 ) -> Result<(), SpannerError> {
+    ensure_vector_index(idx, vector.capacity(), context)?;
+
     // Null is legitimate regardless of expected type, never a mismatch.
     if value.kind() == Kind::Null {
         vector.set_null(idx);
@@ -517,7 +755,7 @@ fn write_raw_scalar_to_flat(
     match spanner_type.code() {
         TypeCode::Bool => {
             if let Some(v) = value.try_as_bool() {
-                unsafe { *vector.as_mut_ptr::<bool>().add(idx) = v }
+                unsafe { vector.as_mut_slice::<bool>()[idx] = v }
             } else {
                 return Err(type_mismatch_error("BOOL (Bool)", value.kind(), &context()));
             }
@@ -527,7 +765,7 @@ fn write_raw_scalar_to_flat(
                 let v: i64 = s
                     .parse()
                     .map_err(|e| SpannerError::Conversion(format!("INT64 parse error: {e}")))?;
-                unsafe { *vector.as_mut_ptr::<i64>().add(idx) = v }
+                unsafe { vector.as_mut_slice::<i64>()[idx] = v }
             } else {
                 let expected = if spanner_type.code() == TypeCode::Enum {
                     "ENUM (String)"
@@ -539,13 +777,13 @@ fn write_raw_scalar_to_flat(
         }
         TypeCode::Float32 => {
             if let Some(v) = value.try_as_f64() {
-                unsafe { *vector.as_mut_ptr::<f32>().add(idx) = v as f32 }
+                unsafe { vector.as_mut_slice::<f32>()[idx] = v as f32 }
             } else if let Some(s) = value.try_as_string() {
                 // Handle NaN, Infinity, -Infinity
                 let v: f32 = s
                     .parse()
                     .map_err(|e| SpannerError::Conversion(format!("FLOAT32 parse error: {e}")))?;
-                unsafe { *vector.as_mut_ptr::<f32>().add(idx) = v }
+                unsafe { vector.as_mut_slice::<f32>()[idx] = v }
             } else {
                 return Err(type_mismatch_error(
                     "FLOAT32 (Number or String)",
@@ -556,12 +794,12 @@ fn write_raw_scalar_to_flat(
         }
         TypeCode::Float64 => {
             if let Some(v) = value.try_as_f64() {
-                unsafe { *vector.as_mut_ptr::<f64>().add(idx) = v }
+                unsafe { vector.as_mut_slice::<f64>()[idx] = v }
             } else if let Some(s) = value.try_as_string() {
                 let v: f64 = s
                     .parse()
                     .map_err(|e| SpannerError::Conversion(format!("FLOAT64 parse error: {e}")))?;
-                unsafe { *vector.as_mut_ptr::<f64>().add(idx) = v }
+                unsafe { vector.as_mut_slice::<f64>()[idx] = v }
             } else {
                 return Err(type_mismatch_error(
                     "FLOAT64 (Number or String)",
@@ -577,6 +815,7 @@ fn write_raw_scalar_to_flat(
                     // DECIMAL(38,9) precision and scale. The bind path maps
                     // this annotated type to VARCHAR, preserving the exact
                     // server representation for callers to cast deliberately.
+                    checked_duckdb_index(s.len(), "string length", context)?;
                     unsafe { unsafe_assign_string(vector, idx, s) }
                     return Ok(());
                 }
@@ -591,7 +830,7 @@ fn write_raw_scalar_to_flat(
                 let int_val: i128 = unscaled.to_i128().ok_or_else(|| {
                     SpannerError::Conversion(format!("NUMERIC value out of i128 range: {s}"))
                 })?;
-                unsafe { *vector.as_mut_ptr::<i128>().add(idx) = int_val }
+                unsafe { vector.as_mut_slice::<i128>()[idx] = int_val }
             } else {
                 return Err(type_mismatch_error(
                     "NUMERIC (String)",
@@ -603,6 +842,7 @@ fn write_raw_scalar_to_flat(
         TypeCode::String | TypeCode::Json => {
             if let Some(s) = value.try_as_string() {
                 // SAFETY: Spanner guarantees STRING and JSON values are valid UTF-8.
+                checked_duckdb_index(s.len(), "string length", context)?;
                 unsafe { unsafe_assign_string(vector, idx, s) }
             } else {
                 return Err(type_mismatch_error(
@@ -615,6 +855,7 @@ fn write_raw_scalar_to_flat(
         TypeCode::Bytes | TypeCode::Proto => {
             if let Some(s) = value.try_as_string() {
                 let bytes = base64_decode(s)?;
+                checked_duckdb_index(bytes.len(), "binary length", context)?;
                 vector.insert(idx, bytes.as_slice());
             } else {
                 return Err(type_mismatch_error(
@@ -630,7 +871,7 @@ fn write_raw_scalar_to_flat(
                 let date = time::Date::parse(s, &format)
                     .map_err(|e| SpannerError::Conversion(format!("DATE parse error: {e}")))?;
                 let days = (date - EPOCH_DATE).whole_days() as i32;
-                unsafe { *vector.as_mut_ptr::<i32>().add(idx) = days }
+                unsafe { vector.as_mut_slice::<i32>()[idx] = days }
             } else {
                 return Err(type_mismatch_error(
                     "DATE (String)",
@@ -646,7 +887,7 @@ fn write_raw_scalar_to_flat(
                     SpannerError::Conversion(format!("TIMESTAMP parse error: {e}"))
                 })?;
                 let micros = (ts.unix_timestamp_nanos() / 1_000) as i64;
-                unsafe { *vector.as_mut_ptr::<i64>().add(idx) = micros }
+                unsafe { vector.as_mut_slice::<i64>()[idx] = micros }
             } else {
                 return Err(type_mismatch_error(
                     "TIMESTAMP (String)",
@@ -664,7 +905,7 @@ fn write_raw_scalar_to_flat(
                 // See also: duckdb/duckdb-rs#519 (UUID value correctness),
                 //           duckdb/duckdb-rs#585 (no duckdb_bind_uuid in C API).
                 let val = parsed.as_u128() ^ (1u128 << 127);
-                unsafe { *vector.as_mut_ptr::<u128>().add(idx) = val }
+                unsafe { vector.as_mut_slice::<u128>()[idx] = val }
             } else {
                 return Err(type_mismatch_error(
                     "UUID (String)",
@@ -676,7 +917,7 @@ fn write_raw_scalar_to_flat(
         TypeCode::Interval => {
             if let Some(s) = value.try_as_string() {
                 let interval = parse_iso8601_interval(s)?;
-                unsafe { *vector.as_mut_ptr::<DuckDBInterval>().add(idx) = interval }
+                unsafe { vector.as_mut_slice::<DuckDBInterval>()[idx] = interval }
             } else {
                 return Err(type_mismatch_error(
                     "INTERVAL (String)",
@@ -689,6 +930,7 @@ fn write_raw_scalar_to_flat(
             // Unknown/unspecified Spanner type code: best-effort fallback to string.
             if let Some(s) = value.try_as_string() {
                 // SAFETY: Spanner only returns valid UTF-8 string values.
+                checked_duckdb_index(s.len(), "string length", context)?;
                 unsafe { unsafe_assign_string(vector, idx, s) }
             } else {
                 return Err(type_mismatch_error(
@@ -944,6 +1186,14 @@ mod tests {
             .into()
     }
 
+    fn array_type_proto(element_type: Type) -> Type {
+        let element_type: model::Type = element_type.into();
+        model::Type::new()
+            .set_code(model::TypeCode::Array)
+            .set_array_element_type(element_type)
+            .into()
+    }
+
     fn value_of(kind: ProtoKind) -> SpannerValue {
         prost_types::Value { kind: Some(kind) }.to_value()
     }
@@ -975,11 +1225,17 @@ mod tests {
         column_name: &str,
     ) -> (DataChunkHandle, Result<(), SpannerError>) {
         let chunk = DataChunkHandle::new(&[LogicalTypeHandle::list(&child_logical_type)]);
+        chunk.set_len(1);
         let result = {
             let mut vector = chunk.list_vector(0);
-            write_raw_list_value(&mut vector, 0, &value, &element_type, &|| {
-                format!("column '{column_name}', row 0")
-            })
+            write_raw_list_value(
+                &mut vector,
+                rows_capacity_hint(),
+                0,
+                &value,
+                &element_type,
+                &|| format!("column '{column_name}', row 0"),
+            )
         };
         (chunk, result)
     }
@@ -997,11 +1253,196 @@ mod tests {
             .clone();
         let result = {
             let mut vector = chunk.struct_vector(0);
-            write_raw_struct_value(&mut vector, 0, &value, &struct_type, &|| {
-                format!("column '{column_name}', row 0")
-            })
+            write_raw_struct_value(
+                &mut vector,
+                rows_capacity_hint(),
+                0,
+                &value,
+                &struct_type,
+                &|| format!("column '{column_name}', row 0"),
+            )
         };
         (chunk, result)
+    }
+
+    #[test]
+    fn array_of_struct_reserves_oversized_children_and_preserves_nulls_and_order() {
+        let count = rows_capacity_hint() + 257;
+        let struct_type = struct_type_proto(vec![
+            ("ordinal", scalar_type(TypeCode::Int64)),
+            ("flag", scalar_type(TypeCode::Bool)),
+        ]);
+        let logical_struct = LogicalTypeHandle::struct_type(&[
+            ("ordinal", LogicalTypeId::Bigint.into()),
+            ("flag", LogicalTypeId::Boolean.into()),
+        ]);
+
+        let values = (0..count)
+            .map(|i| {
+                if i % 509 == 0 {
+                    prost_types::Value {
+                        kind: Some(ProtoKind::NullValue(0)),
+                    }
+                } else {
+                    let flag = if i % 127 == 0 {
+                        ProtoKind::NullValue(0)
+                    } else {
+                        ProtoKind::BoolValue(i % 2 == 0)
+                    };
+                    prost_types::Value {
+                        kind: Some(ProtoKind::ListValue(prost_types::ListValue {
+                            values: vec![
+                                prost_types::Value {
+                                    kind: Some(ProtoKind::StringValue(i.to_string())),
+                                },
+                                prost_types::Value { kind: Some(flag) },
+                            ],
+                        })),
+                    }
+                }
+            })
+            .collect();
+        let value = value_of(ProtoKind::ListValue(prost_types::ListValue { values }));
+
+        let (chunk, result) = write_list_one(logical_struct, struct_type, value, "items");
+        result.expect("oversized ARRAY<STRUCT> conversion");
+
+        let list = chunk.list_vector(0);
+        assert_eq!(list.get_entry(0), (0, count));
+        assert_eq!(list.len(), count);
+
+        let struct_validity = list.child(count);
+        let struct_child = list.struct_child(count);
+        let ordinals = struct_child.child(0, count);
+        let flags = struct_child.child(1, count);
+        let ordinal_values = unsafe { ordinals.as_slice::<i64>() };
+        let flag_values = unsafe { flags.as_slice::<bool>() };
+
+        for i in 0..count {
+            let struct_is_null = i % 509 == 0;
+            assert_eq!(
+                struct_validity.row_is_null(i as u64),
+                struct_is_null,
+                "struct nullness at element {i}"
+            );
+            if struct_is_null {
+                continue;
+            }
+
+            assert_eq!(ordinal_values[i], i as i64, "ordinal at element {i}");
+            let flag_is_null = i % 127 == 0;
+            assert_eq!(
+                flags.row_is_null(i as u64),
+                flag_is_null,
+                "flag nullness at element {i}"
+            );
+            if !flag_is_null {
+                assert_eq!(flag_values[i], i % 2 == 0, "flag at element {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn nested_array_reserves_oversized_list_entry_children() {
+        let count = rows_capacity_hint() + 17;
+        let values = (0..count)
+            .map(|i| prost_types::Value {
+                kind: Some(ProtoKind::ListValue(prost_types::ListValue {
+                    values: vec![prost_types::Value {
+                        kind: Some(ProtoKind::StringValue(i.to_string())),
+                    }],
+                })),
+            })
+            .collect();
+        let value = value_of(ProtoKind::ListValue(prost_types::ListValue { values }));
+        let logical_inner = LogicalTypeHandle::list(&LogicalTypeId::Bigint.into());
+
+        let (chunk, result) = write_list_one(
+            logical_inner,
+            array_type_proto(scalar_type(TypeCode::Int64)),
+            value,
+            "nested",
+        );
+        result.expect("oversized nested ARRAY conversion");
+
+        let outer = chunk.list_vector(0);
+        assert_eq!(outer.get_entry(0), (0, count));
+        let inner = outer.list_child();
+        assert_eq!(inner.len(), count);
+        let inner_entries = unsafe {
+            std::slice::from_raw_parts(
+                ffi::duckdb_vector_get_data(list_vector_raw(&inner))
+                    .cast::<ffi::duckdb_list_entry>(),
+                count,
+            )
+        };
+        let values = inner.child(count);
+        let values = unsafe { values.as_slice::<i64>() };
+        for i in 0..count {
+            assert_eq!(inner_entries[i].offset, i as u64);
+            assert_eq!(inner_entries[i].length, 1);
+            assert_eq!(values[i], i as i64);
+        }
+    }
+
+    #[test]
+    fn reused_struct_chunk_resets_nested_list_offsets() {
+        let array_type = array_type_proto(scalar_type(TypeCode::Int64));
+        let spanner_type = struct_type_proto(vec![("values", array_type)]);
+        let struct_type = spanner_type.struct_type().unwrap().clone();
+        let logical_type = LogicalTypeHandle::struct_type(&[(
+            "values",
+            LogicalTypeHandle::list(&LogicalTypeId::Bigint.into()),
+        )]);
+        let chunk = DataChunkHandle::new(&[logical_type]);
+        chunk.set_len(1);
+
+        let batches = [vec!["10", "11", "12"], vec!["20"]];
+        for batch in batches {
+            let value = value_of(ProtoKind::ListValue(prost_types::ListValue {
+                values: vec![prost_types::Value {
+                    kind: Some(ProtoKind::ListValue(prost_types::ListValue {
+                        values: batch
+                            .iter()
+                            .map(|value| prost_types::Value {
+                                kind: Some(ProtoKind::StringValue((*value).to_string())),
+                            })
+                            .collect(),
+                    })),
+                }],
+            }));
+
+            let mut vector = chunk.struct_vector(0);
+            reset_struct_list_sizes(&vector, &struct_type).unwrap();
+            write_raw_struct_value(
+                &mut vector,
+                rows_capacity_hint(),
+                0,
+                &value,
+                &struct_type,
+                &|| "column 'payload', row 0".to_string(),
+            )
+            .unwrap();
+        }
+
+        let vector = chunk.struct_vector(0);
+        let nested = vector.list_vector_child(0);
+        assert_eq!(nested.get_entry(0), (0, 1));
+        assert_eq!(nested.len(), 1);
+        assert_eq!(unsafe { nested.child(1).as_slice::<i64>() }[0], 20);
+    }
+
+    #[test]
+    fn unrepresentable_nested_child_count_returns_conversion_error() {
+        let too_many = usize::try_from(DUCKDB_MAX_RESULT_CHILDREN + 1).unwrap();
+        let result = checked_child_count(0, too_many, &|| "test value".to_string());
+        match result {
+            Err(SpannerError::Conversion(message)) => {
+                assert!(message.contains("safe result-vector capacity"));
+                assert!(message.contains("test value"));
+            }
+            other => panic!("expected Conversion error, got {other:?}"),
+        }
     }
 
     #[test]
