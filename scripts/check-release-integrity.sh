@@ -21,6 +21,7 @@ while (($# > 0)); do
   esac
 done
 
+# Keep compatibility with macOS /bin/bash 3.2; mapfile/readarray require Bash 4.
 workflow_files=()
 while IFS= read -r workflow; do
   workflow_files+=("$workflow")
