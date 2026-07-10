@@ -22,7 +22,7 @@ pub struct ScanBindData {
     table: String,
     endpoint: Option<String>,
     dialect: DatabaseDialect,
-    use_parallelism: bool,
+    parallelism_mode: crate::bind_utils::ParallelismMode,
     use_data_boost: bool,
     max_parallelism: Option<i64>,
     index: String,
@@ -49,7 +49,12 @@ impl VTab for SpannerScanVTab {
         let database = crate::bind_utils::resolve_database_path(bind)?;
 
         let endpoint = crate::bind_utils::resolve_endpoint(bind);
-        let use_parallelism = crate::bind_utils::get_named_bool(bind, "use_parallelism", false);
+        let legacy_use_parallelism =
+            crate::bind_utils::get_named_bool(bind, "use_parallelism", false);
+        let parallelism_mode = crate::bind_utils::resolve_parallelism_mode(
+            crate::bind_utils::get_named_string(bind, "parallelism_mode").as_deref(),
+            legacy_use_parallelism,
+        )?;
         let use_data_boost = crate::bind_utils::get_named_bool(bind, "use_data_boost", false);
         let max_parallelism = crate::bind_utils::get_named_int64(bind, "max_parallelism");
         let index = crate::bind_utils::get_named_string(bind, "index").unwrap_or_default();
@@ -93,7 +98,7 @@ impl VTab for SpannerScanVTab {
             table,
             endpoint,
             dialect,
-            use_parallelism,
+            parallelism_mode,
             use_data_boost,
             max_parallelism,
             index,
@@ -127,7 +132,7 @@ impl VTab for SpannerScanVTab {
         let endpoint = bind_data.endpoint.clone();
         let table = bind_data.table.clone();
         let index = bind_data.index.clone();
-        let use_parallelism = bind_data.use_parallelism;
+        let parallelism_mode = bind_data.parallelism_mode;
         let use_data_boost = bind_data.use_data_boost;
         let max_parallelism = bind_data.max_parallelism;
         let timestamp_bound = bind_data.timestamp_bound.clone();
@@ -142,7 +147,7 @@ impl VTab for SpannerScanVTab {
                 let col_refs: Vec<&str> =
                     column_names.iter().map(|s| s.as_str()).collect();
 
-                if use_parallelism {
+                if parallelism_mode.uses_partitioned_api() {
                     let partition_options =
                         max_parallelism.map(|max| PartitionOptions::default().set_max_partitions(max));
 
@@ -161,7 +166,7 @@ impl VTab for SpannerScanVTab {
                     .await
                     {
                         Ok(()) => return Ok(()),
-                        Err(e) if !rows_delivered.load(Ordering::SeqCst) => {
+                        Err(e) if parallelism_mode.allows_fallback(rows_delivered.load(Ordering::SeqCst)) => {
                             eprintln!("[duckdb-spanner] Partitioned read failed: {e}, falling back to single read");
                         }
                         Err(e) => return Err(e),
@@ -278,6 +283,10 @@ impl VTab for SpannerScanVTab {
             (
                 "use_parallelism".to_string(),
                 LogicalTypeHandle::from(LogicalTypeId::Boolean),
+            ),
+            (
+                "parallelism_mode".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
             ),
             (
                 "use_data_boost".to_string(),

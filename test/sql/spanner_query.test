@@ -30,6 +30,11 @@ SELECT IF(count = 3, 1, error('expected 3 rows')) FROM (SELECT COUNT(*)::INT AS 
 statement ok
 SELECT IF(count = 0, 1, error('expected empty table')) FROM (SELECT COUNT(*)::INT AS count FROM spanner_query('SELECT * FROM EmptyTable'));
 
+# --- Parallelism mode ---
+
+statement ok
+SELECT IF(count = 3, 1, error('expected 3 non-partitioned query rows')) FROM (SELECT COUNT(*)::INT AS count FROM spanner_query('SELECT Id FROM ScalarTypes', parallelism_mode := 'off'));
+
 # --- STRING type ---
 
 statement ok
