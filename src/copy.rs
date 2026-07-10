@@ -227,7 +227,7 @@ unsafe fn copy_bind_inner(info: ffi::duckdb_copy_function_bind_info) -> Result<(
     };
 
     // Resolve database path: options → component parts → config
-    let database_path = resolve_copy_database_path(&opts, &cfg)?;
+    let database_path = resolve_copy_database_path(&opts, cfg)?;
 
     let endpoint = option_value(&opts, "endpoint")
         .map(ToOwned::to_owned)
@@ -382,8 +382,8 @@ unsafe fn copy_sink_inner(
 
     for row_idx in 0..row_count {
         let mut values = Vec::with_capacity(col_count);
-        for col_idx in 0..col_count {
-            let val = read_duckdb_value(vectors[col_idx], row_idx, &state.columns[col_idx])?;
+        for (vector, column) in vectors.iter().zip(&state.columns) {
+            let val = read_duckdb_value(*vector, row_idx, column)?;
             values.push(val);
         }
         state.buffer.push(build_mutation(
@@ -1260,14 +1260,14 @@ unsafe fn read_decimal_raw(data: *mut c_void, row_idx: usize, internal_type: u32
 unsafe fn read_duckdb_string(str_ptr: *mut ffi::duckdb_string_t) -> String {
     let len = ffi::duckdb_string_t_length(*str_ptr) as usize;
     let data = ffi::duckdb_string_t_data(str_ptr);
-    let bytes = std::slice::from_raw_parts(data as *const u8, len);
+    let bytes = std::slice::from_raw_parts(data.cast::<u8>(), len);
     String::from_utf8_lossy(bytes).into_owned()
 }
 
 unsafe fn read_duckdb_bytes(str_ptr: *mut ffi::duckdb_string_t) -> Vec<u8> {
     let len = ffi::duckdb_string_t_length(*str_ptr) as usize;
     let data = ffi::duckdb_string_t_data(str_ptr);
-    std::slice::from_raw_parts(data as *const u8, len).to_vec()
+    std::slice::from_raw_parts(data.cast::<u8>(), len).to_vec()
 }
 
 // ─── Scalar conversion helpers ──────────────────────────────────────────────
