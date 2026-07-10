@@ -18,7 +18,7 @@ pub struct QueryBindData {
     database: String,
     sql: String,
     endpoint: Option<String>,
-    use_parallelism: bool,
+    parallelism_mode: crate::bind_utils::ParallelismMode,
     use_data_boost: bool,
     max_parallelism: Option<i64>,
     timestamp_bound: Option<crate::bind_utils::TimestampBoundConfig>,
@@ -44,7 +44,12 @@ impl VTab for SpannerQueryVTab {
         let database = crate::bind_utils::resolve_database_path(bind)?;
 
         let endpoint = crate::bind_utils::resolve_endpoint(bind);
-        let use_parallelism = crate::bind_utils::get_named_bool(bind, "use_parallelism", false);
+        let legacy_use_parallelism =
+            crate::bind_utils::get_named_bool(bind, "use_parallelism", false);
+        let parallelism_mode = crate::bind_utils::resolve_parallelism_mode(
+            crate::bind_utils::get_named_string(bind, "parallelism_mode").as_deref(),
+            legacy_use_parallelism,
+        )?;
         let use_data_boost = crate::bind_utils::get_named_bool(bind, "use_data_boost", false);
         let max_parallelism = crate::bind_utils::get_named_int64(bind, "max_parallelism");
         let timestamp_bound = crate::bind_utils::resolve_timestamp_bound(
@@ -74,7 +79,7 @@ impl VTab for SpannerQueryVTab {
             database,
             sql,
             endpoint,
-            use_parallelism,
+            parallelism_mode,
             use_data_boost,
             max_parallelism,
             timestamp_bound,
@@ -95,7 +100,7 @@ impl VTab for SpannerQueryVTab {
         let endpoint = bind_data.endpoint.clone();
         let sql = bind_data.sql.clone();
         let params_json = bind_data.params_json.clone();
-        let use_parallelism = bind_data.use_parallelism;
+        let parallelism_mode = bind_data.parallelism_mode;
         let use_data_boost = bind_data.use_data_boost;
         let max_parallelism = bind_data.max_parallelism;
         let timestamp_bound = bind_data.timestamp_bound.clone();
@@ -107,7 +112,7 @@ impl VTab for SpannerQueryVTab {
                 let client =
                     client::get_or_create_client(&database, endpoint.as_deref()).await?;
 
-                if use_parallelism {
+                if parallelism_mode.uses_partitioned_api() {
                     let partition_options =
                         max_parallelism.map(|max| PartitionOptions::new().set_max_partitions(max));
 
@@ -126,7 +131,7 @@ impl VTab for SpannerQueryVTab {
                     .await
                     {
                         Ok(()) => return Ok(()),
-                        Err(e) if !rows_delivered.load(Ordering::SeqCst) => {
+                        Err(e) if parallelism_mode.allows_fallback(rows_delivered.load(Ordering::SeqCst)) => {
                             eprintln!("[duckdb-spanner] Partitioned query failed: {e}, falling back to single query");
                         }
                         Err(e) => return Err(e),
@@ -229,6 +234,10 @@ impl VTab for SpannerQueryVTab {
             (
                 "use_parallelism".to_string(),
                 LogicalTypeHandle::from(LogicalTypeId::Boolean),
+            ),
+            (
+                "parallelism_mode".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
             ),
             (
                 "use_data_boost".to_string(),

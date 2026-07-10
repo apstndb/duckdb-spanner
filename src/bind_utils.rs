@@ -61,6 +61,50 @@ pub fn get_named_bool(bind: &BindInfo, name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+/// Selects whether a query or read uses Spanner's partition APIs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParallelismMode {
+    /// Use partition APIs and fall back to a single read only before any row is delivered.
+    Auto,
+    /// Use partition APIs and propagate every error without falling back.
+    Required,
+    /// Use only a single read; do not call partition APIs.
+    Off,
+}
+
+impl ParallelismMode {
+    pub const fn uses_partitioned_api(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub const fn allows_fallback(self, rows_delivered: bool) -> bool {
+        matches!(self, Self::Auto) && !rows_delivered
+    }
+}
+
+/// Resolve the parallelism mode, preserving `use_parallelism` compatibility.
+///
+/// An explicit `parallelism_mode` takes precedence over `use_parallelism`. Without it,
+/// the legacy boolean maps `true` to `auto` and `false` (or NULL) to `off`.
+pub fn resolve_parallelism_mode(
+    parallelism_mode: Option<&str>,
+    use_parallelism: bool,
+) -> Result<ParallelismMode, Box<dyn std::error::Error>> {
+    match parallelism_mode {
+        Some(mode) => match mode.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(ParallelismMode::Auto),
+            "required" => Ok(ParallelismMode::Required),
+            "off" => Ok(ParallelismMode::Off),
+            _ => Err(format!(
+                "Invalid parallelism_mode '{mode}': must be 'auto', 'required', or 'off'"
+            )
+            .into()),
+        },
+        None if use_parallelism => Ok(ParallelismMode::Auto),
+        None => Ok(ParallelismMode::Off),
+    }
+}
+
 /// Parse a priority string ("low", "medium", "high") into a Spanner Priority enum.
 pub fn parse_priority(s: &str) -> Result<Priority, Box<dyn std::error::Error>> {
     match s.to_ascii_lowercase().as_str() {
@@ -220,4 +264,66 @@ pub fn resolve_endpoint(bind: &BindInfo) -> Option<String> {
 pub fn resolve_admin_endpoint(bind: &BindInfo) -> Option<String> {
     get_named_string(bind, "admin_endpoint")
         .or_else(|| config::get_config_string(bind, "spanner_admin_endpoint"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_parallelism_mode, ParallelismMode};
+
+    #[test]
+    fn parallelism_mode_accepts_documented_values_case_insensitively() {
+        assert_eq!(
+            resolve_parallelism_mode(Some("auto"), false).unwrap(),
+            ParallelismMode::Auto
+        );
+        assert_eq!(
+            resolve_parallelism_mode(Some("REQUIRED"), false).unwrap(),
+            ParallelismMode::Required
+        );
+        assert_eq!(
+            resolve_parallelism_mode(Some(" off "), true).unwrap(),
+            ParallelismMode::Off
+        );
+    }
+
+    #[test]
+    fn parallelism_mode_rejects_unknown_values() {
+        let err = resolve_parallelism_mode(Some("sometimes"), false).unwrap_err();
+        assert!(err.to_string().contains("parallelism_mode"));
+    }
+
+    #[test]
+    fn explicit_parallelism_mode_overrides_legacy_boolean() {
+        assert_eq!(
+            resolve_parallelism_mode(Some("off"), true).unwrap(),
+            ParallelismMode::Off
+        );
+        assert_eq!(
+            resolve_parallelism_mode(Some("required"), false).unwrap(),
+            ParallelismMode::Required
+        );
+    }
+
+    #[test]
+    fn legacy_boolean_preserves_existing_behavior() {
+        assert_eq!(
+            resolve_parallelism_mode(None, true).unwrap(),
+            ParallelismMode::Auto
+        );
+        assert_eq!(
+            resolve_parallelism_mode(None, false).unwrap(),
+            ParallelismMode::Off
+        );
+    }
+
+    #[test]
+    fn fallback_is_limited_to_auto_before_rows_are_delivered() {
+        assert!(ParallelismMode::Auto.uses_partitioned_api());
+        assert!(ParallelismMode::Required.uses_partitioned_api());
+        assert!(!ParallelismMode::Off.uses_partitioned_api());
+        assert!(ParallelismMode::Auto.allows_fallback(false));
+        assert!(!ParallelismMode::Auto.allows_fallback(true));
+        assert!(!ParallelismMode::Required.allows_fallback(false));
+        assert!(!ParallelismMode::Off.allows_fallback(false));
+    }
 }

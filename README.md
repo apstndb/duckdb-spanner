@@ -51,8 +51,7 @@ brew install cargo-sweep
 
 - Results are streamed via an internal channel. Memory usage is bounded regardless of result set size.
 
-- `use_parallelism` enables the [partitioned API](https://cloud.google.com/spanner/docs/reads#read_data_in_parallel) (required for Data Boost). Partitions are executed concurrently, each with its own session from the pool.
-  If partitioned execution fails **before any row is delivered**, the extension logs a warning and falls back to a single non-partitioned query/read (without Data Boost). If rows were already streamed, the error is propagated instead of falling back (to avoid duplicate rows).
+- `parallelism_mode` controls the [partitioned API](https://cloud.google.com/spanner/docs/reads#read_data_in_parallel) (required for Data Boost). `auto` falls back to a single non-partitioned query/read only when partitioned execution fails **before any row is delivered**; `required` propagates every partition error; `off` skips partition APIs entirely. Partitions are executed concurrently, each with its own session from the pool.
 
 - `COPY TO ... FORMAT spanner` commits each `batch_size` chunk independently; a mid-COPY failure leaves earlier batches committed. Use idempotent write modes (e.g. `insert_or_update`) when retrying.
 
@@ -300,7 +299,8 @@ Both functions accept the following named parameters:
 | `instance` | VARCHAR | (config) | Spanner instance ID |
 | `database` | VARCHAR | (config) | Spanner database ID |
 | `endpoint` | VARCHAR | (config) | Custom gRPC endpoint (e.g., `localhost:9010` for the emulator) |
-| `use_parallelism` | BOOLEAN | `false` | Use partitioned query/read for parallel execution |
+| `parallelism_mode` | VARCHAR | `off` | `'auto'` (pre-row fallback), `'required'` (no fallback), or `'off'` (single API only) |
+| `use_parallelism` | BOOLEAN | `false` | Legacy compatibility option: `true` maps to `'auto'`, `false` maps to `'off'` |
 | `use_data_boost` | BOOLEAN | `false` | Enable [Data Boost](https://cloud.google.com/spanner/docs/databoost/databoost-overview) |
 | `max_parallelism` | INTEGER | (default) | Maximum number of partitions |
 | `exact_staleness_secs` | BIGINT | | Read at an exact staleness (seconds ago) |
@@ -310,6 +310,8 @@ Both functions accept the following named parameters:
 | `priority` | VARCHAR | | Request priority: `'low'`, `'medium'`, or `'high'` |
 
 At most one timestamp bound parameter can be specified. If none is set, Spanner uses a [strong read](https://cloud.google.com/spanner/docs/timestamp-bounds#strong) (the default).
+
+When both `parallelism_mode` and `use_parallelism` are supplied, `parallelism_mode` takes precedence. `use_data_boost` and `max_parallelism` apply only to partitioned modes; `parallelism_mode := 'off'` uses the single query/read API.
 
 `spanner_query` additionally accepts:
 
@@ -651,7 +653,7 @@ If you need a reusable macro that overrides specific config values:
 
 ```sql
 CREATE MACRO my_query(
-    sql, params := NULL, use_parallelism := NULL,
+    sql, params := NULL, use_parallelism := NULL, parallelism_mode := NULL,
     use_data_boost := NULL, max_parallelism := NULL,
     exact_staleness_secs := NULL, max_staleness_secs := NULL,
     read_timestamp := NULL, min_read_timestamp := NULL,
@@ -663,6 +665,7 @@ SELECT * FROM spanner_query(
     endpoint := 'localhost:9010',
     params := params,
     use_parallelism := use_parallelism,
+    parallelism_mode := parallelism_mode,
     use_data_boost := use_data_boost,
     max_parallelism := max_parallelism,
     exact_staleness_secs := exact_staleness_secs,

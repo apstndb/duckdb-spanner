@@ -11,7 +11,7 @@
 CREATE MACRO spanner_query(
     sql,
     database_path := NULL, project := NULL, instance := NULL, database := NULL,
-    params := NULL, endpoint := NULL, use_parallelism := NULL,
+    params := NULL, endpoint := NULL, use_parallelism := NULL, parallelism_mode := NULL,
     use_data_boost := NULL, max_parallelism := NULL,
     exact_staleness_secs := NULL, max_staleness_secs := NULL,
     read_timestamp := NULL, min_read_timestamp := NULL,
@@ -26,6 +26,7 @@ SELECT * FROM spanner_query_raw(
     endpoint := endpoint,
     params := spanner_params(params),
     use_parallelism := use_parallelism,
+    parallelism_mode := parallelism_mode,
     use_data_boost := use_data_boost,
     max_parallelism := max_parallelism,
     exact_staleness_secs := exact_staleness_secs,

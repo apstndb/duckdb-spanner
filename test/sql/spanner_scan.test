@@ -30,6 +30,11 @@ SELECT IF(count = 3, 1, error('expected 3 scan rows')) FROM (SELECT COUNT(*)::IN
 statement ok
 SELECT IF(count = 0, 1, error('expected empty scan')) FROM (SELECT COUNT(*)::INT AS count FROM spanner_scan('EmptyTable'));
 
+# --- Parallelism mode ---
+
+statement ok
+SELECT IF(count = 3, 1, error('expected 3 non-partitioned scan rows')) FROM (SELECT COUNT(*)::INT AS count FROM spanner_scan('ScalarTypes', parallelism_mode := 'off'));
+
 # --- Projection pushdown ---
 
 statement ok
