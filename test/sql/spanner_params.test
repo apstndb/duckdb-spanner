@@ -30,3 +30,20 @@ SELECT IF(count = 1, 1, error('expected one filtered row')) FROM (SELECT COUNT(*
 
 statement ok
 SELECT IF(len(Intervals) = 2, 1, error('expected ARRAY<INTERVAL> param round-trip')) FROM spanner_query('SELECT @v AS Intervals', params := {'v': spanner_typed(['P1D', 'P1Y3M'], 'ARRAY<INTERVAL>')});
+
+# Spanner accepts component-wise negative ISO 8601 durations. Verify these
+# values travel through interval_to_iso8601, spanner_typed, and spanner_query.
+statement ok
+SELECT IF(interval_to_iso8601(NegativeMonth) = 'P-1Y11M', 1, error('expected negative month interval round-trip')) FROM spanner_query('SELECT @v AS NegativeMonth', params := {'v': spanner_typed(INTERVAL '-1 month', 'INTERVAL')});
+
+statement ok
+SELECT IF(interval_to_iso8601(NegativeDay) = 'P-1D', 1, error('expected negative day interval round-trip')) FROM spanner_query('SELECT @v AS NegativeDay', params := {'v': spanner_typed(INTERVAL '-1 day', 'INTERVAL')});
+
+statement ok
+SELECT IF(interval_to_iso8601(NegativeMicros) = 'PT-1H59M59.999999S', 1, error('expected negative microsecond interval round-trip')) FROM spanner_query('SELECT @v AS NegativeMicros', params := {'v': spanner_typed(INTERVAL '-1 microsecond', 'INTERVAL')});
+
+statement ok
+SELECT IF(interval_to_iso8601(MixedDate) = 'P1M-1D', 1, error('expected mixed-sign date interval round-trip')) FROM spanner_query('SELECT @v AS MixedDate', params := {'v': spanner_typed(INTERVAL '1 month -1 day', 'INTERVAL')});
+
+statement ok
+SELECT IF(interval_to_iso8601(MixedTime) = 'P1DT-1H', 1, error('expected mixed-sign time interval round-trip')) FROM spanner_query('SELECT @v AS MixedTime', params := {'v': spanner_typed(INTERVAL '1 day -1 hour', 'INTERVAL')});
