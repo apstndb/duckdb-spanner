@@ -1,4 +1,4 @@
-.PHONY: build build-sweep build-release check-google-cloud-rust extension duckdb emulator-start emulator-stop emulator-status test test_debug test_release clean sweep sweep-dry-run ensure-cargo-sweep configure debug release clean_all
+.PHONY: build build-sweep build-release check-google-cloud-rust check-duckdb-version check-target-duckdb-version extension duckdb emulator-start emulator-stop emulator-status test test_debug test_release clean sweep sweep-dry-run ensure-cargo-sweep configure debug release clean_all
 
 # Detect OS for library extension
 UNAME := $(shell uname)
@@ -22,11 +22,31 @@ endif
 RAW_LIB := target/release/libduckdb_spanner.$(LIB_EXT)
 EXTENSION := spanner.duckdb_extension
 METADATA_SCRIPT := extension-ci-tools/scripts/append_extension_metadata.py
+DUCKDB_VERSION_CHECK := scripts/check-duckdb-version.sh
 EMULATOR_NAME := spanner-emulator
-DUCKDB_VERSION ?= $(shell duckdb --version 2>/dev/null | sed -nE 's/^v?([0-9]+\.[0-9]+\.[0-9]+).*/v\1/p')
-ifeq ($(DUCKDB_VERSION),)
-DUCKDB_VERSION := v1.5.4
+DUCKDB_TARGET_VERSION := v1.5.4
+DUCKDB_BIN ?= duckdb
+DUCKDB_CLI_VERSION := $(shell $(DUCKDB_BIN) --version 2>/dev/null | sed -nE 's/^v?([0-9]+\.[0-9]+\.[0-9]+).*/v\1/p')
+
+# The unstable C_STRUCT ABI is compiled for one exact DuckDB version. An
+# explicit metadata override is retained only when it resolves to that target.
+normalize_duckdb_version = v$(patsubst v%,%,$(strip $(1)))
+DUCKDB_VERSION_INPUT := $(DUCKDB_VERSION)
+ifeq ($(strip $(DUCKDB_VERSION_INPUT)),)
+  DUCKDB_VERSION_INPUT := $(DUCKDB_CLI_VERSION)
 endif
+ifeq ($(strip $(DUCKDB_VERSION_INPUT)),)
+  DUCKDB_VERSION_INPUT := $(DUCKDB_TARGET_VERSION)
+endif
+DUCKDB_VERSION_EFFECTIVE := $(call normalize_duckdb_version,$(DUCKDB_VERSION_INPUT))
+override DUCKDB_VERSION := $(DUCKDB_VERSION_EFFECTIVE)
+
+# extension-ci-tools uses this variable for compilation and metadata. Keep
+# the effective value canonical while checking any caller-supplied override.
+TARGET_DUCKDB_VERSION ?= $(DUCKDB_TARGET_VERSION)
+TARGET_DUCKDB_VERSION_INPUT := $(TARGET_DUCKDB_VERSION)
+TARGET_DUCKDB_VERSION_EFFECTIVE := $(call normalize_duckdb_version,$(TARGET_DUCKDB_VERSION_INPUT))
+override TARGET_DUCKDB_VERSION := $(TARGET_DUCKDB_VERSION_EFFECTIVE)
 # Keep the existing v-prefixed extension metadata while deriving the numeric
 # version from the crate package section to avoid manual drift.
 # Derive from Cargo.toml with grep/sed (portable on Windows CI; awk `[` breaks mawk).
@@ -39,11 +59,17 @@ build:
 build-sweep: ensure-cargo-sweep build
 	cargo sweep --time $(SWEEP_DAYS)
 
-build-release:
+build-release: check-duckdb-version
 	cargo build --features loadable-extension --release
 
 check-google-cloud-rust:
 	bash scripts/check-google-cloud-rust.sh
+
+check-duckdb-version:
+	@$(DUCKDB_VERSION_CHECK) "$(DUCKDB_TARGET_VERSION)" "$(DUCKDB_VERSION_EFFECTIVE)" "$(DUCKDB_CLI_VERSION)"
+
+check-target-duckdb-version:
+	@$(DUCKDB_VERSION_CHECK) "$(DUCKDB_TARGET_VERSION)" "$(TARGET_DUCKDB_VERSION_INPUT)"
 
 extension: build-release
 ifeq ($(strip $(EXT_VERSION)),)
@@ -63,7 +89,7 @@ endif
 
 duckdb: extension
 	@echo "Starting DuckDB with spanner extension loaded..."
-	@duckdb -unsigned -cmd "LOAD '$$(pwd)/$(EXTENSION)'"
+	@$(DUCKDB_BIN) -unsigned -cmd "LOAD '$$(pwd)/$(EXTENSION)'"
 
 emulator-start:
 	@if docker ps --format '{{.Names}}' | grep -q '^$(EMULATOR_NAME)$$'; then \
@@ -111,7 +137,6 @@ clean_all: clean clean_build clean_configure clean_rust
 
 EXTENSION_NAME=spanner
 USE_UNSTABLE_C_API=1
-TARGET_DUCKDB_VERSION=v1.5.4
 # Keep extension-ci-tools metadata in sync with Cargo.toml (not stale git short hash).
 EXTENSION_VERSION ?= $(patsubst v%,%,$(EXT_VERSION))
 
@@ -139,20 +164,20 @@ extension_version:
 	@echo "$(EXTENSION_VERSION)" > configure/extension_version.txt
 
 # duckdb-spanner gates loadable-extension behind a crate feature (integration tests use rlib mode).
-build_extension_library_debug: check_configure
+build_extension_library_debug: check_configure check-target-duckdb-version
 	DUCKDB_EXTENSION_NAME=$(EXTENSION_NAME) DUCKDB_EXTENSION_MIN_DUCKDB_VERSION=$(TARGET_DUCKDB_VERSION) cargo build --features loadable-extension $(CARGO_OVERRIDE_DUCKDB_RS_FLAG) $(TARGET_INFO)
 	$(PYTHON_VENV_BIN) -c "from pathlib import Path;Path('$(EXTENSION_BUILD_PATH)/debug/extension/$(EXTENSION_NAME)').mkdir(parents=True, exist_ok=True)"
 	$(PYTHON_VENV_BIN) -c "import shutil;shutil.copyfile('$(TARGET_PATH)/debug$(IS_EXAMPLE)/$(EXTENSION_LIB_FILENAME)', '$(EXTENSION_BUILD_PATH)/debug/$(EXTENSION_LIB_FILENAME)')"
 
-build_extension_library_release: check_configure
+build_extension_library_release: check_configure check-target-duckdb-version
 	DUCKDB_EXTENSION_NAME=$(EXTENSION_NAME) DUCKDB_EXTENSION_MIN_DUCKDB_VERSION=$(TARGET_DUCKDB_VERSION) cargo build --features loadable-extension $(CARGO_OVERRIDE_DUCKDB_RS_FLAG) --release $(TARGET_INFO)
 	$(PYTHON_VENV_BIN) -c "from pathlib import Path;Path('$(EXTENSION_BUILD_PATH)/release/extension/$(EXTENSION_NAME)').mkdir(parents=True, exist_ok=True)"
 	$(PYTHON_VENV_BIN) -c "import shutil;shutil.copyfile('$(TARGET_PATH)/release$(IS_EXAMPLE)/$(EXTENSION_LIB_FILENAME)', '$(EXTENSION_BUILD_PATH)/release/$(EXTENSION_LIB_FILENAME)')"
 
 configure: venv platform extension_version
 
-debug: build_extension_library_debug build_extension_with_metadata_debug
-release: build_extension_library_release build_extension_with_metadata_release
+debug: check-target-duckdb-version build_extension_library_debug build_extension_with_metadata_debug
+release: check-target-duckdb-version build_extension_library_release build_extension_with_metadata_release
 
 # SQLLogicTest (test/sql/*.test) needs a running Spanner emulator and seeded database.
 EMULATOR_HOST ?= localhost:9010
