@@ -1600,6 +1600,10 @@ fn create_duckdb_connection_with_copy() -> Connection {
 fn test_copy_to_registration() {
     // Verify the copy function is registered and DuckDB can parse COPY TO spanner syntax.
     // Uses raw C API to avoid Rust exception handling issues.
+    //
+    // Point `endpoint` at a closed local port so the client fails fast without
+    // ADC / metadata-server waits. Omitting endpoint hangs CI runners that have
+    // no credentials and try the default Spanner path indefinitely.
     unsafe {
         let mut db: duckdb::ffi::duckdb_database = std::ptr::null_mut();
         let r = duckdb::ffi::duckdb_open(c":memory:".as_ptr(), &mut db);
@@ -1611,19 +1615,35 @@ fn test_copy_to_registration() {
 
         register_copy_function(con, false);
 
-        // Try COPY with invalid database — should fail with Spanner connection error, not crash
+        // Try COPY with unreachable endpoint — should fail with Spanner connection
+        // error, not crash or hang waiting for ADC.
         let sql = std::ffi::CString::new(
-            "COPY (SELECT CAST(1 AS BIGINT) AS a) TO 'T' (FORMAT spanner, database_path 'projects/p/instances/i/databases/d')"
+            "COPY (SELECT CAST(1 AS BIGINT) AS a) TO 'T' (\
+                FORMAT spanner, \
+                database_path 'projects/p/instances/i/databases/d', \
+                endpoint '127.0.0.1:1'\
+            )"
         ).unwrap();
         let mut result = std::mem::MaybeUninit::zeroed();
         let r = duckdb::ffi::duckdb_query(con, sql.as_ptr(), result.as_mut_ptr());
         let mut result = result.assume_init();
-        if r != duckdb::ffi::DuckDBSuccess {
-            let err = duckdb::ffi::duckdb_result_error(&mut result);
-            assert!(!err.is_null(), "error message should not be null");
-            let err_str = std::ffi::CStr::from_ptr(err).to_string_lossy();
-            eprintln!("Expected COPY error: {err_str}");
-        }
+        assert_ne!(
+            r,
+            duckdb::ffi::DuckDBSuccess,
+            "COPY to unreachable endpoint should fail"
+        );
+        let err = duckdb::ffi::duckdb_result_error(&mut result);
+        assert!(!err.is_null(), "error message should not be null");
+        let err_str = std::ffi::CStr::from_ptr(err).to_string_lossy();
+        eprintln!("Expected COPY error: {err_str}");
+        assert!(
+            err_str.contains("Failed to connect to Spanner")
+                || err_str.contains("Timed out connecting")
+                || err_str.contains("connection")
+                || err_str.contains("connect")
+                || err_str.contains("error"),
+            "unexpected COPY error: {err_str}"
+        );
         duckdb::ffi::duckdb_destroy_result(&mut result);
         duckdb::ffi::duckdb_disconnect(&mut con);
         duckdb::ffi::duckdb_close(&mut db);

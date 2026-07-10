@@ -4,6 +4,8 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use google_cloud_auth::credentials::anonymous::Builder as Anonymous;
+use google_cloud_gax::options::RequestOptions;
+use google_cloud_gax::retry_policy::{Aip194Strict, RetryPolicyExt};
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use tokio::sync::OnceCell;
 
@@ -24,6 +26,14 @@ const EVICT_CLOSE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Poll interval used while waiting for an `Arc` to become uniquely owned.
 const RECLAIM_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Upper bound for building a Spanner client (channel + multiplexed session).
+/// Without this, unreachable endpoints retry gRPC indefinitely and hang CI
+/// (e.g. `test_copy_to_registration` against a closed local port).
+const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Per-attempt RPC timeout while creating the multiplexed session.
+const SESSION_CREATE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A tiny hand-rolled LRU map. Capacity is small (see [`CACHE_CAPACITY`]), so an
 /// O(n) scan for the least-recently-used entry on eviction is cheap and avoids
@@ -214,6 +224,22 @@ async fn create_client(
     database: &str,
     endpoint: Option<&str>,
 ) -> Result<Arc<DatabaseClient>, SpannerError> {
+    match tokio::time::timeout(CLIENT_CONNECT_TIMEOUT, create_client_inner(database, endpoint))
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(SpannerError::Other(format!(
+            "Timed out connecting to Spanner after {}s (database={database}, endpoint={})",
+            CLIENT_CONNECT_TIMEOUT.as_secs(),
+            endpoint.unwrap_or("<default>")
+        ))),
+    }
+}
+
+async fn create_client_inner(
+    database: &str,
+    endpoint: Option<&str>,
+) -> Result<Arc<DatabaseClient>, SpannerError> {
     let mut builder = Spanner::builder();
     if let Some(ep) = endpoint {
         builder = builder
@@ -222,7 +248,22 @@ async fn create_client(
     }
 
     let spanner = builder.build().await?;
-    let client = spanner.database_client(database).build().await?;
+
+    // Bound session-create retries so connection refused / unreachable hosts
+    // fail within CLIENT_CONNECT_TIMEOUT instead of retrying for minutes.
+    let mut session_options = RequestOptions::default();
+    session_options.set_attempt_timeout(SESSION_CREATE_ATTEMPT_TIMEOUT);
+    session_options.set_retry_policy(
+        Aip194Strict
+            .with_time_limit(CLIENT_CONNECT_TIMEOUT)
+            .with_attempt_limit(3),
+    );
+
+    let client = spanner
+        .database_client(database)
+        .with_request_options(session_options)
+        .build()
+        .await?;
     Ok(Arc::new(client))
 }
 
