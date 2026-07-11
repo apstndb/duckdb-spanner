@@ -12,6 +12,26 @@ use duckdb::ffi;
 
 const SPANNER_TABLE_PREFIX: &str = "spanner:";
 
+struct OwnedDuckDbValue(ffi::duckdb_value);
+
+impl OwnedDuckDbValue {
+    unsafe fn from_raw(raw: ffi::duckdb_value) -> Self {
+        Self(raw)
+    }
+
+    fn as_raw(&self) -> ffi::duckdb_value {
+        self.0
+    }
+}
+
+impl Drop for OwnedDuckDbValue {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { ffi::duckdb_destroy_value(&mut self.0) };
+        }
+    }
+}
+
 /// Register the Spanner replacement scan callback on a DuckDB database.
 ///
 /// # Safety
@@ -54,15 +74,16 @@ unsafe fn replacement_scan_inner(
     let function_name = c"spanner_scan";
     ffi::duckdb_replacement_scan_set_function_name(info, function_name.as_ptr());
 
-    let value = ffi::duckdb_create_varchar_length(
+    let value = OwnedDuckDbValue::from_raw(ffi::duckdb_create_varchar_length(
         spanner_table.as_ptr().cast(),
         spanner_table.len() as u64,
-    );
-    if value.is_null() {
+    ));
+    if value.as_raw().is_null() {
         set_replacement_error(info, "failed to create replacement scan table parameter");
         return;
     }
-    ffi::duckdb_replacement_scan_add_parameter(info, value);
+    // DuckDB copies the parameter into the replacement-scan input.
+    ffi::duckdb_replacement_scan_add_parameter(info, value.as_raw());
 }
 
 unsafe fn set_replacement_error(info: ffi::duckdb_replacement_scan_info, msg: &str) {

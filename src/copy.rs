@@ -11,19 +11,22 @@
 //!
 //! ## batch_size and mutation limits
 //!
-//! Each row produces one mutation per column. Spanner limits commits to
-//! **80,000 mutations** (including secondary index entries). The default
-//! `batch_size` of 1000 rows is conservative; for wide tables or tables
-//! with many secondary indexes, consider lowering it.
+//! Spanner limits commits to **80,000 mutations** including affected cells and
+//! secondary index entries. The same row can therefore consume many mutations.
+//! `batch_size` is capped at 80,000 rows as an absolute guard, but the default
+//! of 1000 is more conservative and wide/indexed tables should use less.
 
 use std::ffi::{c_void, CStr, CString};
+use std::os::raw::c_char;
 use std::sync::Arc;
 use std::time::Duration;
 
 use duckdb::ffi;
 use google_cloud_gax::error::rpc::Code;
+use google_cloud_gax::retry_policy::{Aip194Strict, RetryPolicyExt};
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::mutation::Mutation;
+use google_cloud_spanner::transaction::{BasicTransactionRetryPolicy, WriteOnlyTransaction};
 use google_cloud_spanner::types::{Type, TypeCode};
 use google_cloud_spanner::Error as SpannerClientError;
 use google_cloud_spanner_admin_database_v1::model::DatabaseDialect;
@@ -36,7 +39,80 @@ use crate::runtime;
 use crate::schema;
 
 const DEFAULT_BATCH_SIZE: usize = 1000;
-const EMULATOR_WRITE_MAX_ATTEMPTS: u32 = 5;
+const MAX_BATCH_SIZE: usize = 80_000;
+const EXPLICIT_EMULATOR_WRITE_MAX_ATTEMPTS: u32 = 5;
+const WRITE_TRANSACTION_MAX_ATTEMPTS: u32 = 5;
+const WRITE_TRANSACTION_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
+const WRITE_BEGIN_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+const WRITE_COMMIT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
+const WRITE_RPC_RETRY_MAX_ATTEMPTS: u32 = 3;
+const WRITE_RPC_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
+
+// These guards mirror the caller-owned handles documented by DuckDB's C API.
+macro_rules! owned_duckdb_handle {
+    ($name:ident, $raw:ty, $destroy:path) => {
+        struct $name($raw);
+
+        impl $name {
+            unsafe fn from_raw(raw: $raw) -> Self {
+                Self(raw)
+            }
+
+            fn as_raw(&self) -> $raw {
+                self.0
+            }
+        }
+
+        impl Drop for $name {
+            fn drop(&mut self) {
+                if !self.0.is_null() {
+                    unsafe { $destroy(&mut self.0) };
+                }
+            }
+        }
+    };
+}
+
+owned_duckdb_handle!(
+    OwnedDuckDbValue,
+    ffi::duckdb_value,
+    ffi::duckdb_destroy_value
+);
+owned_duckdb_handle!(
+    OwnedDuckDbLogicalType,
+    ffi::duckdb_logical_type,
+    ffi::duckdb_destroy_logical_type
+);
+owned_duckdb_handle!(
+    OwnedDuckDbClientContext,
+    ffi::duckdb_client_context,
+    ffi::duckdb_destroy_client_context
+);
+owned_duckdb_handle!(
+    OwnedDuckDbCopyFunction,
+    ffi::duckdb_copy_function,
+    ffi::duckdb_destroy_copy_function
+);
+
+struct OwnedDuckDbString(*mut c_char);
+
+impl OwnedDuckDbString {
+    unsafe fn from_raw(raw: *mut c_char) -> Self {
+        Self(raw)
+    }
+
+    fn as_ptr(&self) -> *mut c_char {
+        self.0
+    }
+}
+
+impl Drop for OwnedDuckDbString {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { ffi::duckdb_free(self.0.cast()) };
+        }
+    }
+}
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -46,6 +122,13 @@ enum MutationMode {
     Update,
     InsertOrUpdate,
     Replace,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EmulatorRetryRoute {
+    None,
+    Sdk,
+    ExplicitEndpointFallback,
 }
 
 impl MutationMode {
@@ -106,7 +189,7 @@ struct CopyExtraInfo {
 /// Global state created during init and shared across sink calls.
 struct CopyGlobalState {
     client: Arc<DatabaseClient>,
-    retry_emulator_internal_write_error: bool,
+    emulator_retry_route: EmulatorRetryRoute,
     table_name: String,
     column_names: Vec<String>,
     mode: MutationMode,
@@ -114,6 +197,7 @@ struct CopyGlobalState {
     columns: Vec<ColumnMeta>,
     buffer: Vec<Mutation>,
     rows_written: u64,
+    failure: Option<String>,
 }
 
 // ─── Registration ───────────────────────────────────────────────────────────
@@ -129,26 +213,29 @@ pub unsafe fn register_copy_function(con: ffi::duckdb_connection, config_enabled
     crate::ensure_rustls_crypto_provider();
 
     unsafe {
-        let copy_fn = ffi::duckdb_create_copy_function();
+        let copy_fn = OwnedDuckDbCopyFunction::from_raw(ffi::duckdb_create_copy_function());
+        if copy_fn.as_raw().is_null() {
+            eprintln!("[duckdb-spanner] Failed to allocate copy function");
+            return;
+        }
 
         let name = c"spanner";
-        ffi::duckdb_copy_function_set_name(copy_fn, name.as_ptr());
+        ffi::duckdb_copy_function_set_name(copy_fn.as_raw(), name.as_ptr());
         let extra = Box::new(CopyExtraInfo { config_enabled });
         ffi::duckdb_copy_function_set_extra_info(
-            copy_fn,
+            copy_fn.as_raw(),
             Box::into_raw(extra) as *mut c_void,
             Some(drop_box::<CopyExtraInfo>),
         );
-        ffi::duckdb_copy_function_set_bind(copy_fn, Some(copy_bind));
-        ffi::duckdb_copy_function_set_global_init(copy_fn, Some(copy_global_init));
-        ffi::duckdb_copy_function_set_sink(copy_fn, Some(copy_sink));
-        ffi::duckdb_copy_function_set_finalize(copy_fn, Some(copy_finalize));
+        ffi::duckdb_copy_function_set_bind(copy_fn.as_raw(), Some(copy_bind));
+        ffi::duckdb_copy_function_set_global_init(copy_fn.as_raw(), Some(copy_global_init));
+        ffi::duckdb_copy_function_set_sink(copy_fn.as_raw(), Some(copy_sink));
+        ffi::duckdb_copy_function_set_finalize(copy_fn.as_raw(), Some(copy_finalize));
 
-        let rc = ffi::duckdb_register_copy_function(con, copy_fn);
+        let rc = ffi::duckdb_register_copy_function(con, copy_fn.as_raw());
         if rc != ffi::DuckDBSuccess {
             eprintln!("[duckdb-spanner] Failed to register copy function");
         }
-        ffi::duckdb_destroy_copy_function(&mut { copy_fn });
     }
 }
 
@@ -191,7 +278,11 @@ unsafe extern "C" fn copy_sink(
     })) {
         Ok(Ok(())) => {}
         Ok(Err(e)) => unsafe { set_sink_error(info, &e) },
-        Err(_) => unsafe { set_sink_error(info, "panic in spanner copy sink") },
+        Err(_) => unsafe {
+            let state_ptr = ffi::duckdb_copy_function_sink_get_global_state(info);
+            let error = record_copy_callback_panic(state_ptr, "sink");
+            set_sink_error(info, &error);
+        },
     }
 }
 
@@ -201,7 +292,11 @@ unsafe extern "C" fn copy_finalize(info: ffi::duckdb_copy_function_finalize_info
     })) {
         Ok(Ok(())) => {}
         Ok(Err(e)) => unsafe { set_finalize_error(info, &e) },
-        Err(_) => unsafe { set_finalize_error(info, "panic in spanner copy finalize") },
+        Err(_) => unsafe {
+            let state_ptr = ffi::duckdb_copy_function_finalize_get_global_state(info);
+            let error = record_copy_callback_panic(state_ptr, "finalize");
+            set_finalize_error(info, &error);
+        },
     }
 }
 
@@ -209,18 +304,18 @@ unsafe extern "C" fn copy_finalize(info: ffi::duckdb_copy_function_finalize_info
 
 unsafe fn copy_bind_inner(info: ffi::duckdb_copy_function_bind_info) -> Result<(), String> {
     // Parse COPY options
-    let options_val = ffi::duckdb_copy_function_bind_get_options(info);
-    let opts = extract_options(options_val);
-    ffi::duckdb_destroy_value(&mut { options_val });
+    let options_val = OwnedDuckDbValue::from_raw(ffi::duckdb_copy_function_bind_get_options(info));
+    let opts = extract_options(options_val.as_raw());
 
     // Get client context for config fallback
-    let ctx = ffi::duckdb_copy_function_bind_get_client_context(info);
-    let have_ctx = !ctx.is_null();
+    let ctx =
+        OwnedDuckDbClientContext::from_raw(ffi::duckdb_copy_function_bind_get_client_context(info));
+    let have_ctx = !ctx.as_raw().is_null();
     let config_enabled = unsafe { copy_config_enabled(info) };
 
     let cfg = |name: &str| -> Option<String> {
         if have_ctx && config_enabled {
-            unsafe { config::get_config_string_from_context(ctx, name) }
+            unsafe { config::get_config_string_from_context(ctx.as_raw(), name) }
         } else {
             None
         }
@@ -233,30 +328,22 @@ unsafe fn copy_bind_inner(info: ffi::duckdb_copy_function_bind_info) -> Result<(
         .map(ToOwned::to_owned)
         .or_else(|| cfg("spanner_endpoint"));
 
-    if have_ctx {
-        ffi::duckdb_destroy_client_context(&mut { ctx });
-    }
-
     let mode = match option_value(&opts, "mode") {
         Some(m) => MutationMode::parse(m)?,
         None => MutationMode::InsertOrUpdate,
     };
 
-    let batch_size = match option_value(&opts, "batch_size") {
-        Some(s) => s
-            .parse::<usize>()
-            .map_err(|e| format!("Invalid batch_size: {e}"))?,
-        None => DEFAULT_BATCH_SIZE,
-    };
+    let batch_size = parse_batch_size(option_value(&opts, "batch_size"))?;
 
     // Collect source column type metadata
     let column_count = ffi::duckdb_copy_function_bind_get_column_count(info) as usize;
     let mut columns = Vec::with_capacity(column_count);
 
     for i in 0..column_count {
-        let logical_type = ffi::duckdb_copy_function_bind_get_column_type(info, i as u64);
-        let column = column_meta_from_logical_type(logical_type)?;
-        ffi::duckdb_destroy_logical_type(&mut { logical_type });
+        let logical_type = OwnedDuckDbLogicalType::from_raw(
+            ffi::duckdb_copy_function_bind_get_column_type(info, i as u64),
+        );
+        let column = column_meta_from_logical_type(logical_type.as_raw())?;
         columns.push(column);
     }
 
@@ -297,6 +384,7 @@ unsafe fn copy_global_init_inner(
         return Err("Bind data is null".to_string());
     }
     let bind_data = &*(bind_ptr as *const CopyBindData);
+    validate_batch_size(bind_data.batch_size)?;
 
     // Connect to Spanner
     let client = runtime::block_on(client::get_or_create_client(
@@ -338,16 +426,23 @@ unsafe fn copy_global_init_inner(
         apply_spanner_type(col, &target.spanner_type)?;
     }
 
+    let sdk_emulator_mode = std::env::var("SPANNER_EMULATOR_HOST")
+        .ok()
+        .is_some_and(|host| !host.is_empty());
+    let emulator_retry_route =
+        emulator_retry_route(bind_data.endpoint.as_deref(), sdk_emulator_mode);
     let state = Box::new(CopyGlobalState {
         client,
-        retry_emulator_internal_write_error: bind_data.endpoint.is_some(),
+        emulator_retry_route,
         table_name,
         column_names,
         mode: bind_data.mode,
         batch_size: bind_data.batch_size,
         columns,
-        buffer: Vec::with_capacity(bind_data.batch_size),
+        // Grow with actual input rather than trusting an unbounded user option as capacity.
+        buffer: Vec::new(),
         rows_written: 0,
+        failure: None,
     });
 
     ffi::duckdb_copy_function_global_init_set_global_state(
@@ -365,10 +460,26 @@ unsafe fn copy_sink_inner(
 ) -> Result<(), String> {
     let state_ptr = ffi::duckdb_copy_function_sink_get_global_state(info);
     if state_ptr.is_null() {
-        return Err("Global state is null".to_string());
+        return Err(copy_failure_message("sink", "global state is null", 0));
     }
-    let state = &mut *(state_ptr as *mut CopyGlobalState);
+    // DuckDB 1.5.4's C COPY adapter leaves execution_mode unset, so this
+    // PhysicalCopyToFile sink is serial and the global state is not aliased.
+    let state = &mut *state_ptr.cast::<CopyGlobalState>();
+    if let Some(failure) = &state.failure {
+        return Err(failure.clone());
+    }
 
+    if let Err(cause) = copy_sink_chunk(state, chunk) {
+        return Err(record_copy_failure(state, "sink", &cause));
+    }
+
+    Ok(())
+}
+
+unsafe fn copy_sink_chunk(
+    state: &mut CopyGlobalState,
+    chunk: ffi::duckdb_data_chunk,
+) -> Result<(), String> {
     let row_count = ffi::duckdb_data_chunk_get_size(chunk) as usize;
     if row_count == 0 {
         return Ok(());
@@ -376,6 +487,7 @@ unsafe fn copy_sink_inner(
 
     let col_count = state.columns.len();
 
+    // The pinned DuckDB C COPY adapter flattens the chunk before this callback.
     let vectors: Vec<ffi::duckdb_vector> = (0..col_count)
         .map(|i| ffi::duckdb_data_chunk_get_vector(chunk, i as u64))
         .collect();
@@ -406,9 +518,14 @@ unsafe fn copy_finalize_inner(info: ffi::duckdb_copy_function_finalize_info) -> 
     if state_ptr.is_null() {
         return Ok(());
     }
-    let state = &mut *(state_ptr as *mut CopyGlobalState);
+    let state = &mut *state_ptr.cast::<CopyGlobalState>();
+    if let Some(failure) = &state.failure {
+        return Err(failure.clone());
+    }
 
-    flush_buffer(state)?;
+    if let Err(cause) = flush_buffer(state) {
+        return Err(record_copy_failure(state, "finalize", &cause));
+    }
 
     eprintln!(
         "[duckdb-spanner] COPY TO '{}': {} rows written",
@@ -416,6 +533,33 @@ unsafe fn copy_finalize_inner(info: ffi::duckdb_copy_function_finalize_info) -> 
     );
 
     Ok(())
+}
+
+fn copy_failure_message(phase: &str, cause: &str, rows_written: u64) -> String {
+    format!(
+        "COPY {phase} failed: {cause}; rows_written={rows_written}; earlier batches remain committed"
+    )
+}
+
+fn record_copy_failure(state: &mut CopyGlobalState, phase: &str, cause: &str) -> String {
+    if let Some(failure) = &state.failure {
+        return failure.clone();
+    }
+
+    // A failed COPY must not let finalize commit rows that were only buffered.
+    state.buffer.clear();
+    let failure = copy_failure_message(phase, cause, state.rows_written);
+    state.failure = Some(failure.clone());
+    failure
+}
+
+unsafe fn record_copy_callback_panic(state_ptr: *mut c_void, phase: &str) -> String {
+    if state_ptr.is_null() {
+        return copy_failure_message(phase, "callback panicked", 0);
+    }
+
+    let state = &mut *state_ptr.cast::<CopyGlobalState>();
+    record_copy_failure(state, phase, "callback panicked")
 }
 
 unsafe fn column_meta_from_logical_type(
@@ -438,15 +582,15 @@ unsafe fn column_meta_from_logical_type(
 
     let (array_size, child, struct_fields) = match type_id {
         ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST => {
-            let child_type = ffi::duckdb_list_type_child_type(logical_type);
-            let child = column_meta_from_logical_type(child_type)?;
-            ffi::duckdb_destroy_logical_type(&mut { child_type });
+            let child_type =
+                OwnedDuckDbLogicalType::from_raw(ffi::duckdb_list_type_child_type(logical_type));
+            let child = column_meta_from_logical_type(child_type.as_raw())?;
             (0, Some(Box::new(child)), Vec::new())
         }
         ffi::DUCKDB_TYPE_DUCKDB_TYPE_ARRAY => {
-            let child_type = ffi::duckdb_array_type_child_type(logical_type);
-            let child = column_meta_from_logical_type(child_type)?;
-            ffi::duckdb_destroy_logical_type(&mut { child_type });
+            let child_type =
+                OwnedDuckDbLogicalType::from_raw(ffi::duckdb_array_type_child_type(logical_type));
+            let child = column_meta_from_logical_type(child_type.as_raw())?;
             (
                 ffi::duckdb_array_type_array_size(logical_type) as usize,
                 Some(Box::new(child)),
@@ -457,16 +601,21 @@ unsafe fn column_meta_from_logical_type(
             let field_count = ffi::duckdb_struct_type_child_count(logical_type) as usize;
             let mut fields = Vec::with_capacity(field_count);
             for field_idx in 0..field_count {
-                let name_ptr = ffi::duckdb_struct_type_child_name(logical_type, field_idx as u64);
-                if name_ptr.is_null() {
+                let name_ptr = OwnedDuckDbString::from_raw(ffi::duckdb_struct_type_child_name(
+                    logical_type,
+                    field_idx as u64,
+                ));
+                if name_ptr.as_ptr().is_null() {
                     return Err(format!("DuckDB STRUCT field {field_idx} has no name"));
                 }
-                let name = CStr::from_ptr(name_ptr).to_string_lossy().into_owned();
-                ffi::duckdb_free(name_ptr as *mut _);
+                let name = CStr::from_ptr(name_ptr.as_ptr())
+                    .to_string_lossy()
+                    .into_owned();
 
-                let child_type = ffi::duckdb_struct_type_child_type(logical_type, field_idx as u64);
-                let column = column_meta_from_logical_type(child_type)?;
-                ffi::duckdb_destroy_logical_type(&mut { child_type });
+                let child_type = OwnedDuckDbLogicalType::from_raw(
+                    ffi::duckdb_struct_type_child_type(logical_type, field_idx as u64),
+                );
+                let column = column_meta_from_logical_type(child_type.as_raw())?;
                 fields.push(StructFieldMeta { name, column });
             }
             (0, None, fields)
@@ -645,54 +794,59 @@ unsafe fn extract_options(
     if type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_STRUCT {
         let child_count = ffi::duckdb_struct_type_child_count(options_type);
         for i in 0..child_count {
-            let name_ptr = ffi::duckdb_struct_type_child_name(options_type, i);
-            if name_ptr.is_null() {
+            let name_ptr =
+                OwnedDuckDbString::from_raw(ffi::duckdb_struct_type_child_name(options_type, i));
+            if name_ptr.as_ptr().is_null() {
                 continue;
             }
-            let name = CStr::from_ptr(name_ptr).to_string_lossy().to_lowercase();
-            ffi::duckdb_free(name_ptr as *mut _);
+            let name = CStr::from_ptr(name_ptr.as_ptr())
+                .to_string_lossy()
+                .to_ascii_lowercase();
 
             // Skip 'format' — already consumed by DuckDB
             if name == "format" {
                 continue;
             }
 
-            let child_val = ffi::duckdb_get_struct_child(options_val, i);
-            if !child_val.is_null() && !ffi::duckdb_is_null_value(child_val) {
+            let child_val =
+                OwnedDuckDbValue::from_raw(ffi::duckdb_get_struct_child(options_val, i));
+            if !child_val.as_raw().is_null() && !ffi::duckdb_is_null_value(child_val.as_raw()) {
                 // Child may be a LIST; try to get the first element.
                 // NOTE: duckdb_get_value_type returns an internal reference — do NOT destroy it.
-                let child_type = ffi::duckdb_get_value_type(child_val);
+                let child_type = ffi::duckdb_get_value_type(child_val.as_raw());
                 let child_type_id = ffi::duckdb_get_type_id(child_type);
 
                 if child_type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST {
-                    let list_size = ffi::duckdb_get_list_size(child_val);
+                    let list_size = ffi::duckdb_get_list_size(child_val.as_raw());
                     let mut values = Vec::with_capacity(list_size as usize);
                     for index in 0..list_size {
-                        let elem = ffi::duckdb_get_list_child(child_val, index);
-                        if let Some(s) = value_to_string_allow_empty(elem) {
+                        let elem = OwnedDuckDbValue::from_raw(ffi::duckdb_get_list_child(
+                            child_val.as_raw(),
+                            index,
+                        ));
+                        if let Some(s) = value_to_string_allow_empty(elem.as_raw()) {
                             values.push(s);
                         }
-                        ffi::duckdb_destroy_value(&mut { elem });
                     }
                     opts.insert(name, values);
-                } else if let Some(s) = value_to_string(child_val) {
+                } else if let Some(s) = value_to_string(child_val.as_raw()) {
                     opts.insert(name, vec![s]);
                 }
             }
-            ffi::duckdb_destroy_value(&mut { child_val });
         }
     } else if type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_MAP {
         let map_size = ffi::duckdb_get_map_size(options_val);
         for i in 0..map_size {
-            let key = ffi::duckdb_get_map_key(options_val, i);
-            let val = ffi::duckdb_get_map_value(options_val, i);
-            if let (Some(k), Some(v)) = (value_to_string(key), value_to_string(val)) {
-                if k.to_lowercase() != "format" {
-                    opts.insert(k.to_lowercase(), vec![v]);
+            let key = OwnedDuckDbValue::from_raw(ffi::duckdb_get_map_key(options_val, i));
+            let val = OwnedDuckDbValue::from_raw(ffi::duckdb_get_map_value(options_val, i));
+            if let (Some(k), Some(v)) =
+                (value_to_string(key.as_raw()), value_to_string(val.as_raw()))
+            {
+                let key = k.to_ascii_lowercase();
+                if key != "format" {
+                    opts.insert(key, vec![v]);
                 }
             }
-            ffi::duckdb_destroy_value(&mut { key });
-            ffi::duckdb_destroy_value(&mut { val });
         }
     }
 
@@ -707,6 +861,29 @@ fn option_value<'a>(
     opts.get(name)?.first().map(String::as_str)
 }
 
+fn parse_batch_size(value: Option<&str>) -> Result<usize, String> {
+    let batch_size = match value {
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|e| format!("Invalid batch_size '{value}': {e}"))?,
+        None => DEFAULT_BATCH_SIZE,
+    };
+    validate_batch_size(batch_size)?;
+    Ok(batch_size)
+}
+
+fn validate_batch_size(batch_size: usize) -> Result<(), String> {
+    if batch_size == 0 {
+        return Err("Invalid batch_size '0': must be greater than zero".to_string());
+    }
+    if batch_size > MAX_BATCH_SIZE {
+        return Err(format!(
+            "Invalid batch_size '{batch_size}': must not exceed {MAX_BATCH_SIZE} rows; use a lower value for multi-column or indexed tables"
+        ));
+    }
+    Ok(())
+}
+
 /// Extract a string from a `duckdb_value`.
 unsafe fn value_to_string(val: ffi::duckdb_value) -> Option<String> {
     value_to_string_allow_empty(val).filter(|s| !s.is_empty())
@@ -717,12 +894,13 @@ unsafe fn value_to_string_allow_empty(val: ffi::duckdb_value) -> Option<String> 
     if val.is_null() || ffi::duckdb_is_null_value(val) {
         return None;
     }
-    let c_str = ffi::duckdb_get_varchar(val);
-    if c_str.is_null() {
+    let c_str = OwnedDuckDbString::from_raw(ffi::duckdb_get_varchar(val));
+    if c_str.as_ptr().is_null() {
         return None;
     }
-    let s = CStr::from_ptr(c_str).to_string_lossy().into_owned();
-    ffi::duckdb_free(c_str as *mut _);
+    let s = CStr::from_ptr(c_str.as_ptr())
+        .to_string_lossy()
+        .into_owned();
     Some(s)
 }
 
@@ -741,6 +919,16 @@ fn resolve_copy_database_path(
     let project_opt = option_value(opts, "project").map(ToOwned::to_owned);
     let instance_opt = option_value(opts, "instance").map(ToOwned::to_owned);
     let database_opt = option_value(opts, "database").map(ToOwned::to_owned);
+    let database_path_opt = option_value(opts, "database_path").map(ToOwned::to_owned);
+
+    if database_path_opt.is_some()
+        && (project_opt.is_some() || instance_opt.is_some() || database_opt.is_some())
+    {
+        return Err(
+            "cannot combine database_path with project, instance, or database COPY options"
+                .to_string(),
+        );
+    }
 
     if project_opt.is_some() || instance_opt.is_some() || database_opt.is_some() {
         let project = project_opt.or_else(|| cfg("spanner_project"));
@@ -761,8 +949,8 @@ fn resolve_copy_database_path(
         return Ok(format!("projects/{p}/instances/{i}/databases/{d}"));
     }
 
-    if let Some(path) = option_value(opts, "database_path") {
-        return Ok(path.to_owned());
+    if let Some(path) = database_path_opt {
+        return Ok(path);
     }
 
     let project = cfg("spanner_project");
@@ -798,6 +986,18 @@ fn resolve_copy_database_path(
 
 // ─── Buffer flush / mutation building ───────────────────────────────────────
 
+fn emulator_retry_route(endpoint: Option<&str>, sdk_emulator_mode: bool) -> EmulatorRetryRoute {
+    // The pinned SDK marks only SPANNER_EMULATOR_HOST clients as emulator;
+    // explicit endpoints need the compatibility retry below.
+    if sdk_emulator_mode {
+        EmulatorRetryRoute::Sdk
+    } else if endpoint.is_some() {
+        EmulatorRetryRoute::ExplicitEndpointFallback
+    } else {
+        EmulatorRetryRoute::None
+    }
+}
+
 fn flush_buffer(state: &mut CopyGlobalState) -> Result<(), String> {
     if state.buffer.is_empty() {
         return Ok(());
@@ -809,9 +1009,11 @@ fn flush_buffer(state: &mut CopyGlobalState) -> Result<(), String> {
     runtime::block_on(write_mutations(
         Arc::clone(&state.client),
         mutations,
-        state.retry_emulator_internal_write_error,
+        state.emulator_retry_route,
     ))
-    .map_err(|e| format!("Runtime error: {e}"))??;
+    .map_err(|e| {
+        format!("Runtime error: {e}; the final batch's commit outcome may be unknown")
+    })??;
 
     state.rows_written += count as u64;
     Ok(())
@@ -820,28 +1022,77 @@ fn flush_buffer(state: &mut CopyGlobalState) -> Result<(), String> {
 async fn write_mutations(
     client: Arc<DatabaseClient>,
     mutations: Vec<Mutation>,
-    retry_emulator_internal_error: bool,
+    emulator_retry_route: EmulatorRetryRoute,
 ) -> Result<(), String> {
     let mut attempt = 1;
     loop {
-        match client
-            .write_only_transaction()
-            .build()
+        match build_copy_write_transaction(&client)
             .write(mutations.clone())
             .await
         {
             Ok(_) => return Ok(()),
             Err(e)
-                if retry_emulator_internal_error
-                    && attempt < EMULATOR_WRITE_MAX_ATTEMPTS
+                if emulator_retry_route == EmulatorRetryRoute::ExplicitEndpointFallback
+                    && attempt < EXPLICIT_EMULATOR_WRITE_MAX_ATTEMPTS
                     && is_internal_emulator_schema_error(&e) =>
             {
                 attempt += 1;
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            Err(e) => return Err(format!("Spanner write error: {e}")),
+            Err(e) => return Err(format_spanner_write_error(&e)),
         }
     }
+}
+
+fn copy_transaction_retry_policy() -> BasicTransactionRetryPolicy {
+    BasicTransactionRetryPolicy::new()
+        .with_max_attempts(WRITE_TRANSACTION_MAX_ATTEMPTS)
+        .with_total_timeout(WRITE_TRANSACTION_TOTAL_TIMEOUT)
+}
+
+fn build_copy_write_transaction(client: &DatabaseClient) -> WriteOnlyTransaction {
+    client
+        .write_only_transaction()
+        .with_retry_policy(copy_transaction_retry_policy())
+        .with_begin_attempt_timeout(WRITE_BEGIN_ATTEMPT_TIMEOUT)
+        .with_begin_retry_policy(
+            Aip194Strict
+                .with_time_limit(WRITE_RPC_RETRY_TIMEOUT)
+                .with_attempt_limit(WRITE_RPC_RETRY_MAX_ATTEMPTS),
+        )
+        .with_commit_attempt_timeout(WRITE_COMMIT_ATTEMPT_TIMEOUT)
+        .with_commit_retry_policy(
+            Aip194Strict
+                .with_time_limit(WRITE_RPC_RETRY_TIMEOUT)
+                .with_attempt_limit(WRITE_RPC_RETRY_MAX_ATTEMPTS),
+        )
+        .build()
+}
+
+fn format_spanner_write_error(err: &SpannerClientError) -> String {
+    let mut message = format!("Spanner write error: {err}");
+    if is_ambiguous_write_error(err) {
+        message.push_str("; the final batch's commit outcome is unknown");
+    }
+    message
+}
+
+fn is_ambiguous_write_error(err: &SpannerClientError) -> bool {
+    err.is_timeout()
+        || err.is_exhausted()
+        || err.is_deserialization()
+        || err.is_io()
+        || err.status().is_some_and(|status| {
+            matches!(
+                status.code,
+                Code::Cancelled
+                    | Code::DeadlineExceeded
+                    | Code::Unknown
+                    | Code::Internal
+                    | Code::Unavailable
+                    | Code::DataLoss
+            )
+        })
 }
 
 fn is_internal_emulator_schema_error(err: &SpannerClientError) -> bool {
@@ -1382,6 +1633,13 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
+    fn options(values: &[(&str, &str)]) -> std::collections::HashMap<String, Vec<String>> {
+        values
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), vec![(*value).to_string()]))
+            .collect()
+    }
+
     #[test]
     fn positional_excludes_generated_columns() {
         // DDL order: Id, FullName (generated), Name. Writable = Id, Name.
@@ -1480,6 +1738,98 @@ mod tests {
         let src = names(&["Id", ""]);
         let err = resolve_copy_columns(&schema, Some(&src), 2, "T").unwrap_err();
         assert!(err.contains("must not contain empty column names"), "{err}");
+    }
+
+    #[test]
+    fn database_path_cannot_be_combined_with_component_options() {
+        let opts = options(&[
+            ("database_path", "projects/p/instances/i/databases/d"),
+            ("project", "p"),
+        ]);
+        let err = resolve_copy_database_path(&opts, |_| None).unwrap_err();
+        assert_eq!(
+            err,
+            "cannot combine database_path with project, instance, or database COPY options"
+        );
+    }
+
+    #[test]
+    fn batch_size_must_be_positive() {
+        assert_eq!(parse_batch_size(None).unwrap(), DEFAULT_BATCH_SIZE);
+        assert_eq!(parse_batch_size(Some("1")).unwrap(), 1);
+        assert_eq!(
+            parse_batch_size(Some("0")).unwrap_err(),
+            "Invalid batch_size '0': must be greater than zero"
+        );
+    }
+
+    #[test]
+    fn batch_size_is_capped_before_allocation() {
+        assert_eq!(
+            parse_batch_size(Some(&MAX_BATCH_SIZE.to_string())).unwrap(),
+            MAX_BATCH_SIZE
+        );
+        let value = (MAX_BATCH_SIZE + 1).to_string();
+        let error = parse_batch_size(Some(&value)).unwrap_err();
+        assert!(error.contains("must not exceed 80000 rows"), "{error}");
+    }
+
+    #[test]
+    fn partial_progress_error_is_explicit() {
+        assert_eq!(
+            copy_failure_message("sink", "conversion failed", 42),
+            "COPY sink failed: conversion failed; rows_written=42; earlier batches remain committed"
+        );
+    }
+
+    #[test]
+    fn emulator_retry_route_uses_sdk_for_environment_configuration() {
+        assert_eq!(emulator_retry_route(None, true), EmulatorRetryRoute::Sdk);
+        assert_eq!(
+            emulator_retry_route(Some("localhost:9010"), true),
+            EmulatorRetryRoute::Sdk
+        );
+        assert_eq!(
+            emulator_retry_route(Some("localhost:9010"), false),
+            EmulatorRetryRoute::ExplicitEndpointFallback
+        );
+        assert_eq!(emulator_retry_route(None, false), EmulatorRetryRoute::None);
+    }
+
+    #[test]
+    fn copy_transaction_retry_policy_is_finite() {
+        let policy = copy_transaction_retry_policy();
+        assert_eq!(policy.max_attempts(), WRITE_TRANSACTION_MAX_ATTEMPTS);
+        assert_eq!(policy.total_timeout(), WRITE_TRANSACTION_TOTAL_TIMEOUT);
+    }
+
+    #[test]
+    fn ambiguous_write_error_reports_unknown_commit_outcome() {
+        let err = SpannerClientError::service(
+            Status::default()
+                .set_code(Code::DeadlineExceeded)
+                .set_message("deadline exceeded"),
+        );
+        assert!(is_ambiguous_write_error(&err));
+        assert!(
+            format_spanner_write_error(&err).contains("commit outcome is unknown"),
+            "{}",
+            format_spanner_write_error(&err)
+        );
+
+        let err = SpannerClientError::service(
+            Status::default()
+                .set_code(Code::AlreadyExists)
+                .set_message("already exists"),
+        );
+        assert!(!is_ambiguous_write_error(&err));
+        assert!(!format_spanner_write_error(&err).contains("unknown"));
+
+        let err = SpannerClientError::timeout(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "commit response timed out",
+        ));
+        assert!(is_ambiguous_write_error(&err));
     }
 
     #[test]
