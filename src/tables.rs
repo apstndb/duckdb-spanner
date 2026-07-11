@@ -55,8 +55,7 @@ impl VTab for SpannerTablesVTab {
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
         );
 
-        let database = crate::bind_utils::resolve_database_path(bind)?;
-        let endpoint = crate::bind_utils::resolve_endpoint(bind);
+        let profile = crate::bind_utils::resolve_connection_profile(bind)?;
         let dialect = crate::bind_utils::get_named_string(bind, "dialect")
             .map(|value| schema::parse_dialect(&value))
             .transpose()?
@@ -72,8 +71,8 @@ impl VTab for SpannerTablesVTab {
         };
 
         let rows = runtime::run(async move {
-            let client = client::get_or_create_client(&database, endpoint.as_deref()).await?;
-            list_tables(&client, &database, endpoint.as_deref(), dialect, &filters).await
+            let client = client::get_or_create_client(&profile).await?;
+            list_tables(&client, &profile, dialect, &filters).await
         })??;
 
         bind.set_cardinality(rows.len() as u64, true);
@@ -146,6 +145,10 @@ impl VTab for SpannerTablesVTab {
                 LogicalTypeHandle::from(LogicalTypeId::Varchar),
             ),
             (
+                "endpoint_mode".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            ),
+            (
                 "dialect".to_string(),
                 LogicalTypeHandle::from(LogicalTypeId::Varchar),
             ),
@@ -167,16 +170,13 @@ impl VTab for SpannerTablesVTab {
 
 async fn list_tables(
     client: &DatabaseClient,
-    database: &str,
-    endpoint: Option<&str>,
+    profile: &crate::connection::ConnectionProfile,
     dialect: DatabaseDialect,
     filters: &TableFilters,
 ) -> Result<Vec<TableRow>, SpannerError> {
     let tx = client.single_use().build();
-    let dialect = schema::resolve_dialect(dialect, || {
-        schema::detect_dialect(client, database, endpoint)
-    })
-    .await?;
+    let dialect =
+        schema::resolve_dialect(dialect, || schema::detect_dialect(client, profile)).await?;
     let stmt = build_tables_query(dialect, filters);
     let mut iter = tx.execute_query(stmt).await?;
 

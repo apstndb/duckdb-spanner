@@ -18,6 +18,7 @@ use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::AbortHandle;
 
 use crate::cache::LruCache;
+use crate::connection::{AuthenticationMode, ConnectionProfile, EndpointMode};
 use crate::error::SpannerError;
 use crate::{bind_utils, runtime};
 
@@ -809,33 +810,39 @@ static ADMIN_CLIENT_CACHE: LazyLock<Arc<Mutex<ClientCache<DatabaseAdmin>>>> = La
 
 /// Get or create a Spanner Admin client.
 ///
-/// Admin clients are NOT per-database (unlike data clients). The cache key is
-/// the endpoint string (or empty for default).
+/// Admin clients are NOT per-database (unlike data clients). The cache key
+/// includes endpoint mode, endpoint, credentials, and transport so profiles
+/// that happen to share a host cannot reuse an incompatible client.
 async fn get_or_create_admin_client(
-    admin_endpoint: Option<&str>,
+    profile: &ConnectionProfile,
 ) -> Result<Arc<DatabaseAdmin>, SpannerError> {
-    let cache_key = admin_endpoint.unwrap_or("").to_string();
-    let owned_endpoint = admin_endpoint.map(str::to_string);
+    let admin_endpoint = profile.admin_endpoint();
+    let authentication = profile.authentication();
+    let cache_key = format!(
+        "mode={:?};endpoint={:?};auth={:?}",
+        profile.endpoint_mode(),
+        admin_endpoint,
+        authentication,
+    );
     get_or_create_cached_client(
         Arc::clone(&ADMIN_CLIENT_CACHE),
         cache_key,
         DEFAULT_TIMEOUTS.connect,
-        move || async move { create_admin_client(owned_endpoint.as_deref()).await },
+        move || async move { create_admin_client(admin_endpoint.as_deref(), authentication).await },
     )
     .await
 }
 
 async fn create_admin_client(
     admin_endpoint: Option<&str>,
+    authentication: AuthenticationMode,
 ) -> Result<Arc<DatabaseAdmin>, SpannerError> {
     let mut builder = DatabaseAdmin::builder();
-    let emulator_endpoint = admin_endpoint
-        .map(str::to_owned)
-        .or_else(|| std::env::var("SPANNER_EMULATOR_HOST").ok());
-    if let Some(ep) = emulator_endpoint {
-        builder = builder
-            .with_endpoint(admin_endpoint_url(&ep))
-            .with_credentials(Anonymous::new().build());
+    if let Some(endpoint) = admin_endpoint {
+        builder = builder.with_endpoint(endpoint.to_owned());
+    }
+    if authentication == AuthenticationMode::Anonymous {
+        builder = builder.with_credentials(Anonymous::new().build());
     }
 
     match tokio::time::timeout(DEFAULT_TIMEOUTS.connect, builder.build()).await {
@@ -853,44 +860,38 @@ async fn create_admin_client(
     }
 }
 
-fn emulator_endpoint(endpoint: Option<&str>) -> Option<String> {
-    endpoint
-        .map(str::to_owned)
-        .or_else(|| std::env::var("SPANNER_EMULATOR_HOST").ok())
-}
-
-fn emulator_admin_endpoint(endpoint: Option<&str>, admin_endpoint: Option<&str>) -> Option<String> {
-    admin_endpoint
-        .map(admin_endpoint_url)
-        .or_else(|| emulator_endpoint(endpoint).map(|ep| admin_endpoint_url(&ep)))
-}
-
 async fn update_database_ddl(
     admin: &DatabaseAdmin,
-    database_path: String,
+    profile: &ConnectionProfile,
     statements: Vec<String>,
-    endpoint: Option<&str>,
-    admin_endpoint: Option<&str>,
 ) -> Result<InternalOperation, SpannerError> {
     let operation_id = new_operation_id();
-    if let Some(admin_endpoint) = emulator_admin_endpoint(endpoint, admin_endpoint) {
+    if profile.endpoint_mode() == EndpointMode::Emulator {
+        let admin_endpoint = profile.admin_endpoint().ok_or_else(|| {
+            SpannerError::Other("Emulator connection profile has no admin endpoint".to_owned())
+        })?;
         return update_emulator_database_ddl(
             &admin_endpoint,
-            &database_path,
+            profile.database_path(),
             statements,
             &operation_id,
         )
         .await;
     }
 
-    update_real_database_ddl(admin, database_path, statements, operation_id).await
+    update_real_database_ddl(
+        admin,
+        profile.database_path().to_owned(),
+        statements,
+        operation_id,
+    )
+    .await
 }
 
 async fn wait_database_operation(
     admin: &DatabaseAdmin,
+    profile: &ConnectionProfile,
     operation_name: &str,
-    endpoint: Option<&str>,
-    admin_endpoint: Option<&str>,
     remaining: Duration,
 ) -> Result<InternalOperation, SpannerError> {
     wait_with_operation_deadline(
@@ -898,7 +899,12 @@ async fn wait_database_operation(
         remaining,
         DEFAULT_TIMEOUTS.operation,
         async {
-            if let Some(admin_endpoint) = emulator_admin_endpoint(endpoint, admin_endpoint) {
+            if profile.endpoint_mode() == EndpointMode::Emulator {
+                let admin_endpoint = profile.admin_endpoint().ok_or_else(|| {
+                    SpannerError::Other(
+                        "Emulator connection profile has no admin endpoint".to_owned(),
+                    )
+                })?;
                 wait_emulator_operation(&admin_endpoint, operation_name).await
             } else {
                 wait_operation(admin, operation_name).await
@@ -1308,6 +1314,10 @@ fn database_named_parameters() -> Vec<(String, LogicalTypeHandle)> {
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
         ),
         (
+            "endpoint_mode".to_string(),
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+        ),
+        (
             "admin_endpoint".to_string(),
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
         ),
@@ -1418,10 +1428,8 @@ where
 
 #[repr(C)]
 pub struct DdlBindData {
-    database_path: String,
+    profile: ConnectionProfile,
     statements: Vec<String>,
-    endpoint: Option<String>,
-    admin_endpoint: Option<String>,
     // DuckDB may call init() more than once for one bound table function.
     // Cache the full init outcome so repeated callers do not resend DDL and
     // see the same success or error from the first execution.
@@ -1447,9 +1455,7 @@ impl VTab for SpannerDdlVTab {
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
         let statements = ddl_statements_from_bind(bind)?;
-        let database_path = bind_utils::resolve_database_path(bind)?;
-        let endpoint = bind_utils::resolve_endpoint(bind);
-        let admin_endpoint = bind_utils::resolve_admin_endpoint(bind);
+        let profile = bind_utils::resolve_connection_profile(bind)?;
 
         bind.add_result_column(
             "operation_name",
@@ -1462,10 +1468,8 @@ impl VTab for SpannerDdlVTab {
         );
 
         Ok(DdlBindData {
-            database_path,
+            profile,
             statements,
-            endpoint,
-            admin_endpoint,
             cached_result: Arc::new(Mutex::new(None)),
         })
     }
@@ -1474,26 +1478,15 @@ impl VTab for SpannerDdlVTab {
         let bind_data = unsafe { &*init.get_bind_data::<DdlBindData>() };
 
         let result = cached_init_result(&bind_data.cached_result, || {
-            let database_path = bind_data.database_path.clone();
+            let profile = bind_data.profile.clone();
             let statements = bind_data.statements.clone();
-            let endpoint = bind_data.endpoint.clone();
-            let admin_endpoint = bind_data.admin_endpoint.clone();
-            let effective_admin_endpoint =
-                emulator_admin_endpoint(endpoint.as_deref(), admin_endpoint.as_deref());
 
             runtime::run(async move {
                 let overall_start = Instant::now();
-                let admin = get_or_create_admin_client(effective_admin_endpoint.as_deref()).await?;
+                let admin = get_or_create_admin_client(&profile).await?;
 
                 let start = Instant::now();
-                let op = update_database_ddl(
-                    &admin,
-                    database_path,
-                    statements,
-                    endpoint.as_deref(),
-                    admin_endpoint.as_deref(),
-                )
-                .await?;
+                let op = update_database_ddl(&admin, &profile, statements).await?;
 
                 let operation_name = op.name.clone();
                 let remaining = DEFAULT_TIMEOUTS
@@ -1502,14 +1495,8 @@ impl VTab for SpannerDdlVTab {
                     .ok_or_else(|| {
                         operation_deadline_error(&operation_name, DEFAULT_TIMEOUTS.operation)
                     })?;
-                let op = wait_database_operation(
-                    &admin,
-                    &operation_name,
-                    endpoint.as_deref(),
-                    admin_endpoint.as_deref(),
-                    remaining,
-                )
-                .await?;
+                let op =
+                    wait_database_operation(&admin, &profile, &operation_name, remaining).await?;
                 if let Some(err) = ddl_operation_error(&op) {
                     return Err(SpannerError::Other(err));
                 }
@@ -1583,10 +1570,8 @@ impl VTab for SpannerDdlVTab {
 
 #[repr(C)]
 pub struct DdlAsyncBindData {
-    database_path: String,
+    profile: ConnectionProfile,
     statements: Vec<String>,
-    endpoint: Option<String>,
-    admin_endpoint: Option<String>,
     // See the comment on `DdlBindData::cached_result`.
     cached_result: Arc<Mutex<Option<Result<DdlAsyncResult, String>>>>,
 }
@@ -1609,9 +1594,7 @@ impl VTab for SpannerDdlAsyncVTab {
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
         let statements = ddl_statements_from_bind(bind)?;
-        let database_path = bind_utils::resolve_database_path(bind)?;
-        let endpoint = bind_utils::resolve_endpoint(bind);
-        let admin_endpoint = bind_utils::resolve_admin_endpoint(bind);
+        let profile = bind_utils::resolve_connection_profile(bind)?;
 
         bind.add_result_column(
             "operation_name",
@@ -1620,10 +1603,8 @@ impl VTab for SpannerDdlAsyncVTab {
         bind.add_result_column("done", LogicalTypeHandle::from(LogicalTypeId::Boolean));
 
         Ok(DdlAsyncBindData {
-            database_path,
+            profile,
             statements,
-            endpoint,
-            admin_endpoint,
             cached_result: Arc::new(Mutex::new(None)),
         })
     }
@@ -1632,24 +1613,13 @@ impl VTab for SpannerDdlAsyncVTab {
         let bind_data = unsafe { &*init.get_bind_data::<DdlAsyncBindData>() };
 
         let result = cached_init_result(&bind_data.cached_result, || {
-            let database_path = bind_data.database_path.clone();
+            let profile = bind_data.profile.clone();
             let statements = bind_data.statements.clone();
-            let endpoint = bind_data.endpoint.clone();
-            let admin_endpoint = bind_data.admin_endpoint.clone();
-            let effective_admin_endpoint =
-                emulator_admin_endpoint(endpoint.as_deref(), admin_endpoint.as_deref());
 
             runtime::run(async move {
-                let admin = get_or_create_admin_client(effective_admin_endpoint.as_deref()).await?;
+                let admin = get_or_create_admin_client(&profile).await?;
 
-                let op = update_database_ddl(
-                    &admin,
-                    database_path,
-                    statements,
-                    endpoint.as_deref(),
-                    admin_endpoint.as_deref(),
-                )
-                .await?;
+                let op = update_database_ddl(&admin, &profile, statements).await?;
                 if let Some(err) = ddl_operation_error(&op) {
                     return Err(SpannerError::Other(err));
                 }
@@ -1718,9 +1688,7 @@ impl VTab for SpannerDdlAsyncVTab {
 
 #[repr(C)]
 pub struct OperationsBindData {
-    database_path: String,
-    endpoint: Option<String>,
-    admin_endpoint: Option<String>,
+    profile: ConnectionProfile,
     filter: Option<String>,
 }
 
@@ -1745,9 +1713,7 @@ impl VTab for SpannerOperationsVTab {
     type InitData = OperationsInitData;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        let database_path = bind_utils::resolve_database_path(bind)?;
-        let endpoint = bind_utils::resolve_endpoint(bind);
-        let admin_endpoint = bind_utils::resolve_admin_endpoint(bind);
+        let profile = bind_utils::resolve_connection_profile(bind)?;
         let filter = bind_utils::get_named_string(bind, "filter");
 
         bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
@@ -1765,31 +1731,19 @@ impl VTab for SpannerOperationsVTab {
             LogicalTypeHandle::from(LogicalTypeId::Varchar),
         );
 
-        Ok(OperationsBindData {
-            database_path,
-            endpoint,
-            admin_endpoint,
-            filter,
-        })
+        Ok(OperationsBindData { profile, filter })
     }
 
     fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
         let bind_data = unsafe { &*init.get_bind_data::<OperationsBindData>() };
 
-        let database_path = bind_data.database_path.clone();
-        let endpoint = bind_data.endpoint.clone();
-        let admin_endpoint = bind_data.admin_endpoint.clone();
+        let profile = bind_data.profile.clone();
         let filter = bind_data.filter.clone();
 
-        let ops = runtime::run(async move {
-            list_database_operations(
-                &database_path,
-                endpoint.as_deref(),
-                admin_endpoint.as_deref(),
-                filter.as_deref(),
-            )
-            .await
-        })??;
+        let ops =
+            runtime::run(
+                async move { list_database_operations(&profile, filter.as_deref()).await },
+            )??;
 
         init.set_max_threads(1);
 
@@ -1915,19 +1869,20 @@ async fn get_real_operation(
 }
 
 async fn list_database_operations(
-    database_path: &str,
-    endpoint: Option<&str>,
-    admin_endpoint: Option<&str>,
+    profile: &ConnectionProfile,
     filter: Option<&str>,
 ) -> Result<Vec<OperationRow>, SpannerError> {
     let listing = async {
         // The emulator only implements google.longrunning.Operations/ListOperations,
         // while real Spanner exposes DatabaseAdmin/ListDatabaseOperations with auth.
-        match emulator_admin_endpoint(endpoint, admin_endpoint) {
-            Some(admin_endpoint) => {
-                list_emulator_database_operations(database_path, &admin_endpoint, filter).await
-            }
-            None => list_real_database_operations(database_path, filter).await,
+        if profile.endpoint_mode() == EndpointMode::Emulator {
+            let admin_endpoint = profile.admin_endpoint().ok_or_else(|| {
+                SpannerError::Other("Emulator connection profile has no admin endpoint".to_owned())
+            })?;
+            list_emulator_database_operations(profile.database_path(), &admin_endpoint, filter)
+                .await
+        } else {
+            list_real_database_operations(profile, filter).await
         }
     };
     let mut operations = match tokio::time::timeout(DEFAULT_TIMEOUTS.list, listing).await {
@@ -1942,21 +1897,21 @@ async fn list_database_operations(
 
     // ListDatabaseOperations is instance-scoped, so keep the table function's
     // per-database contract by trimming unrelated operations client-side.
-    let database_operation_prefix = database_operation_prefix(database_path);
+    let database_operation_prefix = database_operation_prefix(profile.database_path());
     operations.retain(|op| op.name.starts_with(&database_operation_prefix));
 
     Ok(operations.into_iter().map(operation_to_row).collect())
 }
 
 async fn list_real_database_operations(
-    database_path: &str,
+    profile: &ConnectionProfile,
     filter: Option<&str>,
 ) -> Result<Vec<InternalOperation>, SpannerError> {
-    let admin = get_or_create_admin_client(None).await?;
+    let admin = get_or_create_admin_client(profile).await?;
     let request = bounded_admin_request(
         admin
             .list_database_operations()
-            .set_parent(instance_path_from_database_path(database_path)?.to_string())
+            .set_parent(instance_path_from_database_path(profile.database_path())?.to_string())
             .set_filter(filter.unwrap_or_default()),
     );
     let mut pages = request.by_page();
@@ -2127,21 +2082,6 @@ fn record_next_page_token(
     Ok(())
 }
 
-fn admin_endpoint_url(endpoint: &str) -> String {
-    let endpoint = endpoint.trim_end_matches('/');
-    let endpoint = if endpoint.ends_with(":9010") {
-        format!("{}:9020", endpoint.trim_end_matches(":9010"))
-    } else {
-        endpoint.to_string()
-    };
-
-    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        endpoint
-    } else {
-        format!("http://{endpoint}")
-    }
-}
-
 fn database_operation_prefix(database_path: &str) -> String {
     format!("{database_path}/operations/")
 }
@@ -2180,18 +2120,17 @@ mod tests {
     use crate::runtime::test_support::TestRuntimeOwner;
 
     use super::{
-        admin_endpoint_url, admin_request_is_ambiguous, cached_init_result,
-        database_operation_prefix, ddl_operation_error, ddl_statements_from_values,
-        fetch_emulator_operation, gax_submission_signals_are_ambiguous,
-        get_or_create_cached_client, google_error_code_and_message,
-        instance_path_from_database_path, is_emulator_replay_conflict,
-        is_emulator_schema_change_rejection, list_emulator_database_operations_with,
-        lookup_cached_client, operation_from_json, recover_ambiguous_submission,
-        spawn_client_initialization, spawn_client_initialization_with,
-        update_emulator_database_ddl_with, wait_emulator_operation_with,
-        wait_with_operation_deadline, AdminRequestError, ClientCache, ClientCacheLookup,
-        ClientFlight, DdlTimeouts, EmulatorResponse, EmulatorTransport, FlightCleanupGuard,
-        HttpFuture,
+        admin_request_is_ambiguous, cached_init_result, database_operation_prefix,
+        ddl_operation_error, ddl_statements_from_values, fetch_emulator_operation,
+        gax_submission_signals_are_ambiguous, get_or_create_cached_client,
+        google_error_code_and_message, instance_path_from_database_path,
+        is_emulator_replay_conflict, is_emulator_schema_change_rejection,
+        list_emulator_database_operations_with, lookup_cached_client, operation_from_json,
+        recover_ambiguous_submission, spawn_client_initialization,
+        spawn_client_initialization_with, update_emulator_database_ddl_with,
+        wait_emulator_operation_with, wait_with_operation_deadline, AdminRequestError, ClientCache,
+        ClientCacheLookup, ClientFlight, DdlTimeouts, EmulatorResponse, EmulatorTransport,
+        FlightCleanupGuard, HttpFuture,
     };
 
     struct DropSignal(Option<SyncSender<()>>);
@@ -2679,22 +2618,6 @@ mod tests {
         assert_eq!(
             database_operation_prefix("projects/p/instances/i/databases/d"),
             "projects/p/instances/i/databases/d/operations/"
-        );
-    }
-
-    #[test]
-    fn test_admin_endpoint_url_maps_default_emulator_port_and_trims_slash() {
-        assert_eq!(
-            admin_endpoint_url("localhost:9010/"),
-            "http://localhost:9020"
-        );
-        assert_eq!(
-            admin_endpoint_url("http://127.0.0.1:9010/"),
-            "http://127.0.0.1:9020"
-        );
-        assert_eq!(
-            admin_endpoint_url("localhost:19020"),
-            "http://localhost:19020"
         );
     }
 

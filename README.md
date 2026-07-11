@@ -129,14 +129,26 @@ For local development with end-user credentials, install the [Google Cloud SDK](
 gcloud auth application-default login
 ```
 
-When using the Spanner emulator, no authentication is required. Either set the `SPANNER_EMULATOR_HOST` environment variable or pass `endpoint` directly:
+Connection targets use an `endpoint_mode` profile. The default profile uses the official Spanner endpoint with ADC and the SDK's default TLS. The other profiles are:
+
+| Mode | Credentials and transport | Endpoint source |
+|------|---------------------------|-----------------|
+| `default` | ADC and default TLS | SDK default; no `endpoint` |
+| `emulator` | Anonymous and plaintext by default | `endpoint`, or `SPANNER_EMULATOR_HOST` |
+| `custom` | ADC and HTTPS | Required `endpoint` |
+| `omni` | Anonymous and HTTPS by default; explicit `http://` is allowed | Required `endpoint` |
+
+With no explicit `endpoint_mode`, an `endpoint` or `SPANNER_EMULATOR_HOST` selects `emulator`. This preserves endpoint-only compatibility. In emulator mode, an explicit `endpoint` takes precedence over `SPANNER_EMULATOR_HOST`.
+
+For emulator access, no authentication is required. Either set the environment variable or pass `endpoint` directly:
 
 ```bash
 export SPANNER_EMULATOR_HOST=localhost:9010
 ```
 
-Passing `endpoint` explicitly switches the client to emulator-style behavior (plaintext, no auth). Use `endpoint` for the emulator or other local test endpoints; for real Spanner, omit it and rely on ADC.
-DDL helpers use the emulator's REST admin endpoint. With the default emulator ports, `localhost:9010` maps to `localhost:9020` automatically; when gRPC and REST are exposed on unrelated host ports, pass `admin_endpoint` or set `spanner_admin_endpoint`.
+Use `endpoint_mode := 'emulator'` when the profile should be explicit. `custom` requires an HTTPS endpoint and ADC. `omni` uses anonymous credentials and HTTPS unless its endpoint explicitly starts with `http://`. Explicit non-emulator modes (`default`, `custom`, and `omni`) reject `SPANNER_EMULATOR_HOST`; unset it before selecting one. Omni TLS uses the system trust store. Custom CA certificates and mTLS are not currently configurable through the pinned official Rust client builder.
+
+`admin_endpoint` (or `spanner_admin_endpoint`) overrides the admin endpoint used by DDL and operation helpers. Emulator mode preserves the data endpoint's scheme and maps the conventional data port `9010` to `9020`; custom and Omni modes use the data endpoint for admin requests by default. Custom admin requests use ADC and HTTPS, while Omni admin requests are anonymous and use the data endpoint's scheme. An explicit admin endpoint must use HTTPS for authenticated `default` and `custom` profiles. Real Spanner uses its authenticated Database Admin client when no emulator admin endpoint applies.
 
 ## Getting Started
 
@@ -198,13 +210,40 @@ export SPANNER_EMULATOR_HOST=localhost:9010
 SET spanner_database_path = 'projects/test/instances/test/databases/test';
 SELECT * FROM spanner_query('SELECT * FROM Users');
 
--- Or pass endpoint explicitly
+-- Or make the emulator profile explicit
 SELECT * FROM spanner_query(
     'SELECT * FROM Users',
     database_path := 'projects/test/instances/test/databases/test',
+    endpoint_mode := 'emulator',
     endpoint := 'localhost:9010'
 );
 ```
+
+For a custom authenticated endpoint:
+
+```sql
+SELECT * FROM spanner_query(
+    'SELECT * FROM Users',
+    database_path := 'projects/p/instances/i/databases/d',
+    endpoint_mode := 'custom',
+    endpoint := 'spanner.example.com:443'
+);
+```
+
+For Spanner Omni, select anonymous authentication explicitly. DDL and operation
+helpers use the same endpoint unless `admin_endpoint` is provided:
+
+```sql
+SET spanner_database_path = 'projects/p/instances/i/databases/d';
+SET spanner_endpoint_mode = 'omni';
+SET spanner_endpoint = 'omni.example.com:443';
+
+SELECT * FROM spanner_query('SELECT * FROM Users');
+```
+
+Repository CI does not provision a Spanner Omni deployment. Before production
+rollout, validate query and DDL operations against the target deployment,
+including its system trust-store and TLS configuration.
 
 ## Table Functions
 
@@ -274,7 +313,8 @@ Session-level defaults can be set via `SET` statements. These are used when the 
 | `spanner_database` | VARCHAR | Default Spanner database ID |
 | `spanner_database_path` | VARCHAR | Default full database resource path (`projects/P/instances/I/databases/D`) |
 | `spanner_endpoint` | VARCHAR | Default gRPC endpoint |
-| `spanner_admin_endpoint` | VARCHAR | Default admin REST endpoint for emulator DDL/operations |
+| `spanner_endpoint_mode` | VARCHAR | Default connection profile: `default`, `emulator`, `custom`, or `omni` |
+| `spanner_admin_endpoint` | VARCHAR | Default admin endpoint for DDL/operations; mode determines credentials and default scheme |
 
 ### Database Resolution
 
@@ -311,7 +351,8 @@ Both functions accept the following named parameters:
 | `project` | VARCHAR | (config) | Google Cloud project ID |
 | `instance` | VARCHAR | (config) | Spanner instance ID |
 | `database` | VARCHAR | (config) | Spanner database ID |
-| `endpoint` | VARCHAR | (config) | Custom gRPC endpoint (e.g., `localhost:9010` for the emulator) |
+| `endpoint` | VARCHAR | (config) | Profile endpoint; emulator uses plaintext by default, custom uses HTTPS with ADC, and Omni uses HTTPS by default |
+| `endpoint_mode` | VARCHAR | (config) | `default`, `emulator`, `custom`, or `omni`; without it, `endpoint`/`SPANNER_EMULATOR_HOST` selects `emulator` |
 | `parallelism_mode` | VARCHAR | `off` | `'auto'` (pre-row fallback), `'required'` (no fallback), or `'off'` (single API only) |
 | `use_parallelism` | BOOLEAN | `false` | Legacy compatibility option: `true` maps to `'auto'`, `false` maps to `'off'` |
 | `use_data_boost` | BOOLEAN | `false` | Enable [Data Boost](https://cloud.google.com/spanner/docs/databoost/databoost-overview); requires `parallelism_mode := 'required'` |
@@ -395,7 +436,15 @@ An optional `filter` parameter can be used:
 SELECT * FROM spanner_operations(filter := 'done=true');
 ```
 
-All DDL functions accept the same database identification parameters as `spanner_query` (`database_path`, `project`, `instance`, `database`, `endpoint`). They also accept `admin_endpoint` for emulator setups where the REST admin endpoint cannot be derived from `endpoint`.
+All DDL functions accept the same database identification parameters as `spanner_query` and the following endpoint parameters:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `endpoint` | VARCHAR | (config) | Data endpoint; its interpretation follows `endpoint_mode` |
+| `endpoint_mode` | VARCHAR | (config) | `default`, `emulator`, `custom`, or `omni` |
+| `admin_endpoint` | VARCHAR | (config) | Override the mode-derived admin endpoint for DDL and operation helpers |
+
+See [Authentication](#authentication) for admin credentials, schemes, and emulator port mapping.
 
 #### DDL and operation timeout contract
 
@@ -427,7 +476,8 @@ Options:
 | `project` | VARCHAR | (config) | Google Cloud project ID |
 | `instance` | VARCHAR | (config) | Spanner instance ID |
 | `database` | VARCHAR | (config) | Spanner database ID |
-| `endpoint` | VARCHAR | (config) | Custom gRPC endpoint |
+| `endpoint` | VARCHAR | (config) | Profile endpoint; emulator is plaintext by default, custom is HTTPS with ADC, and Omni is HTTPS by default |
+| `endpoint_mode` | VARCHAR | (config) | `default`, `emulator`, `custom`, or `omni` |
 | `dialect` | VARCHAR | (auto-detected) | Database dialect: `'googlesql'` or `'postgresql'`; bypasses metadata discovery |
 | `mode` | VARCHAR | `insert_or_update` | Mutation mode: `insert`, `update`, `insert_or_update`, or `replace` |
 | `batch_size` | VARCHAR | `1000` | Rows per independent commit (1 to 80,000) |
@@ -701,7 +751,8 @@ This extension registers the following names into the global DuckDB namespace.
 | `spanner_database` | VARCHAR | Default Spanner database ID |
 | `spanner_database_path` | VARCHAR | Default full database resource path |
 | `spanner_endpoint` | VARCHAR | Default gRPC endpoint |
-| `spanner_admin_endpoint` | VARCHAR | Default admin REST endpoint for emulator DDL/operations |
+| `spanner_endpoint_mode` | VARCHAR | Default connection profile |
+| `spanner_admin_endpoint` | VARCHAR | Default admin endpoint for DDL/operations |
 
 ### Convenience Macro Pattern
 
@@ -711,6 +762,7 @@ With config options, convenience macros are often unnecessary. Just set your def
 SET spanner_project = 'myproj';
 SET spanner_instance = 'myinst';
 SET spanner_database = 'mydb';
+SET spanner_endpoint_mode = 'emulator';
 SET spanner_endpoint = 'localhost:9010';
 
 SELECT * FROM spanner_query('SELECT * FROM Users');
@@ -728,11 +780,13 @@ CREATE MACRO my_query(
     use_data_boost := NULL, max_parallelism := NULL,
     exact_staleness_secs := NULL, max_staleness_secs := NULL,
     read_timestamp := NULL, min_read_timestamp := NULL,
+    endpoint_mode := NULL,
     priority := NULL
 ) AS TABLE
 SELECT * FROM spanner_query(
     sql,
     database_path := 'projects/myproj/instances/myinst/databases/mydb',
+    endpoint_mode := endpoint_mode,
     endpoint := 'localhost:9010',
     params := params,
     use_parallelism := use_parallelism,

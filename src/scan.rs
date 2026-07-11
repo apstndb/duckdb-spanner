@@ -14,14 +14,14 @@ use tokio_util::sync::CancellationToken;
 
 use google_cloud_spanner_admin_database_v1::model::DatabaseDialect;
 
+use crate::connection::ConnectionProfile;
 use crate::error::SpannerError;
 use crate::schema::ColumnInfo;
 use crate::{client, convert, runtime, schema, streaming, types, vector_size};
 
 pub struct ScanBindData {
-    database: String,
+    profile: ConnectionProfile,
     table: String,
-    endpoint: Option<String>,
     parallelism_mode: crate::bind_utils::ParallelismMode,
     use_data_boost: bool,
     max_parallelism: Option<i64>,
@@ -44,9 +44,7 @@ impl VTab for SpannerScanVTab {
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
         let table = bind.get_parameter(0).to_string();
-        let database = crate::bind_utils::resolve_database_path(bind)?;
-
-        let endpoint = crate::bind_utils::resolve_endpoint(bind);
+        let profile = crate::bind_utils::resolve_connection_profile(bind)?;
         let legacy_use_parallelism =
             crate::bind_utils::get_named_bool(bind, "use_parallelism", false);
         let parallelism_mode = crate::bind_utils::resolve_parallelism_mode(
@@ -78,20 +76,11 @@ impl VTab for SpannerScanVTab {
         // Discover table schema from INFORMATION_SCHEMA
         // If dialect is specified, uses correct param syntax directly.
         // If not, auto-detects via INFORMATION_SCHEMA.DATABASE_OPTIONS.
-        let schema_database = database.clone();
-        let schema_endpoint = endpoint.clone();
+        let schema_profile = profile.clone();
         let schema_table = table.clone();
         let columns = runtime::run(async move {
-            let client =
-                client::get_or_create_client(&schema_database, schema_endpoint.as_deref()).await?;
-            schema::discover_table_schema(
-                &client,
-                &schema_table,
-                dialect,
-                &schema_database,
-                schema_endpoint.as_deref(),
-            )
-            .await
+            let client = client::get_or_create_client(&schema_profile).await?;
+            schema::discover_table_schema(&client, &schema_table, dialect, &schema_profile).await
         })??;
 
         // Register output columns with DuckDB
@@ -101,9 +90,8 @@ impl VTab for SpannerScanVTab {
         }
 
         Ok(ScanBindData {
-            database,
+            profile,
             table,
-            endpoint,
             parallelism_mode,
             use_data_boost,
             max_parallelism,
@@ -132,8 +120,7 @@ impl VTab for SpannerScanVTab {
             .collect();
 
         // Clone bind data fields for the spawned task ('static requirement)
-        let database = bind_data.database.clone();
-        let endpoint = bind_data.endpoint.clone();
+        let profile = bind_data.profile.clone();
         let table = bind_data.table.clone();
         let index = bind_data.index.clone();
         let parallelism_mode = bind_data.parallelism_mode;
@@ -148,7 +135,7 @@ impl VTab for SpannerScanVTab {
                 let rows_delivered = Arc::new(AtomicBool::new(false));
                 let client = tokio::select! {
                     _ = cancellation.cancelled() => return Ok(()),
-                    client = client::get_or_create_client(&database, endpoint.as_deref()) => client?,
+                    client = client::get_or_create_client(&profile) => client?,
                 };
 
                 let col_refs: Vec<&str> = column_names.iter().map(|s| s.as_str()).collect();
@@ -264,6 +251,10 @@ impl VTab for SpannerScanVTab {
             ),
             (
                 "endpoint".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            ),
+            (
+                "endpoint_mode".to_string(),
                 LogicalTypeHandle::from(LogicalTypeId::Varchar),
             ),
             // Read options

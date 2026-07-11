@@ -8,6 +8,7 @@ use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use tokio::sync::OnceCell;
 
 use crate::cache::LruCache;
+use crate::connection::{AuthenticationMode, ConnectionIdentity, ConnectionProfile};
 use crate::error::SpannerError;
 use crate::runtime;
 
@@ -39,7 +40,7 @@ const SESSION_CREATE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 /// instead of each racing bind building its own client and leaking sessions.
 type ClientSlot = Arc<OnceCell<Arc<DatabaseClient>>>;
 
-static CLIENT_CACHE: LazyLock<Mutex<LruCache<String, ClientSlot>>> =
+static CLIENT_CACHE: LazyLock<Mutex<LruCache<ConnectionIdentity, ClientSlot>>> =
     LazyLock::new(|| Mutex::new(LruCache::new(CACHE_CAPACITY)));
 
 /// Outcome of waiting for an `Arc` to become uniquely owned.
@@ -86,35 +87,20 @@ async fn close_evicted(slot: ClientSlot, grace: Duration) {
     };
 }
 
-/// Build the cache key used to identify a `(database, endpoint)` pair.
-///
-/// Shared by the client cache below and the dialect cache in `schema.rs` so a
-/// database's detected dialect can be looked up under the same identity as
-/// its cached client.
-pub fn cache_key(database: &str, endpoint: Option<&str>) -> String {
-    match endpoint {
-        Some(ep) => format!("{database}@{ep}"),
-        None => database.to_string(),
-    }
-}
-
 /// Get or create a Spanner client.
 ///
-/// - `endpoint: None` → default behavior (uses `SPANNER_EMULATOR_HOST` env var if set, otherwise real Spanner with auth)
-/// - `endpoint: Some("host:port")` → connects to the given endpoint without auth (emulator mode)
-///
-/// Clients are cached by `(database, endpoint)` so both emulator and real connections can coexist.
+/// Clients are cached by the complete resolved identity so targets sharing an
+/// endpoint cannot accidentally share credentials or transport semantics.
 /// The cache is bounded ([`CACHE_CAPACITY`]) with LRU eviction; evicted clients are closed in the
 /// background once no in-flight work references them.
 pub async fn get_or_create_client(
-    database: &str,
-    endpoint: Option<&str>,
+    profile: &ConnectionProfile,
 ) -> Result<Arc<DatabaseClient>, SpannerError> {
-    let cache_key = cache_key(database, endpoint);
+    let cache_key = profile.identity();
 
     // Look up (or create) the slot for this key under the std mutex. The lock is
-    // released before any `.await` below — bind runs on `block_on`, so holding a
-    // std mutex across an await point could deadlock the runtime.
+    // released before any `.await` below; holding a std mutex across async
+    // client initialization could deadlock concurrent callers.
     let (slot, evicted) = {
         let mut cache = CLIENT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         cache.get_or_insert_with(cache_key.clone(), || Arc::new(OnceCell::new()))
@@ -129,41 +115,33 @@ pub async fn get_or_create_client(
     // race a waiting caller that has already started retrying initialization,
     // creating two clients for one key. Tokio OnceCell retries failures on the
     // same slot, and normal LRU eviction bounds unreachable identities.
-    let client = slot
-        .get_or_try_init(|| create_client(database, endpoint))
-        .await?;
+    let client = slot.get_or_try_init(|| create_client(profile)).await?;
     Ok(Arc::clone(client))
 }
 
 /// Build a brand-new Spanner client for the given target.
-async fn create_client(
-    database: &str,
-    endpoint: Option<&str>,
-) -> Result<Arc<DatabaseClient>, SpannerError> {
-    match tokio::time::timeout(
-        CLIENT_CONNECT_TIMEOUT,
-        create_client_inner(database, endpoint),
-    )
-    .await
-    {
+async fn create_client(profile: &ConnectionProfile) -> Result<Arc<DatabaseClient>, SpannerError> {
+    match tokio::time::timeout(CLIENT_CONNECT_TIMEOUT, create_client_inner(profile)).await {
         Ok(result) => result,
         Err(_) => Err(SpannerError::Other(format!(
-            "Timed out connecting to Spanner after {}s (database={database}, endpoint={})",
+            "Timed out connecting to Spanner after {}s (database={}, endpoint={}, mode={:?})",
             CLIENT_CONNECT_TIMEOUT.as_secs(),
-            endpoint.unwrap_or("<default>")
+            profile.database_path(),
+            profile.data_endpoint().unwrap_or("<default>"),
+            profile.endpoint_mode(),
         ))),
     }
 }
 
 async fn create_client_inner(
-    database: &str,
-    endpoint: Option<&str>,
+    profile: &ConnectionProfile,
 ) -> Result<Arc<DatabaseClient>, SpannerError> {
     let mut builder = Spanner::builder();
-    if let Some(ep) = endpoint {
-        builder = builder
-            .with_endpoint(endpoint_url(ep))
-            .with_credentials(Anonymous::new().build());
+    if let Some(endpoint) = profile.data_endpoint() {
+        builder = builder.with_endpoint(endpoint);
+    }
+    if profile.authentication() == AuthenticationMode::Anonymous {
+        builder = builder.with_credentials(Anonymous::new().build());
     }
 
     let spanner = builder.build().await?;
@@ -179,19 +157,11 @@ async fn create_client_inner(
     );
 
     let client = spanner
-        .database_client(database)
+        .database_client(profile.database_path())
         .with_request_options(session_options)
         .build()
         .await?;
     Ok(Arc::new(client))
-}
-
-pub(crate) fn endpoint_url(endpoint: &str) -> String {
-    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        endpoint.to_string()
-    } else {
-        format!("http://{endpoint}")
-    }
 }
 
 #[cfg(test)]
