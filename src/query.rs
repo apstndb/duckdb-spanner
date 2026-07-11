@@ -68,9 +68,14 @@ impl VTab for SpannerQueryVTab {
         let params_json = crate::bind_utils::get_named_string(bind, "params");
 
         // Discover output schema
-        let columns = runtime::block_on(async {
-            let client = client::get_or_create_client(&database, endpoint.as_deref()).await?;
-            schema::discover_query_schema(&client, &sql, params_json.as_deref()).await
+        let schema_database = database.clone();
+        let schema_endpoint = endpoint.clone();
+        let schema_sql = sql.clone();
+        let schema_params_json = params_json.clone();
+        let columns = runtime::run(async move {
+            let client =
+                client::get_or_create_client(&schema_database, schema_endpoint.as_deref()).await?;
+            schema::discover_query_schema(&client, &schema_sql, schema_params_json.as_deref()).await
         })??;
 
         // Register output columns with DuckDB

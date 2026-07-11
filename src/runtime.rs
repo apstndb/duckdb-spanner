@@ -1,18 +1,56 @@
-use std::sync::OnceLock;
+use std::cell::Cell;
+use std::future::Future;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::{mpsc as std_mpsc, Mutex, OnceLock};
+use std::thread::JoinHandle as ThreadJoinHandle;
+use std::time::{Duration, Instant};
+
 use tokio::runtime::Runtime;
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::error::SpannerError;
 
-static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
+type RuntimeJob = Box<dyn FnOnce(&mut RuntimeContext) + Send + 'static>;
+
+enum RuntimeRequest {
+    Run(RuntimeJob),
+    Shutdown {
+        deadline: Instant,
+        result: std_mpsc::SyncSender<Result<(), String>>,
+    },
+}
+
+struct RuntimeOwner {
+    requests: std_mpsc::Sender<RuntimeRequest>,
+    thread: Mutex<Option<ThreadJoinHandle<()>>>,
+}
+
+struct RuntimeContext {
+    runtime: Runtime,
+    tasks: TaskTracker,
+    abort_handles: Vec<AbortHandle>,
+}
+
+static RUNTIME_OWNER: OnceLock<Result<RuntimeOwner, String>> = OnceLock::new();
+
+// Tokio task-locals are not inherited by spawned child tasks. Marking the
+// dedicated runtime's worker threads rejects reentry from all descendants too.
+thread_local! {
+    static EXTENSION_RUNTIME_THREAD: Cell<bool> = const { Cell::new(false) };
+}
 
 // Cap at 4 threads — we don't need many since this is mostly I/O (gRPC).
 // Shared with query.rs/scan.rs so concurrent partition execution doesn't
 // oversubscribe the runtime's worker threads.
 const MAX_WORKER_THREADS: usize = 4;
+const OWNER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const OWNER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
-// DuckDB's C extension API has no unload hook, so the Tokio runtime and cached Spanner
-// clients are intentionally leaked for the process lifetime.
+// DuckDB's C extension API has no unload hook, so the global owner and cached Spanner
+// clients live for the process lifetime. RuntimeOwner still has a complete shutdown
+// path for tests and any future host lifecycle hook.
 
 /// Number of worker threads the shared Tokio runtime is (or will be) built with.
 pub fn worker_threads() -> usize {
@@ -31,38 +69,295 @@ pub fn partition_worker_limit(returned_partitions: usize, max_parallelism: Optio
         .min(returned_partitions)
 }
 
-fn get_or_init_runtime() -> Result<&'static Runtime, SpannerError> {
-    if let Some(rt) = TOKIO_RUNTIME.get() {
-        return Ok(rt);
+impl RuntimeContext {
+    fn spawn<F>(&mut self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.abort_handles.retain(|handle| !handle.is_finished());
+        let task = self.tasks.spawn_on(future, self.runtime.handle());
+        self.abort_handles.push(task.abort_handle());
+        task
     }
 
-    let rt = {
-        let mut builder = tokio::runtime::Builder::new_multi_thread();
-        builder.worker_threads(worker_threads());
-        builder.enable_all();
-        builder
-            .build()
-            .map_err(|e| SpannerError::Other(format!("Failed to create Tokio runtime: {e}")))?
-    };
+    fn shutdown(mut self, deadline: Instant) -> Result<(), SpannerError> {
+        self.tasks.close();
+        self.abort_handles.retain(|handle| !handle.is_finished());
+        for handle in &self.abort_handles {
+            handle.abort();
+        }
 
-    // Another thread may have initialized it between our get() and here;
-    // OnceLock::set returns Err(value) if already set, which is fine.
-    let _ = TOKIO_RUNTIME.set(rt);
-    Ok(TOKIO_RUNTIME.get().unwrap())
+        // The waiter is deliberately untracked: waiting for the tracker from a
+        // tracked task would keep the tracker non-empty forever.
+        let tracker = self.tasks.clone();
+        let (drained_tx, drained_rx) = std_mpsc::sync_channel(1);
+        self.runtime.spawn(async move {
+            tracker.wait().await;
+            let _ = drained_tx.send(());
+        });
+        let drained = matches!(drained_rx.recv_timeout(remaining_until(deadline)), Ok(()));
+        self.runtime.shutdown_timeout(remaining_until(deadline));
+
+        if drained {
+            Ok(())
+        } else {
+            Err(SpannerError::Other(
+                "Runtime owner shutdown timed out while draining tasks".to_string(),
+            ))
+        }
+    }
 }
 
-pub fn block_on<F: std::future::Future>(future: F) -> Result<F::Output, SpannerError> {
-    let rt = get_or_init_runtime()?;
-    Ok(rt.block_on(future))
+impl RuntimeOwner {
+    fn start() -> Result<Self, SpannerError> {
+        Self::start_with_worker_threads(worker_threads())
+    }
+
+    fn start_with_worker_threads(worker_threads: usize) -> Result<Self, SpannerError> {
+        let (request_tx, request_rx) = std_mpsc::channel();
+        let (startup_tx, startup_rx) = std_mpsc::sync_channel(1);
+        let thread = std::thread::Builder::new()
+            .name("duckdb-spanner-runtime-owner".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(worker_threads)
+                    .on_thread_start(|| EXTENSION_RUNTIME_THREAD.set(true))
+                    .on_thread_stop(|| EXTENSION_RUNTIME_THREAD.set(false))
+                    .enable_all()
+                    .build();
+                let runtime = match runtime {
+                    Ok(runtime) => {
+                        let _ = startup_tx.send(Ok::<(), String>(()));
+                        runtime
+                    }
+                    Err(error) => {
+                        let _ = startup_tx
+                            .send(Err(format!("Failed to create Tokio runtime: {error}")));
+                        return;
+                    }
+                };
+
+                let mut context = RuntimeContext {
+                    runtime,
+                    tasks: TaskTracker::new(),
+                    abort_handles: Vec::new(),
+                };
+                let mut shutdown_request = None;
+                while let Ok(request) = request_rx.recv() {
+                    match request {
+                        RuntimeRequest::Run(job) => {
+                            if catch_unwind(AssertUnwindSafe(|| job(&mut context))).is_err() {
+                                // Each job owns its response sender, so unwinding drops
+                                // it and wakes the caller with an explicit bridge error.
+                                eprintln!("[duckdb-spanner] runtime owner request panicked");
+                            }
+                        }
+                        RuntimeRequest::Shutdown { deadline, result } => {
+                            shutdown_request = Some((deadline, result));
+                            break;
+                        }
+                    }
+                }
+
+                let (deadline, result_tx) = shutdown_request
+                    .map(|(deadline, result)| (deadline, Some(result)))
+                    .unwrap_or_else(|| (Instant::now() + OWNER_SHUTDOWN_TIMEOUT, None));
+                let result = context
+                    .shutdown(deadline)
+                    .map_err(|error| error.to_string());
+                if let Some(result_tx) = result_tx {
+                    let _ = result_tx.send(result);
+                }
+            })
+            .map_err(|error| {
+                SpannerError::Other(format!("Failed to start runtime owner thread: {error}"))
+            })?;
+
+        match startup_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                requests: request_tx,
+                thread: Mutex::new(Some(thread)),
+            }),
+            Ok(Err(error)) => {
+                let _ = thread.join();
+                Err(SpannerError::Other(error))
+            }
+            Err(error) => {
+                let _ = thread.join();
+                Err(SpannerError::Other(format!(
+                    "Runtime owner stopped during startup: {error}"
+                )))
+            }
+        }
+    }
+
+    fn submit(&self, request: RuntimeRequest) -> Result<(), SpannerError> {
+        self.requests
+            .send(request)
+            .map_err(|_| SpannerError::Other("Runtime owner is not available".to_string()))
+    }
+
+    fn run<F>(&self, future: F) -> Result<F::Output, SpannerError>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        if EXTENSION_RUNTIME_THREAD.get() {
+            return Err(SpannerError::Other(
+                "runtime::run cannot be called from an extension-owned runtime task".to_string(),
+            ));
+        }
+
+        let (response_tx, response_rx) = std_mpsc::sync_channel(1);
+        let cancellation = CancellationToken::new();
+        let request_cancellation = cancellation.clone();
+        self.submit(RuntimeRequest::Run(Box::new(move |context| {
+            let mut task = context.spawn(future);
+            let fallback_abort = task.abort_handle();
+            let reporter = async move {
+                let result = tokio::select! {
+                    biased;
+                    _ = request_cancellation.cancelled() => {
+                        task.abort();
+                        let _ = task.await;
+                        Err(SpannerError::Other("Runtime request was cancelled".to_string()))
+                    }
+                    result = &mut task => join_result(result),
+                };
+                let _ = response_tx.send(result);
+            };
+            if catch_unwind(AssertUnwindSafe(|| context.spawn(reporter))).is_err() {
+                fallback_abort.abort();
+            }
+        })))?;
+
+        match response_rx.recv() {
+            Ok(result) => result,
+            Err(_) => {
+                cancellation.cancel();
+                Err(SpannerError::Other(
+                    "Runtime request ended without a response".to_string(),
+                ))
+            }
+        }
+    }
+
+    fn spawn<F>(&self, future: F) -> Result<JoinHandle<F::Output>, SpannerError>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let (response_tx, response_rx) = std_mpsc::sync_channel(1);
+        self.submit(RuntimeRequest::Run(Box::new(move |context| {
+            let result = catch_unwind(AssertUnwindSafe(|| context.spawn(future))).map_err(|_| {
+                SpannerError::Other("Runtime owner panicked while spawning a task".to_string())
+            });
+            let _ = response_tx.send(result);
+        })))?;
+        response_rx.recv().map_err(|_| {
+            SpannerError::Other("Runtime spawn request ended without a response".to_string())
+        })?
+    }
+
+    fn shutdown(&self) -> Result<(), SpannerError> {
+        self.shutdown_with_timeout(OWNER_SHUTDOWN_TIMEOUT)
+    }
+
+    fn shutdown_with_timeout(&self, timeout: Duration) -> Result<(), SpannerError> {
+        let thread = self
+            .thread
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        let Some(thread) = thread else {
+            return Ok(());
+        };
+
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(Instant::now);
+        let (result_tx, result_rx) = std_mpsc::sync_channel(1);
+        self.submit(RuntimeRequest::Shutdown {
+            deadline,
+            result: result_tx,
+        })?;
+
+        while !thread.is_finished() {
+            let remaining = remaining_until(deadline);
+            if remaining.is_zero() {
+                if thread.is_finished() {
+                    break;
+                }
+                return Err(SpannerError::Other(format!(
+                    "Runtime owner shutdown timed out after {}ms",
+                    timeout.as_millis()
+                )));
+            }
+            std::thread::sleep(remaining.min(OWNER_SHUTDOWN_POLL_INTERVAL));
+        }
+
+        // Joining is non-blocking now: is_finished was observed within the
+        // shared deadline. A timed-out path returns above and drops the handle.
+        thread.join().map_err(|_| {
+            SpannerError::Other("Runtime owner thread panicked during shutdown".to_string())
+        })?;
+        match result_rx.try_recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(SpannerError::Other(error)),
+            Err(std_mpsc::TryRecvError::Empty | std_mpsc::TryRecvError::Disconnected) => {
+                Err(SpannerError::Other(
+                    "Runtime owner stopped without reporting shutdown status".to_string(),
+                ))
+            }
+        }
+    }
 }
 
-pub fn spawn<F>(future: F) -> Result<tokio::task::JoinHandle<F::Output>, SpannerError>
+impl Drop for RuntimeOwner {
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}
+
+fn get_or_init_owner() -> Result<&'static RuntimeOwner, SpannerError> {
+    match RUNTIME_OWNER.get_or_init(|| RuntimeOwner::start().map_err(|error| error.to_string())) {
+        Ok(owner) => Ok(owner),
+        Err(error) => Err(SpannerError::Other(error.clone())),
+    }
+}
+
+fn join_result<T>(result: Result<T, tokio::task::JoinError>) -> Result<T, SpannerError> {
+    match result {
+        Ok(output) => Ok(output),
+        Err(error) if error.is_panic() => Err(SpannerError::Other(format!(
+            "Runtime task panicked: {error}"
+        ))),
+        Err(error) => Err(SpannerError::Other(format!(
+            "Runtime task was cancelled: {error}"
+        ))),
+    }
+}
+
+fn remaining_until(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
+/// Run async work on the extension-owned runtime and wait through std synchronization.
+pub fn run<F>(future: F) -> Result<F::Output, SpannerError>
 where
-    F: std::future::Future + Send + 'static,
+    F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    let rt = get_or_init_runtime()?;
-    Ok(rt.spawn(future))
+    get_or_init_owner()?.run(future)
+}
+
+pub fn spawn<F>(future: F) -> Result<JoinHandle<F::Output>, SpannerError>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    get_or_init_owner()?.spawn(future)
 }
 
 /// Await an operation unless stream cancellation has already been requested.
@@ -167,9 +462,96 @@ where
 }
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    use std::future::Future;
+    use std::time::{Duration, Instant};
+
+    use tokio::task::AbortHandle;
+
+    use super::RuntimeOwner;
+    use crate::error::SpannerError;
+
+    const CHILD_TEST: &str = "DUCKDB_SPANNER_RUNTIME_CHILD_TEST";
+    const CHILD_MARKER: &str = "DUCKDB_SPANNER_RUNTIME_CHILD_MARKER";
+
+    pub struct TestRuntimeOwner(RuntimeOwner);
+
+    impl TestRuntimeOwner {
+        pub fn start(worker_threads: usize) -> Result<Self, SpannerError> {
+            RuntimeOwner::start_with_worker_threads(worker_threads).map(Self)
+        }
+
+        pub fn spawn_detached<F>(&self, future: F) -> Result<AbortHandle, SpannerError>
+        where
+            F: Future<Output = ()> + Send + 'static,
+        {
+            let task = self.0.spawn(future)?;
+            let abort_handle = task.abort_handle();
+            drop(task);
+            Ok(abort_handle)
+        }
+
+        pub fn shutdown(&self, timeout: Duration) -> Result<(), SpannerError> {
+            self.0.shutdown_with_timeout(timeout)
+        }
+    }
+
+    pub fn is_child(test_name: &str) -> bool {
+        std::env::var(CHILD_TEST).is_ok_and(|value| value == test_name)
+    }
+
+    pub fn finish_child() {
+        std::fs::write(std::env::var(CHILD_MARKER).unwrap(), "ok").unwrap();
+    }
+
+    pub fn run(test_name: &str, timeout: Duration) {
+        let marker = std::env::temp_dir().join(format!(
+            "duckdb-spanner-runtime-test-{}-{}",
+            std::process::id(),
+            test_name.replace("::", "-")
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .env(CHILD_TEST, test_name)
+            .env(CHILD_MARKER, &marker)
+            .spawn()
+            .expect("failed to start runtime regression subprocess");
+
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            if let Some(status) = child
+                .try_wait()
+                .expect("failed to poll runtime regression subprocess")
+            {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("runtime regression subprocess timed out: {test_name}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        assert!(
+            status.success(),
+            "runtime regression subprocess failed: {test_name} ({status})"
+        );
+        let marker_contents = std::fs::read_to_string(&marker)
+            .expect("runtime regression child did not write its completion marker");
+        let _ = std::fs::remove_file(marker);
+        assert_eq!(marker_contents, "ok");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{sync_channel, SyncSender};
     use std::sync::Arc;
     use std::task::Poll;
     use std::time::Duration;
@@ -177,11 +559,29 @@ mod tests {
 
     struct DropSignal(Option<oneshot::Sender<()>>);
 
+    struct StdDropSignal(Option<SyncSender<()>>);
+
+    struct SlowDrop(Duration);
+
     impl Drop for DropSignal {
         fn drop(&mut self) {
             if let Some(sender) = self.0.take() {
                 let _ = sender.send(());
             }
+        }
+    }
+
+    impl Drop for StdDropSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    impl Drop for SlowDrop {
+        fn drop(&mut self) {
+            std::thread::sleep(self.0);
         }
     }
 
@@ -202,6 +602,154 @@ mod tests {
         assert_eq!(partition_worker_limit(0, Some(1)), 0);
         assert_eq!(partition_worker_limit(1, Some(1)), 1);
         assert!(partition_worker_limit(10, Some(2)) <= 2);
+    }
+
+    fn assert_run_from_tokio_worker() {
+        let caller = std::thread::current().id();
+        let (worker, value) = run(async move {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            (std::thread::current().id(), 42)
+        })
+        .unwrap();
+
+        assert_ne!(
+            worker, caller,
+            "async work ran on the caller's Tokio thread"
+        );
+        assert_eq!(value, 42);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_is_safe_from_a_current_thread_runtime() {
+        tokio::task::yield_now().await;
+        assert_run_from_tokio_worker();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_is_safe_from_a_multithread_runtime_worker() {
+        tokio::task::yield_now().await;
+        assert_run_from_tokio_worker();
+    }
+
+    #[test]
+    fn task_panic_is_reported_and_owner_remains_usable() {
+        let error = run(async move {
+            panic!("runtime bridge panic probe");
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("Runtime task panicked"));
+        assert_eq!(run(async move { 7 }).unwrap(), 7);
+    }
+
+    #[test]
+    fn run_reentry_is_rejected_on_a_single_worker_owner_subprocess() {
+        test_support::run(
+            "runtime::tests::run_reentry_is_rejected_on_a_single_worker_owner_child",
+            Duration::from_secs(5),
+        );
+    }
+
+    #[test]
+    fn run_reentry_is_rejected_on_a_single_worker_owner_child() {
+        const TEST_NAME: &str =
+            "runtime::tests::run_reentry_is_rejected_on_a_single_worker_owner_child";
+        if !test_support::is_child(TEST_NAME) {
+            return;
+        }
+
+        let owner = Arc::new(RuntimeOwner::start_with_worker_threads(1).unwrap());
+        let reentrant_owner = Arc::clone(&owner);
+        let error = owner
+            .run(async move { reentrant_owner.run(async move { 42 }) })
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("extension-owned runtime task"));
+        owner.shutdown().unwrap();
+        test_support::finish_child();
+    }
+
+    #[test]
+    fn owner_shutdown_aborts_and_drains_tracked_tasks() {
+        let owner = RuntimeOwner::start().unwrap();
+        let (started_tx, started_rx) = sync_channel(1);
+        let (dropped_tx, dropped_rx) = sync_channel(1);
+        let _task = owner
+            .spawn(async move {
+                let _drop_signal = StdDropSignal(Some(dropped_tx));
+                started_tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+            })
+            .unwrap();
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("tracked task did not start");
+        owner.shutdown().unwrap();
+        dropped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("owner shutdown returned before the tracked task drained");
+    }
+
+    #[test]
+    fn owner_shutdown_reports_success_after_a_slow_bounded_drain() {
+        let owner = RuntimeOwner::start_with_worker_threads(1).unwrap();
+        let (started_tx, started_rx) = sync_channel(1);
+        let _task = owner
+            .spawn(async move {
+                let _slow_drop = SlowDrop(Duration::from_millis(50));
+                started_tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+            })
+            .unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("slow task did not start");
+
+        let started = Instant::now();
+        owner
+            .shutdown_with_timeout(Duration::from_millis(500))
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(40), "elapsed={elapsed:?}");
+        assert!(elapsed < Duration::from_millis(500), "elapsed={elapsed:?}");
+    }
+
+    #[test]
+    fn stuck_owner_shutdown_respects_deadline_subprocess() {
+        test_support::run(
+            "runtime::tests::stuck_owner_shutdown_respects_deadline_child",
+            Duration::from_secs(5),
+        );
+    }
+
+    #[test]
+    fn stuck_owner_shutdown_respects_deadline_child() {
+        const TEST_NAME: &str = "runtime::tests::stuck_owner_shutdown_respects_deadline_child";
+        if !test_support::is_child(TEST_NAME) {
+            return;
+        }
+
+        let owner = RuntimeOwner::start_with_worker_threads(1).unwrap();
+        let (started_tx, started_rx) = sync_channel(1);
+        let _task = owner
+            .spawn(async move {
+                started_tx.send(()).unwrap();
+                loop {
+                    std::hint::spin_loop();
+                }
+            })
+            .unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("stuck task did not start");
+
+        let started = Instant::now();
+        let error = owner
+            .shutdown_with_timeout(Duration::from_millis(50))
+            .unwrap_err();
+        assert!(error.to_string().contains("shutdown timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        test_support::finish_child();
     }
 
     #[tokio::test]

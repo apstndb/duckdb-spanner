@@ -2,6 +2,7 @@ mod spanemuboost;
 
 use std::ops::Deref;
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use duckdb::Connection;
 use duckdb_spanner::register_spanner_extension;
@@ -357,6 +358,162 @@ fn vtab_scan_sql(table: &str) -> String {
         db.database_path(),
         db.emulator_host()
     )
+}
+
+const NESTED_RUNTIME_CHILD: &str = "DUCKDB_SPANNER_NESTED_RUNTIME_CHILD";
+const NESTED_RUNTIME_DATABASE: &str = "DUCKDB_SPANNER_NESTED_RUNTIME_DATABASE";
+const NESTED_RUNTIME_ENDPOINT: &str = "DUCKDB_SPANNER_NESTED_RUNTIME_ENDPOINT";
+const NESTED_RUNTIME_ADMIN_ENDPOINT: &str = "DUCKDB_SPANNER_NESTED_RUNTIME_ADMIN_ENDPOINT";
+const NESTED_RUNTIME_MARKER: &str = "DUCKDB_SPANNER_NESTED_RUNTIME_MARKER";
+const NESTED_RUNTIME_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn run_nested_runtime_subprocess(test_name: &str) {
+    let db = get_gsql_db();
+    let marker = std::env::temp_dir().join(format!(
+        "duckdb-spanner-runtime-bridge-{}-{test_name}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker);
+
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg(test_name)
+        .arg("--nocapture")
+        .env(NESTED_RUNTIME_CHILD, "1")
+        .env(NESTED_RUNTIME_DATABASE, db.database_path())
+        .env(NESTED_RUNTIME_ENDPOINT, db.emulator_host())
+        .env(NESTED_RUNTIME_ADMIN_ENDPOINT, db.admin_host())
+        .env(NESTED_RUNTIME_MARKER, &marker)
+        .spawn()
+        .expect("failed to start nested-runtime regression subprocess");
+
+    let deadline = Instant::now() + NESTED_RUNTIME_SUBPROCESS_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .expect("failed to poll nested-runtime regression subprocess")
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("nested-runtime regression subprocess timed out: {test_name}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    assert!(
+        status.success(),
+        "nested-runtime regression subprocess failed: {test_name} ({status})"
+    );
+    let marker_contents =
+        std::fs::read_to_string(&marker).expect("child test did not write its completion marker");
+    let _ = std::fs::remove_file(marker);
+    assert_eq!(marker_contents, "ok");
+}
+
+fn nested_runtime_duckdb_regression() {
+    let database = std::env::var(NESTED_RUNTIME_DATABASE).unwrap();
+    let endpoint = std::env::var(NESTED_RUNTIME_ENDPOINT).unwrap();
+    let admin_endpoint = std::env::var(NESTED_RUNTIME_ADMIN_ENDPOINT).unwrap();
+    let conn = open_extension_connection();
+
+    let query_sql = format!(
+        "SELECT Id FROM spanner_query(\
+         'SELECT Id FROM ScalarTypes ORDER BY Id', \
+         database_path := '{database}', endpoint := '{endpoint}')"
+    );
+    let query_ids: Vec<i64> = conn
+        .prepare(&query_sql)
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(query_ids, vec![1, 2, 3]);
+
+    let scan_sql = format!(
+        "SELECT Id FROM spanner_scan('ScalarTypes', \
+         database_path := '{database}', endpoint := '{endpoint}') ORDER BY Id"
+    );
+    let scan_ids: Vec<i64> = conn
+        .prepare(&scan_sql)
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(scan_ids, vec![1, 2, 3]);
+
+    let table_count: i64 = conn
+        .query_row(
+            &format!(
+                "SELECT COUNT(*) FROM spanner_tables(\
+                 database_path := '{database}', endpoint := '{endpoint}')"
+            ),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(table_count > 0);
+
+    let copy_error = conn
+        .execute_batch(&format!(
+            "COPY (SELECT CAST(1 AS BIGINT) AS Id) \
+             TO 'RuntimeOwnerMissingTable' (FORMAT spanner, \
+             database_path '{database}', endpoint '{endpoint}')"
+        ))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        copy_error.contains("Schema discovery failed"),
+        "unexpected COPY/schema error: {copy_error}"
+    );
+
+    let ddl_error = conn
+        .query_row(
+            &format!(
+                "SELECT operation_name FROM spanner_ddl(\
+                 'THIS IS NOT VALID DDL', database_path := '{database}', \
+                 endpoint := '{endpoint}', admin_endpoint := '{admin_endpoint}')"
+            ),
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(!ddl_error.is_empty(), "invalid DDL returned an empty error");
+
+    std::fs::write(std::env::var(NESTED_RUNTIME_MARKER).unwrap(), "ok").unwrap();
+}
+
+#[test]
+fn test_runtime_bridge_current_thread_subprocess() {
+    run_nested_runtime_subprocess("test_runtime_bridge_current_thread_child");
+}
+
+#[test]
+fn test_runtime_bridge_multithread_subprocess() {
+    run_nested_runtime_subprocess("test_runtime_bridge_multithread_child");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn test_runtime_bridge_current_thread_child() {
+    if std::env::var_os(NESTED_RUNTIME_CHILD).is_none() {
+        return;
+    }
+    tokio::task::yield_now().await;
+    nested_runtime_duckdb_regression();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_runtime_bridge_multithread_child() {
+    if std::env::var_os(NESTED_RUNTIME_CHILD).is_none() {
+        return;
+    }
+    tokio::task::yield_now().await;
+    nested_runtime_duckdb_regression();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

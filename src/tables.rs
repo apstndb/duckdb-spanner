@@ -71,7 +71,7 @@ impl VTab for SpannerTablesVTab {
             table_name: crate::bind_utils::get_named_string(bind, "table_name"),
         };
 
-        let rows = runtime::block_on(async {
+        let rows = runtime::run(async move {
             let client = client::get_or_create_client(&database, endpoint.as_deref()).await?;
             list_tables(&client, &database, endpoint.as_deref(), dialect, &filters).await
         })??;
