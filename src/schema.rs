@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -6,28 +7,260 @@ use google_cloud_spanner::model::execute_sql_request::QueryMode;
 use google_cloud_spanner::statement::Statement;
 use google_cloud_spanner::types::Type;
 use google_cloud_spanner_admin_database_v1::model::DatabaseDialect;
-use tokio::sync::OnceCell;
+use tokio::sync::Notify;
 
-use crate::cache::LruCache;
 use crate::error::SpannerError;
 use crate::types;
 
 /// Keep the dialect cache aligned with the client cache in `client.rs`.
 const DIALECT_CACHE_CAPACITY: usize = 8;
+/// Hard cap on distinct concurrent discovery waves. Overload deliberately
+/// fails closed immediately instead of adding potentially indefinite bind-time
+/// backpressure; callers can retry after any active wave completes.
+const DIALECT_IN_FLIGHT_CAPACITY: usize = 8;
+const DIALECT_LEADER_DROPPED_ERROR: &str =
+    "Dialect discovery leader was cancelled or panicked before completing";
 
-type DialectSlot = Arc<OnceCell<DatabaseDialect>>;
-type DialectCache = LruCache<String, DialectSlot>;
+/// A completed dialect LRU and an independent bounded set of active discovery
+/// waves. Completed entries may be evicted; active waves must never be evicted
+/// because doing so would allow a second discovery for the same key.
+struct DialectCache {
+    completed: CompletedDialects,
+    in_flight: HashMap<String, Arc<DialectFlight>>,
+    in_flight_capacity: usize,
+}
+
+impl DialectCache {
+    fn new(completed_capacity: usize, in_flight_capacity: usize) -> Self {
+        assert!(
+            completed_capacity >= 1,
+            "dialect cache capacity must be at least 1"
+        );
+        assert!(
+            in_flight_capacity >= 1,
+            "dialect in-flight capacity must be at least 1"
+        );
+        Self {
+            completed: CompletedDialects::new(completed_capacity),
+            in_flight: HashMap::new(),
+            in_flight_capacity,
+        }
+    }
+}
+
+/// A minimal LRU specialized for completed dialects. This is deliberately
+/// separate from active waves, which have different eviction rules.
+struct CompletedDialects {
+    capacity: usize,
+    tick: u64,
+    entries: HashMap<String, (DatabaseDialect, u64)>,
+}
+
+impl CompletedDialects {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            tick: 0,
+            entries: HashMap::new(),
+        }
+    }
+
+    fn next_tick(&mut self) -> u64 {
+        self.tick = self.tick.wrapping_add(1);
+        self.tick
+    }
+
+    fn get(&mut self, key: &str) -> Option<DatabaseDialect> {
+        let tick = self.next_tick();
+        self.entries.get_mut(key).map(|(dialect, recency)| {
+            *recency = tick;
+            dialect.clone()
+        })
+    }
+
+    fn insert(&mut self, key: String, dialect: DatabaseDialect) {
+        let tick = self.next_tick();
+        self.entries.insert(key, (dialect, tick));
+        if self.entries.len() > self.capacity {
+            let lru_key = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, recency))| *recency)
+                .map(|(key, _)| key.clone());
+            if let Some(key) = lru_key {
+                self.entries.remove(&key);
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+enum DialectOutcome {
+    Success(DatabaseDialect),
+    Failure(DialectFailure),
+}
+
+impl DialectOutcome {
+    fn into_result(self) -> Result<DatabaseDialect, SpannerError> {
+        match self {
+            Self::Success(dialect) => Ok(dialect),
+            Self::Failure(error) => Err(error.into_spanner_error()),
+        }
+    }
+}
+
+/// Store failures in a cloneable form so every member of a wave sees the same
+/// typed GAX error, including non-status predicates, metadata, and source chain.
+#[derive(Clone)]
+enum DialectFailure {
+    GoogleCloud(Arc<google_cloud_gax::error::Error>),
+    Other(String),
+    LeaderDropped,
+}
+
+impl DialectFailure {
+    fn from_spanner_error(error: SpannerError) -> Self {
+        match error {
+            SpannerError::GoogleCloud(error) => Self::GoogleCloud(error),
+            error => Self::Other(error.to_string()),
+        }
+    }
+
+    fn into_spanner_error(self) -> SpannerError {
+        match self {
+            Self::GoogleCloud(error) => SpannerError::GoogleCloud(error),
+            Self::Other(message) => SpannerError::Other(message),
+            Self::LeaderDropped => SpannerError::Other(DIALECT_LEADER_DROPPED_ERROR.to_string()),
+        }
+    }
+}
+
+/// Shared state for exactly one discovery wave.
+struct DialectFlight {
+    outcome: Mutex<Option<DialectOutcome>>,
+    completed: Notify,
+    #[cfg(test)]
+    followers: std::sync::atomic::AtomicUsize,
+}
+
+impl DialectFlight {
+    fn new() -> Self {
+        Self {
+            outcome: Mutex::new(None),
+            completed: Notify::new(),
+            #[cfg(test)]
+            followers: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    #[cfg(test)]
+    fn record_follower(&self) {
+        self.followers
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Publish the first terminal outcome and wake the whole wave. Idempotence
+    /// matters during unwinding: if normal completion published before a later
+    /// operation panicked, the leader guard must not overwrite that outcome.
+    fn publish(&self, outcome: DialectOutcome) {
+        let mut current = self.outcome.lock().unwrap_or_else(|e| e.into_inner());
+        if current.is_some() {
+            return;
+        }
+        *current = Some(outcome);
+        drop(current);
+        self.completed.notify_waiters();
+    }
+
+    async fn wait(&self) -> DialectOutcome {
+        loop {
+            // Register before inspecting the result so a completion between
+            // these two operations cannot lose its wake-up.
+            let notified = self.completed.notified();
+            if let Some(outcome) = self
+                .outcome
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+            {
+                return outcome;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Owns cleanup responsibility while the discovery leader is awaiting I/O.
+/// Dropping the leader future (including task abort or panic unwinding) runs
+/// this synchronously, so no active wave can be stranded without an outcome.
+struct DialectLeaderGuard<'a> {
+    cache: &'a Mutex<DialectCache>,
+    key: String,
+    flight: Arc<DialectFlight>,
+    armed: bool,
+}
+
+impl<'a> DialectLeaderGuard<'a> {
+    fn new(cache: &'a Mutex<DialectCache>, key: String, flight: Arc<DialectFlight>) -> Self {
+        Self {
+            cache,
+            key,
+            flight,
+            armed: true,
+        }
+    }
+
+    fn complete(mut self, outcome: DialectOutcome) -> Result<DatabaseDialect, SpannerError> {
+        self.flight.publish(outcome.clone());
+
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let DialectOutcome::Success(dialect) = &outcome {
+            cache.completed.insert(self.key.clone(), dialect.clone());
+        }
+        remove_matching_flight(&mut cache, &self.key, &self.flight);
+
+        self.armed = false;
+        outcome.into_result()
+    }
+}
+
+impl Drop for DialectLeaderGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        self.flight
+            .publish(DialectOutcome::Failure(DialectFailure::LeaderDropped));
+
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        remove_matching_flight(&mut cache, &self.key, &self.flight);
+    }
+}
+
+fn remove_matching_flight(cache: &mut DialectCache, key: &str, flight: &Arc<DialectFlight>) {
+    if cache
+        .in_flight
+        .get(key)
+        .is_some_and(|current| Arc::ptr_eq(current, flight))
+    {
+        cache.in_flight.remove(key);
+    }
+}
 
 /// Cache of detected dialects, keyed by the same `(database, endpoint)` key
 /// used by the client cache in `client.rs` (see `client::cache_key`).
 ///
 /// `detect_dialect` issues a query, so callers that run it on every bind
 /// (`spanner_scan`, `COPY TO ... (FORMAT spanner)`) look here first to avoid
-/// a redundant round-trip against the same database. Each slot is a `OnceCell`
-/// so concurrent misses for one key share the primary metadata query. Failed
-/// queries do not populate the cell and retry normally on the next bind.
-static DIALECT_CACHE: LazyLock<Mutex<DialectCache>> =
-    LazyLock::new(|| Mutex::new(LruCache::new(DIALECT_CACHE_CAPACITY)));
+/// a redundant round-trip against the same database. Concurrent misses share
+/// one discovery wave. Failed waves are not cached, so a later bind retries.
+static DIALECT_CACHE: LazyLock<Mutex<DialectCache>> = LazyLock::new(|| {
+    Mutex::new(DialectCache::new(
+        DIALECT_CACHE_CAPACITY,
+        DIALECT_IN_FLIGHT_CAPACITY,
+    ))
+});
 
 /// Column metadata discovered from Spanner schema.
 #[derive(Debug, Clone)]
@@ -75,33 +308,74 @@ pub async fn detect_dialect(
     endpoint: Option<&str>,
 ) -> Result<DatabaseDialect, SpannerError> {
     let key = crate::client::cache_key(database, endpoint);
-    let (slot, _) = get_or_insert_dialect_slot(&DIALECT_CACHE, key);
-    get_or_detect_dialect(&slot, || detect_dialect_via_database_options(client)).await
+    get_or_detect_dialect(&DIALECT_CACHE, key, || {
+        detect_dialect_via_database_options(client)
+    })
+    .await
 }
 
-/// Look up or create a bounded cache slot without holding the mutex during
-/// database I/O. Recovering a poisoned mutex is intentional: this cache is an
-/// optimization and must not unwind through DuckDB's FFI boundary.
-fn get_or_insert_dialect_slot(
+/// Run dialect discovery once for the current wave. Successes are cached in
+/// the completed LRU; failures are broadcast to all current waiters and are
+/// retried only by a subsequent wave.
+async fn get_or_detect_dialect<F, Fut>(
     cache: &Mutex<DialectCache>,
     key: String,
-) -> (DialectSlot, Option<DialectSlot>) {
-    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
-    cache.get_or_insert_with(key, || Arc::new(OnceCell::new()))
-}
-
-/// Run dialect discovery once for a cache slot. `OnceCell` stores only a
-/// successful result, so RPC, authentication, transport, and response errors
-/// remain retryable and are returned unchanged to the caller.
-async fn get_or_detect_dialect<F, Fut>(
-    slot: &DialectSlot,
     detect: F,
 ) -> Result<DatabaseDialect, SpannerError>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<DatabaseDialect, SpannerError>>,
 {
-    Ok(slot.get_or_try_init(detect).await?.clone())
+    let (flight, leader) = {
+        let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(dialect) = cache.completed.get(&key) {
+            return Ok(dialect);
+        }
+        if let Some(flight) = cache.in_flight.get(&key) {
+            #[cfg(test)]
+            flight.record_follower();
+            (Arc::clone(flight), false)
+        } else {
+            if cache.in_flight.len() >= cache.in_flight_capacity {
+                return Err(SpannerError::Other(format!(
+                    "Dialect discovery overload: {} distinct database detections are already in progress",
+                    cache.in_flight_capacity
+                )));
+            }
+            let flight = Arc::new(DialectFlight::new());
+            cache.in_flight.insert(key.clone(), Arc::clone(&flight));
+            (flight, true)
+        }
+    };
+
+    if !leader {
+        return flight.wait().await.into_result();
+    }
+
+    let guard = DialectLeaderGuard::new(cache, key, flight);
+    let outcome = match detect().await {
+        Ok(dialect) => DialectOutcome::Success(dialect),
+        Err(error) => DialectOutcome::Failure(DialectFailure::from_spanner_error(error)),
+    };
+
+    guard.complete(outcome)
+}
+
+/// Resolve an explicit dialect without invoking detection. The detector is a
+/// closure so callers and tests can prove that overrides bypass metadata I/O.
+pub(crate) async fn resolve_dialect<F, Fut>(
+    dialect: DatabaseDialect,
+    detect: F,
+) -> Result<DatabaseDialect, SpannerError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<DatabaseDialect, SpannerError>>,
+{
+    if dialect == DatabaseDialect::Unspecified {
+        detect().await
+    } else {
+        Ok(dialect)
+    }
 }
 
 /// Query `INFORMATION_SCHEMA.DATABASE_OPTIONS` for the `database_dialect` option.
@@ -196,11 +470,7 @@ pub async fn discover_table_schema(
     database: &str,
     endpoint: Option<&str>,
 ) -> Result<Vec<ColumnInfo>, SpannerError> {
-    let dialect = if dialect == DatabaseDialect::Unspecified {
-        detect_dialect(client, database, endpoint).await?
-    } else {
-        dialect
-    };
+    let dialect = resolve_dialect(dialect, || detect_dialect(client, database, endpoint)).await?;
 
     let (schema_name, table_name) = split_schema_table(table);
 
@@ -310,17 +580,21 @@ fn split_schema_table(qualified_name: &str) -> (&str, &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as _;
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use google_cloud_gax::error::rpc::{Code, Status};
-    use google_cloud_spanner::Error as SpannerClientError;
+    use google_cloud_gax::error::Error as GaxError;
 
     use super::*;
 
+    const CONCURRENCY_TEST_TIMEOUT: Duration = Duration::from_secs(2);
+
     fn rpc_error(code: Code) -> SpannerError {
-        SpannerError::GoogleCloud(SpannerClientError::service(
+        SpannerError::from(GaxError::service(
             Status::default().set_code(code).set_message("test"),
         ))
     }
@@ -373,6 +647,20 @@ mod tests {
             DatabaseDialect::Postgresql
         );
         assert!(parse_dialect("mysql").is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_dialect_bypasses_failing_detector() {
+        let detector_calls = AtomicUsize::new(0);
+        let dialect = resolve_dialect(DatabaseDialect::Postgresql, || async {
+            detector_calls.fetch_add(1, Ordering::SeqCst);
+            Err(SpannerError::Other("detector must be bypassed".to_string()))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(dialect, DatabaseDialect::Postgresql);
+        assert_eq!(detector_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -435,12 +723,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn database_options_caches_postgresql_discovery() {
-        let slot = Arc::new(OnceCell::new());
+    async fn completed_dialect_cache_reuses_postgresql_discovery() {
+        let cache = Mutex::new(DialectCache::new(2, 2));
         let primary_calls = AtomicUsize::new(0);
         let cached_calls = AtomicUsize::new(0);
 
-        let dialect = get_or_detect_dialect(&slot, || async {
+        let dialect = get_or_detect_dialect(&cache, "database".to_string(), || async {
             primary_calls.fetch_add(1, Ordering::SeqCst);
             Ok(DatabaseDialect::Postgresql)
         })
@@ -448,7 +736,7 @@ mod tests {
         .unwrap();
         assert_eq!(dialect, DatabaseDialect::Postgresql);
 
-        let cached = get_or_detect_dialect(&slot, || async {
+        let cached = get_or_detect_dialect(&cache, "database".to_string(), || async {
             cached_calls.fetch_add(1, Ordering::SeqCst);
             Ok(DatabaseDialect::GoogleStandardSql)
         })
@@ -460,44 +748,357 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn database_options_caches_googlesql_discovery() {
-        let slot = Arc::new(OnceCell::new());
+    async fn concurrent_success_wave_runs_one_discovery() {
+        const WAITERS: usize = 4;
+        let cache = Arc::new(Mutex::new(DialectCache::new(2, 2)));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut tasks = tokio::task::JoinSet::new();
 
-        let dialect =
-            get_or_detect_dialect(&slot, || async { Ok(DatabaseDialect::GoogleStandardSql) })
+        for _ in 0..WAITERS {
+            let cache = Arc::clone(&cache);
+            let calls = Arc::clone(&calls);
+            let release = Arc::clone(&release);
+            tasks.spawn(async move {
+                get_or_detect_dialect(&cache, "database".to_string(), || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    release.notified().await;
+                    Ok(DatabaseDialect::GoogleStandardSql)
+                })
                 .await
-                .unwrap();
+            });
+        }
 
-        assert_eq!(dialect, DatabaseDialect::GoogleStandardSql);
-        assert_eq!(slot.get(), Some(&DatabaseDialect::GoogleStandardSql));
+        wait_for_count(&calls, 1).await;
+        let flight = active_flight(&cache, "database");
+        wait_for_followers(&flight, WAITERS - 1).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        release.notify_waiters();
+
+        while let Some(result) = join_next_bounded(&mut tasks).await {
+            assert_eq!(result.unwrap().unwrap(), DatabaseDialect::GoogleStandardSql);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn concurrent_dialect_cache_misses_share_one_discovery() {
-        let slot = Arc::new(OnceCell::new());
+    async fn concurrent_failure_wave_shares_one_error_and_next_wave_retries() {
+        const WAITERS: usize = 4;
+        let cache = Arc::new(Mutex::new(DialectCache::new(2, 2)));
         let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut tasks = tokio::task::JoinSet::new();
 
-        let (first, second) = tokio::join!(
-            get_or_detect_dialect(&slot, || {
-                let calls = Arc::clone(&calls);
-                async move {
+        for _ in 0..WAITERS {
+            let cache = Arc::clone(&cache);
+            let calls = Arc::clone(&calls);
+            let release = Arc::clone(&release);
+            tasks.spawn(async move {
+                get_or_detect_dialect(&cache, "database".to_string(), || async move {
                     calls.fetch_add(1, Ordering::SeqCst);
-                    tokio::task::yield_now().await;
-                    Ok(DatabaseDialect::GoogleStandardSql)
-                }
-            }),
-            get_or_detect_dialect(&slot, || {
-                let calls = Arc::clone(&calls);
-                async move {
-                    calls.fetch_add(1, Ordering::SeqCst);
-                    Ok(DatabaseDialect::GoogleStandardSql)
-                }
-            }),
+                    release.notified().await;
+                    Err::<DatabaseDialect, SpannerError>(rpc_error(Code::Unavailable))
+                })
+                .await
+            });
+        }
+
+        wait_for_count(&calls, 1).await;
+        let flight = active_flight(&cache, "database");
+        wait_for_followers(&flight, WAITERS - 1).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        release.notify_waiters();
+
+        let mut shared_error: Option<Arc<GaxError>> = None;
+        while let Some(result) = join_next_bounded(&mut tasks).await {
+            let error = result.unwrap().unwrap_err();
+            assert_eq!(status_code(&error), Some(Code::Unavailable));
+            let error = into_gax_error(error);
+            if let Some(shared) = &shared_error {
+                assert!(Arc::ptr_eq(shared, &error));
+            } else {
+                shared_error = Some(error);
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(shared_error.is_some());
+
+        let retried = get_or_detect_dialect(&cache, "database".to_string(), || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(DatabaseDialect::Postgresql)
+        })
+        .await
+        .unwrap();
+        assert_eq!(retried, DatabaseDialect::Postgresql);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn service_error_wave_preserves_status_http_metadata_and_identity() {
+        let status = Status::default()
+            .set_code(Code::Unavailable)
+            .set_message("service unavailable");
+        let (leader, follower) = shared_gax_failure_wave(GaxError::service_with_http_metadata(
+            status.clone(),
+            Some(503),
+            None,
+        ))
+        .await;
+
+        assert!(Arc::ptr_eq(&leader, &follower));
+        assert_eq!(leader.status(), Some(&status));
+        assert_eq!(leader.http_status_code(), Some(503));
+    }
+
+    #[tokio::test]
+    async fn transport_error_wave_preserves_http_metadata_and_identity() {
+        let (leader, follower) =
+            shared_gax_failure_wave(GaxError::http(502, Default::default(), Default::default()))
+                .await;
+
+        assert!(Arc::ptr_eq(&leader, &follower));
+        assert!(leader.is_transport());
+        assert_eq!(leader.http_status_code(), Some(502));
+        assert!(leader.http_headers().is_some());
+        assert!(leader.http_payload().is_some());
+    }
+
+    #[tokio::test]
+    async fn timeout_and_exhausted_error_waves_preserve_predicates_sources_and_identity() {
+        let (timeout_leader, timeout_follower) = shared_gax_failure_wave(GaxError::timeout(
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout source"),
+        ))
+        .await;
+        assert!(Arc::ptr_eq(&timeout_leader, &timeout_follower));
+        assert!(timeout_leader.is_timeout());
+        assert!(timeout_leader.status().is_none());
+        assert_eq!(
+            timeout_leader.as_ref().source().unwrap().to_string(),
+            "timeout source"
         );
 
-        assert_eq!(first.unwrap(), DatabaseDialect::GoogleStandardSql);
-        assert_eq!(second.unwrap(), DatabaseDialect::GoogleStandardSql);
+        let (exhausted_leader, exhausted_follower) = shared_gax_failure_wave(GaxError::exhausted(
+            std::io::Error::other("exhausted source"),
+        ))
+        .await;
+        assert!(Arc::ptr_eq(&exhausted_leader, &exhausted_follower));
+        assert!(exhausted_leader.is_exhausted());
+        assert!(exhausted_leader.status().is_none());
+        assert_eq!(
+            exhausted_leader.as_ref().source().unwrap().to_string(),
+            "exhausted source"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_leader_releases_waiters_and_allows_retry() {
+        let cache = Arc::new(Mutex::new(DialectCache::new(2, 2)));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let leader_release = Arc::new(tokio::sync::Notify::new());
+
+        let leader = {
+            let cache = Arc::clone(&cache);
+            let calls = Arc::clone(&calls);
+            let leader_release = Arc::clone(&leader_release);
+            tokio::spawn(async move {
+                get_or_detect_dialect(&cache, "database".to_string(), || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    leader_release.notified().await;
+                    Ok(DatabaseDialect::GoogleStandardSql)
+                })
+                .await
+            })
+        };
+        wait_for_count(&calls, 1).await;
+        let flight = active_flight(&cache, "database");
+
+        let follower = {
+            let cache = Arc::clone(&cache);
+            let calls = Arc::clone(&calls);
+            tokio::spawn(async move {
+                get_or_detect_dialect(&cache, "database".to_string(), || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(DatabaseDialect::Postgresql)
+                })
+                .await
+            })
+        };
+        wait_for_followers(&flight, 1).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        leader.abort();
+        assert!(join_bounded(leader).await.unwrap_err().is_cancelled());
+
+        let follower_error = join_bounded(follower)
+            .await
+            .expect("follower task must not panic")
+            .unwrap_err();
+        assert_eq!(follower_error.to_string(), DIALECT_LEADER_DROPPED_ERROR);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(cache.lock().unwrap().in_flight.is_empty());
+
+        let retried = get_or_detect_dialect(&cache, "database".to_string(), || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(DatabaseDialect::Postgresql)
+        })
+        .await
+        .unwrap();
+        assert_eq!(retried, DatabaseDialect::Postgresql);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let cache = cache.lock().unwrap();
+        assert!(cache.in_flight.is_empty());
+        assert!(cache.completed.entries.contains_key("database"));
+    }
+
+    #[tokio::test]
+    async fn panicked_leader_releases_waiters() {
+        let cache = Arc::new(Mutex::new(DialectCache::new(2, 2)));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let panic_release = Arc::new(tokio::sync::Notify::new());
+
+        let leader = {
+            let cache = Arc::clone(&cache);
+            let calls = Arc::clone(&calls);
+            let panic_release = Arc::clone(&panic_release);
+            tokio::spawn(async move {
+                get_or_detect_dialect(&cache, "database".to_string(), || {
+                    panic_after_release(calls, panic_release)
+                })
+                .await
+            })
+        };
+        wait_for_count(&calls, 1).await;
+        let flight = active_flight(&cache, "database");
+
+        let follower = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move {
+                get_or_detect_dialect(&cache, "database".to_string(), || async {
+                    Ok(DatabaseDialect::Postgresql)
+                })
+                .await
+            })
+        };
+        wait_for_followers(&flight, 1).await;
+
+        panic_release.notify_waiters();
+        assert!(join_bounded(leader).await.unwrap_err().is_panic());
+
+        let follower_error = join_bounded(follower)
+            .await
+            .expect("follower task must not panic")
+            .unwrap_err();
+        assert_eq!(follower_error.to_string(), DIALECT_LEADER_DROPPED_ERROR);
+        assert!(cache.lock().unwrap().in_flight.is_empty());
+    }
+
+    #[test]
+    fn stale_leader_guard_does_not_remove_replacement_generation() {
+        let cache = Mutex::new(DialectCache::new(2, 2));
+        let old_flight = Arc::new(DialectFlight::new());
+        cache
+            .lock()
+            .unwrap()
+            .in_flight
+            .insert("database".to_string(), Arc::clone(&old_flight));
+        let old_guard =
+            DialectLeaderGuard::new(&cache, "database".to_string(), Arc::clone(&old_flight));
+
+        let replacement = Arc::new(DialectFlight::new());
+        cache
+            .lock()
+            .unwrap()
+            .in_flight
+            .insert("database".to_string(), Arc::clone(&replacement));
+        drop(old_guard);
+
+        let cache = cache.lock().unwrap();
+        let current = cache.in_flight.get("database").unwrap();
+        assert!(Arc::ptr_eq(current, &replacement));
+        assert!(matches!(
+            old_flight.outcome.lock().unwrap().as_ref(),
+            Some(DialectOutcome::Failure(DialectFailure::LeaderDropped))
+        ));
+    }
+
+    #[tokio::test]
+    async fn in_flight_capacity_does_not_evict_active_waves_or_duplicate_detection() {
+        let cache = Arc::new(Mutex::new(DialectCache::new(2, 2)));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release_a = Arc::new(tokio::sync::Notify::new());
+        let release_b = Arc::new(tokio::sync::Notify::new());
+
+        let first_a = start_blocked_discovery(
+            Arc::clone(&cache),
+            "a",
+            Arc::clone(&calls),
+            Arc::clone(&release_a),
+        );
+        let first_b = start_blocked_discovery(
+            Arc::clone(&cache),
+            "b",
+            Arc::clone(&calls),
+            Arc::clone(&release_b),
+        );
+        wait_for_count(&calls, 2).await;
+        let flight_a = active_flight(&cache, "a");
+
+        let duplicate_a = {
+            let cache = Arc::clone(&cache);
+            let calls = Arc::clone(&calls);
+            tokio::spawn(async move {
+                get_or_detect_dialect(&cache, "a".to_string(), || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(DatabaseDialect::GoogleStandardSql)
+                })
+                .await
+            })
+        };
+        wait_for_followers(&flight_a, 1).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let full = get_or_detect_dialect(&cache, "c".to_string(), || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(DatabaseDialect::GoogleStandardSql)
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(
+            full.to_string(),
+            "Dialect discovery overload: 2 distinct database detections are already in progress"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        release_a.notify_waiters();
+        assert_eq!(
+            join_bounded(first_a).await.unwrap().unwrap(),
+            DatabaseDialect::GoogleStandardSql
+        );
+        assert_eq!(
+            join_bounded(duplicate_a).await.unwrap().unwrap(),
+            DatabaseDialect::GoogleStandardSql
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+        let detected_c = get_or_detect_dialect(&cache, "c".to_string(), || async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(DatabaseDialect::Postgresql)
+        })
+        .await
+        .unwrap();
+        assert_eq!(detected_c, DatabaseDialect::Postgresql);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        release_b.notify_waiters();
+        assert_eq!(
+            join_bounded(first_b).await.unwrap().unwrap(),
+            DatabaseDialect::GoogleStandardSql
+        );
+
+        let cache = cache.lock().unwrap();
+        assert!(cache.in_flight.is_empty());
+        assert_eq!(cache.completed.entries.len(), 2);
+        assert!(cache.completed.entries.contains_key("c"));
     }
 
     #[tokio::test]
@@ -510,19 +1111,19 @@ mod tests {
             Code::DeadlineExceeded,
             Code::InvalidArgument,
         ] {
-            let slot = Arc::new(OnceCell::new());
-            let returned = get_or_detect_dialect(&slot, || async move {
+            let cache = Mutex::new(DialectCache::new(1, 1));
+            let returned = get_or_detect_dialect(&cache, "database".to_string(), || async move {
                 Err::<DatabaseDialect, SpannerError>(rpc_error(code))
             })
             .await
             .unwrap_err();
 
             assert_eq!(status_code(&returned), Some(code));
-            assert!(slot.get().is_none());
+            assert!(cache.lock().unwrap().completed.entries.is_empty());
         }
 
-        let slot = Arc::new(OnceCell::new());
-        let returned = get_or_detect_dialect(&slot, || async {
+        let cache = Mutex::new(DialectCache::new(1, 1));
+        let returned = get_or_detect_dialect(&cache, "database".to_string(), || async {
             Err::<DatabaseDialect, SpannerError>(SpannerError::Other(
                 "malformed database_dialect response".to_string(),
             ))
@@ -534,37 +1135,150 @@ mod tests {
             returned,
             SpannerError::Other(message) if message == "malformed database_dialect response"
         ));
-        assert!(slot.get().is_none());
+        assert!(cache.lock().unwrap().completed.entries.is_empty());
     }
 
-    #[test]
-    fn dialect_cache_evicts_the_least_recently_used_slot() {
-        let cache = Mutex::new(DialectCache::new(2));
-        let (first, evicted) = get_or_insert_dialect_slot(&cache, "first".to_string());
-        assert!(evicted.is_none());
-        let (second, evicted) = get_or_insert_dialect_slot(&cache, "second".to_string());
-        assert!(evicted.is_none());
-
-        let (first_hit, evicted) = get_or_insert_dialect_slot(&cache, "first".to_string());
-        assert!(evicted.is_none());
-        assert!(Arc::ptr_eq(&first, &first_hit));
-
-        let (_, evicted) = get_or_insert_dialect_slot(&cache, "third".to_string());
-        let evicted = evicted.expect("the full cache must evict one slot");
-        assert!(Arc::ptr_eq(&evicted, &second));
-    }
-
-    #[test]
-    fn dialect_cache_recovers_from_a_poisoned_mutex() {
-        let cache = Mutex::new(DialectCache::new(1));
+    #[tokio::test]
+    async fn dialect_cache_recovers_from_a_poisoned_mutex() {
+        let cache = Mutex::new(DialectCache::new(1, 1));
         let panic = catch_unwind(AssertUnwindSafe(|| {
             let _guard = cache.lock().unwrap();
             panic!("poison the dialect cache mutex");
         }));
         assert!(panic.is_err());
 
-        let (slot, evicted) = get_or_insert_dialect_slot(&cache, "database".to_string());
-        assert!(evicted.is_none());
-        assert!(slot.get().is_none());
+        let dialect = get_or_detect_dialect(&cache, "database".to_string(), || async {
+            Ok(DatabaseDialect::GoogleStandardSql)
+        })
+        .await
+        .unwrap();
+        assert_eq!(dialect, DatabaseDialect::GoogleStandardSql);
+    }
+
+    async fn wait_for_count(counter: &AtomicUsize, expected: usize) {
+        tokio::time::timeout(CONCURRENCY_TEST_TIMEOUT, async {
+            while counter.load(Ordering::SeqCst) < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timed out waiting for concurrency test counter");
+    }
+
+    fn active_flight(cache: &Mutex<DialectCache>, key: &str) -> Arc<DialectFlight> {
+        Arc::clone(
+            cache
+                .lock()
+                .unwrap()
+                .in_flight
+                .get(key)
+                .expect("expected an active dialect flight"),
+        )
+    }
+
+    async fn wait_for_followers(flight: &DialectFlight, expected: usize) {
+        tokio::time::timeout(CONCURRENCY_TEST_TIMEOUT, async {
+            while flight.followers.load(Ordering::SeqCst) < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timed out waiting for dialect followers");
+    }
+
+    async fn join_bounded<T>(
+        handle: tokio::task::JoinHandle<T>,
+    ) -> Result<T, tokio::task::JoinError> {
+        tokio::time::timeout(CONCURRENCY_TEST_TIMEOUT, handle)
+            .await
+            .expect("timed out waiting for concurrency test task")
+    }
+
+    async fn join_next_bounded<T: 'static>(
+        tasks: &mut tokio::task::JoinSet<T>,
+    ) -> Option<Result<T, tokio::task::JoinError>> {
+        tokio::time::timeout(CONCURRENCY_TEST_TIMEOUT, tasks.join_next())
+            .await
+            .expect("timed out waiting for concurrency test task set")
+    }
+
+    fn into_gax_error(error: SpannerError) -> Arc<GaxError> {
+        match error {
+            SpannerError::GoogleCloud(error) => error,
+            error => panic!("expected typed Google Cloud error, got {error}"),
+        }
+    }
+
+    async fn shared_gax_failure_wave(error: GaxError) -> (Arc<GaxError>, Arc<GaxError>) {
+        let cache = Arc::new(Mutex::new(DialectCache::new(2, 2)));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+
+        let leader = {
+            let cache = Arc::clone(&cache);
+            let calls = Arc::clone(&calls);
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                get_or_detect_dialect(&cache, "database".to_string(), || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    release.notified().await;
+                    Err::<DatabaseDialect, SpannerError>(error.into())
+                })
+                .await
+            })
+        };
+        wait_for_count(&calls, 1).await;
+        let flight = active_flight(&cache, "database");
+
+        let follower = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move {
+                get_or_detect_dialect(&cache, "database".to_string(), || async {
+                    Err(SpannerError::Other(
+                        "follower unexpectedly became detector".to_string(),
+                    ))
+                })
+                .await
+            })
+        };
+        wait_for_followers(&flight, 1).await;
+        release.notify_waiters();
+
+        let leader = join_bounded(leader)
+            .await
+            .expect("leader task must not panic")
+            .unwrap_err();
+        let follower = join_bounded(follower)
+            .await
+            .expect("follower task must not panic")
+            .unwrap_err();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        (into_gax_error(leader), into_gax_error(follower))
+    }
+
+    async fn panic_after_release(
+        calls: Arc<AtomicUsize>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> Result<DatabaseDialect, SpannerError> {
+        calls.fetch_add(1, Ordering::SeqCst);
+        release.notified().await;
+        panic!("intentional dialect discovery panic");
+    }
+
+    fn start_blocked_discovery(
+        cache: Arc<Mutex<DialectCache>>,
+        key: &'static str,
+        calls: Arc<AtomicUsize>,
+        release: Arc<tokio::sync::Notify>,
+    ) -> tokio::task::JoinHandle<Result<DatabaseDialect, SpannerError>> {
+        tokio::spawn(async move {
+            get_or_detect_dialect(&cache, key.to_string(), || async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                release.notified().await;
+                Ok(DatabaseDialect::GoogleStandardSql)
+            })
+            .await
+        })
     }
 }

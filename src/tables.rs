@@ -57,6 +57,10 @@ impl VTab for SpannerTablesVTab {
 
         let database = crate::bind_utils::resolve_database_path(bind)?;
         let endpoint = crate::bind_utils::resolve_endpoint(bind);
+        let dialect = crate::bind_utils::get_named_string(bind, "dialect")
+            .map(|value| schema::parse_dialect(&value))
+            .transpose()?
+            .unwrap_or(DatabaseDialect::Unspecified);
         let filters = TableFilters {
             // Preserve the original zero-argument behavior; callers opt into
             // views (or other INFORMATION_SCHEMA table types) explicitly.
@@ -69,7 +73,7 @@ impl VTab for SpannerTablesVTab {
 
         let rows = runtime::block_on(async {
             let client = client::get_or_create_client(&database, endpoint.as_deref()).await?;
-            list_tables(&client, &database, endpoint.as_deref(), &filters).await
+            list_tables(&client, &database, endpoint.as_deref(), dialect, &filters).await
         })??;
 
         bind.set_cardinality(rows.len() as u64, true);
@@ -142,6 +146,10 @@ impl VTab for SpannerTablesVTab {
                 LogicalTypeHandle::from(LogicalTypeId::Varchar),
             ),
             (
+                "dialect".to_string(),
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            ),
+            (
                 "table_type".to_string(),
                 LogicalTypeHandle::from(LogicalTypeId::Varchar),
             ),
@@ -161,10 +169,14 @@ async fn list_tables(
     client: &DatabaseClient,
     database: &str,
     endpoint: Option<&str>,
+    dialect: DatabaseDialect,
     filters: &TableFilters,
 ) -> Result<Vec<TableRow>, SpannerError> {
     let tx = client.single_use().build();
-    let dialect = schema::detect_dialect(client, database, endpoint).await?;
+    let dialect = schema::resolve_dialect(dialect, || {
+        schema::detect_dialect(client, database, endpoint)
+    })
+    .await?;
     let stmt = build_tables_query(dialect, filters);
     let mut iter = tx.execute_query(stmt).await?;
 

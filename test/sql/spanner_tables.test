@@ -38,4 +38,12 @@ statement ok
 SELECT IF(table_type = 'VIEW', 1, error('expected case-insensitive table type filter')) FROM spanner_tables(table_type := 'view', table_name := 'ScalarTypesView');
 
 statement ok
+SELECT IF(table_name = 'ScalarTypes', 1, error('expected explicit dialect override')) FROM spanner_tables(dialect := 'googlesql', table_name := 'ScalarTypes');
+
+statement error
+SELECT * FROM spanner_tables(dialect := 'not-a-dialect');
+----
+Invalid dialect 'not-a-dialect'
+
+statement ok
 SELECT IF(parent_table_name = 'InterleavedParent', 1, error('expected interleaved parent')) FROM spanner_tables(table_name := 'InterleavedChild');
