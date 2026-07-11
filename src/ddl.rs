@@ -658,6 +658,9 @@ impl<T> FlightCleanupGuard<T> {
 
 impl<T> Drop for FlightCleanupGuard<T> {
     fn drop(&mut self) {
+        if self.sender.is_none() {
+            return;
+        }
         {
             let mut cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
             if flight_is_current(&cache, &self.cache_key, self.generation) {
