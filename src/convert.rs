@@ -519,10 +519,9 @@ fn reset_struct_list_sizes(
             .r#type
             .as_ref()
             .ok_or_else(|| SpannerError::Conversion("STRUCT field without type".to_string()))?;
-        let field_type = Type::from((**field_type).clone());
-        match field_type.code() {
+        match TypeCode::from(field_type.code.clone()) {
             TypeCode::Struct => {
-                let nested_type = field_type.struct_type().ok_or_else(|| {
+                let nested_type = field_type.struct_type.as_deref().ok_or_else(|| {
                     SpannerError::Conversion("Nested STRUCT without struct_type".to_string())
                 })?;
                 let child = struct_vector.struct_vector_child(field_idx);
