@@ -26,11 +26,11 @@ DUCKDB_VERSION_CHECK := scripts/check-duckdb-version.sh
 EMULATOR_NAME := spanner-emulator
 DUCKDB_TARGET_VERSION := v1.5.4
 DUCKDB_BIN ?= duckdb
-DUCKDB_CLI_VERSION := $(shell $(DUCKDB_BIN) --version 2>/dev/null | sed -nE 's/^v?([0-9]+\.[0-9]+\.[0-9]+).*/v\1/p')
+DUCKDB_CLI_VERSION := $(shell "$(DUCKDB_BIN)" --version 2>/dev/null | sed -nE 's/^v?([0-9]+\.[0-9]+\.[0-9]+).*/v\1/p')
 
 # The unstable C_STRUCT ABI is compiled for one exact DuckDB version. An
 # explicit metadata override is retained only when it resolves to that target.
-normalize_duckdb_version = v$(patsubst v%,%,$(strip $(1)))
+normalize_duckdb_version = $(if $(strip $(1)),v$(patsubst v%,%,$(strip $(1))))
 DUCKDB_VERSION_INPUT := $(DUCKDB_VERSION)
 ifeq ($(strip $(DUCKDB_VERSION_INPUT)),)
   DUCKDB_VERSION_INPUT := $(DUCKDB_CLI_VERSION)
