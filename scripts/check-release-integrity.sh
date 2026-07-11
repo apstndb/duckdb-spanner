@@ -85,7 +85,7 @@ while IFS= read -r ci_tools_version; do
   fi
   ((ci_tools_version_count += 1))
 done < <(
-  sed -nE '/^[[:space:]]*#/!s/.*ci_tools_version:[[:space:]]*([0-9a-fA-F]{40}).*/\1/p' "${workflow_files[@]}"
+  sed -nE "/^[[:space:]]*#/!s/.*ci_tools_version:[[:space:]]*['\"]?([0-9a-fA-F]{40})['\"]?.*/\1/p" "${workflow_files[@]}"
 )
 
 if ((ci_tools_version_count != 2)); then
