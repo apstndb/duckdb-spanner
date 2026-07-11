@@ -4,6 +4,8 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 release_tag=""
+readonly EXPECTED_WORKFLOW_REFS=2
+readonly EXPECTED_CI_TOOLS_VERSIONS=2
 while (($# > 0)); do
   case "$1" in
     --release-tag)
@@ -33,15 +35,13 @@ if ((${#workflow_files[@]} == 0)); then
   exit 1
 fi
 readonly full_sha_use_pattern="^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]+['\"]?[^@'\"[:space:]]+@[0-9a-fA-F]{40}['\"]?[[:space:]]+#.+$"
+readonly local_ref_pattern="^[[:space:]]*['\"]?\.\.?/"
 
 invalid_uses=0
 for workflow in "${workflow_files[@]}"; do
   while IFS= read -r line; do
     use_ref=${line#*uses:}
-    use_ref=${use_ref#"${use_ref%%[![:space:]]*}"}
-    use_ref=${use_ref#\"}
-    use_ref=${use_ref#\'}
-    if [[ "$use_ref" == ./* || "$use_ref" == ../* ]]; then
+    if [[ "$use_ref" =~ $local_ref_pattern ]]; then
       continue
     fi
     if [[ ! "$line" =~ $full_sha_use_pattern ]]; then
@@ -55,9 +55,9 @@ if ((invalid_uses)); then
   exit 1
 fi
 
-gitlink_commit="$(git ls-tree HEAD -- extension-ci-tools | awk '$1 == "160000" && $4 == "extension-ci-tools" { print $3 }')"
+gitlink_commit="$(git ls-files -s -- extension-ci-tools | awk '$1 == "160000" && $4 == "extension-ci-tools" { print $2 }')"
 if [[ ! "$gitlink_commit" =~ ^[0-9a-fA-F]{40}$ ]]; then
-  echo "error: could not read the extension-ci-tools gitlink from HEAD" >&2
+  echo "error: could not read the extension-ci-tools gitlink from the git index" >&2
   exit 1
 fi
 
@@ -72,8 +72,8 @@ done < <(
   sed -nE '/^[[:space:]]*#/!s/.*duckdb\/extension-ci-tools\/\.github\/workflows\/_extension_distribution\.yml@([0-9a-fA-F]{40}).*/\1/p' "${workflow_files[@]}"
 )
 
-if ((workflow_ref_count != 2)); then
-  echo "error: expected two pinned extension-ci-tools reusable workflow references, found $workflow_ref_count" >&2
+if ((workflow_ref_count != EXPECTED_WORKFLOW_REFS)); then
+  echo "error: expected $EXPECTED_WORKFLOW_REFS pinned extension-ci-tools reusable workflow references, found $workflow_ref_count" >&2
   exit 1
 fi
 
@@ -88,8 +88,8 @@ done < <(
   sed -nE "/^[[:space:]]*#/!s/.*ci_tools_version:[[:space:]]*['\"]?([0-9a-fA-F]{40})['\"]?.*/\1/p" "${workflow_files[@]}"
 )
 
-if ((ci_tools_version_count != 2)); then
-  echo "error: expected two pinned ci_tools_version values, found $ci_tools_version_count" >&2
+if ((ci_tools_version_count != EXPECTED_CI_TOOLS_VERSIONS)); then
+  echo "error: expected $EXPECTED_CI_TOOLS_VERSIONS pinned ci_tools_version values, found $ci_tools_version_count" >&2
   exit 1
 fi
 
