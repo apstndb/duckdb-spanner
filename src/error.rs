@@ -1,9 +1,11 @@
+use std::sync::Arc;
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum SpannerError {
     #[error("Google Cloud error: {0}")]
-    GoogleCloud(#[from] google_cloud_gax::error::Error),
+    GoogleCloud(#[source] Arc<google_cloud_gax::error::Error>),
 
     #[error("Google Cloud client builder error: {0}")]
     GoogleCloudClientBuilder(#[from] google_cloud_gax::client_builder::Error),
@@ -13,4 +15,10 @@ pub enum SpannerError {
 
     #[error("{0}")]
     Other(String),
+}
+
+impl From<google_cloud_gax::error::Error> for SpannerError {
+    fn from(error: google_cloud_gax::error::Error) -> Self {
+        Self::GoogleCloud(Arc::new(error))
+    }
 }

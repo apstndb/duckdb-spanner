@@ -4,7 +4,7 @@ A DuckDB extension for querying [Google Cloud Spanner](https://cloud.google.com/
 
 > **Experimental**: This extension is under active development. The API (function signatures, named parameters, configuration) may change without notice between versions. Do not depend on backward compatibility.
 
-Both **GoogleSQL** and **PostgreSQL** dialect databases are supported transparently. Dialect detection is automatic — no configuration needed. `spanner_query` and `spanner_scan` work the same way regardless of the database dialect.
+Both **GoogleSQL** and **PostgreSQL** dialect databases are supported transparently. Dialect detection is automatic on normal endpoints. When an older or custom endpoint does not support `INFORMATION_SCHEMA.DATABASE_OPTIONS`, pass `dialect := 'googlesql'` or `dialect := 'postgresql'` to `spanner_scan` or `spanner_tables`, or `dialect 'googlesql'` / `dialect 'postgresql'` to `COPY ... FORMAT spanner`.
 
 ## Prerequisites
 
@@ -253,6 +253,9 @@ SELECT * FROM spanner_tables(
     schema := 'public',
     table_name := 'active_users'
 );
+
+-- Override automatic discovery for an older or custom endpoint.
+SELECT * FROM spanner_tables(dialect := 'googlesql');
 ```
 
 ### Config Options
@@ -330,6 +333,8 @@ When both `parallelism_mode` and `use_parallelism` are supplied, `parallelism_mo
 |-----------|------|-------------|
 | `index` | VARCHAR | Secondary index name to use for the read |
 | `dialect` | VARCHAR | Database dialect: `'googlesql'` or `'postgresql'` (auto-detected if omitted) |
+
+`spanner_tables` accepts the same `dialect` parameter. An explicit value bypasses metadata discovery; invalid values fail rather than falling back to a guess.
 
 ### `spanner_ddl`
 
@@ -418,6 +423,7 @@ Options:
 | `instance` | VARCHAR | (config) | Spanner instance ID |
 | `database` | VARCHAR | (config) | Spanner database ID |
 | `endpoint` | VARCHAR | (config) | Custom gRPC endpoint |
+| `dialect` | VARCHAR | (auto-detected) | Database dialect: `'googlesql'` or `'postgresql'`; bypasses metadata discovery |
 | `mode` | VARCHAR | `insert_or_update` | Mutation mode: `insert`, `update`, `insert_or_update`, or `replace` |
 | `batch_size` | VARCHAR | `1000` | Rows per independent commit (1 to 80,000) |
 | `columns` | VARCHAR[] | (none) | Target Spanner column names in source-column order |
@@ -451,7 +457,8 @@ COPY my_table TO 'Users' (FORMAT spanner, mode 'insert');
 -- With explicit database path
 COPY my_table TO 'Users' (
     FORMAT spanner,
-    database_path 'projects/p/instances/i/databases/d'
+    database_path 'projects/p/instances/i/databases/d',
+    dialect 'googlesql'
 );
 ```
 

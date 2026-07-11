@@ -1542,7 +1542,8 @@ fn test_pg_spanner_tables_filters() {
         .query_row(
             &format!(
                 "SELECT table_name, table_type, parent_table_name FROM spanner_tables(\
-                 database_path := '{}', endpoint := '{}', table_type := 'VIEW', \
+                 database_path := '{}', endpoint := '{}', dialect := 'postgresql', \
+                 table_type := 'VIEW', \
                  schema := 'public', table_name := 'user_names')",
                 db.database_path(),
                 db.emulator_host()
@@ -2147,7 +2148,8 @@ fn test_pg_copy_to_basic() {
         "COPY (SELECT CAST(100 AS BIGINT) AS id, 'alice' AS name, 1.5 AS value \
          UNION ALL SELECT CAST(101 AS BIGINT), 'bob', 2.5 \
          UNION ALL SELECT CAST(102 AS BIGINT), 'charlie', 3.5) \
-         TO 'pgsql_copy_target' (FORMAT spanner, database_path '{}', endpoint '{}')",
+         TO 'pgsql_copy_target' (FORMAT spanner, database_path '{}', endpoint '{}', \
+         dialect 'postgresql')",
         db.database_path(),
         db.emulator_host()
     );

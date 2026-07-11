@@ -25,7 +25,15 @@ statement ok
 COPY (SELECT CAST(900 AS BIGINT) AS Id, 'sqllogic_alice' AS Name, CAST(1.5 AS DOUBLE) AS Value) TO 'CopyTarget' (FORMAT spanner);
 
 statement ok
+COPY (SELECT CAST(899 AS BIGINT) AS Id, 'explicit_dialect' AS Name, CAST(1.25 AS DOUBLE) AS Value) TO 'CopyTarget' (FORMAT spanner, dialect 'googlesql');
+
+statement ok
 SELECT IF(Name = 'sqllogic_alice', 1, error('expected copied name')) FROM spanner_query('SELECT Name FROM CopyTarget WHERE Id = 900');
+
+statement error
+COPY (SELECT CAST(898 AS BIGINT) AS Id, 'invalid_dialect' AS Name, CAST(1.0 AS DOUBLE) AS Value) TO 'CopyTarget' (FORMAT spanner, dialect 'not-a-dialect');
+----
+Invalid dialect 'not-a-dialect'
 
 statement ok
 SELECT IF(strpos(Value::VARCHAR, '1.5') > 0, 1, error('expected copied value 1.5')) FROM spanner_query('SELECT Value FROM CopyTarget WHERE Id = 900');

@@ -5,6 +5,7 @@
 //! COPY my_table TO 'SpannerTable' (FORMAT spanner);
 //! COPY my_table TO 'SpannerTable' (FORMAT spanner,
 //!     database_path 'projects/p/instances/i/databases/d',
+//!     dialect 'googlesql',
 //!     mode 'insert_or_update',
 //!     batch_size 500);
 //! ```
@@ -173,6 +174,7 @@ struct StructFieldMeta {
 struct CopyBindData {
     database_path: String,
     endpoint: Option<String>,
+    dialect: DatabaseDialect,
     mode: MutationMode,
     batch_size: usize,
     target_columns: Option<Vec<String>>,
@@ -328,6 +330,12 @@ unsafe fn copy_bind_inner(info: ffi::duckdb_copy_function_bind_info) -> Result<(
         .map(ToOwned::to_owned)
         .or_else(|| cfg("spanner_endpoint"));
 
+    let dialect = option_value(&opts, "dialect")
+        .map(schema::parse_dialect)
+        .transpose()
+        .map_err(|e| e.to_string())?
+        .unwrap_or(DatabaseDialect::Unspecified);
+
     let mode = match option_value(&opts, "mode") {
         Some(m) => MutationMode::parse(m)?,
         None => MutationMode::InsertOrUpdate,
@@ -350,6 +358,7 @@ unsafe fn copy_bind_inner(info: ffi::duckdb_copy_function_bind_info) -> Result<(
     let data = Box::new(CopyBindData {
         database_path,
         endpoint,
+        dialect,
         mode,
         batch_size,
         target_columns: opts.get("columns").cloned(),
@@ -394,11 +403,12 @@ unsafe fn copy_global_init_inner(
     .map_err(|e| format!("Runtime error: {e}"))?
     .map_err(|e| format!("Failed to connect to Spanner: {e}"))?;
 
-    // Discover table schema (auto-detect dialect)
+    // An explicit dialect avoids metadata discovery for endpoints that do not
+    // expose INFORMATION_SCHEMA.DATABASE_OPTIONS.
     let schema_columns = runtime::block_on(schema::discover_table_schema(
         &client,
         &table_name,
-        DatabaseDialect::Unspecified,
+        bind_data.dialect.clone(),
         &bind_data.database_path,
         bind_data.endpoint.as_deref(),
     ))
