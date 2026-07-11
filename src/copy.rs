@@ -801,7 +801,7 @@ unsafe fn extract_options(
             }
             let name = CStr::from_ptr(name_ptr.as_ptr())
                 .to_string_lossy()
-                .to_lowercase();
+                .to_ascii_lowercase();
 
             // Skip 'format' — already consumed by DuckDB
             if name == "format" {
@@ -842,8 +842,9 @@ unsafe fn extract_options(
             if let (Some(k), Some(v)) =
                 (value_to_string(key.as_raw()), value_to_string(val.as_raw()))
             {
-                if k.to_lowercase() != "format" {
-                    opts.insert(k.to_lowercase(), vec![v]);
+                let key = k.to_ascii_lowercase();
+                if key != "format" {
+                    opts.insert(key, vec![v]);
                 }
             }
         }

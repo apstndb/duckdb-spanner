@@ -142,7 +142,10 @@ unsafe fn register_varchar_option(con: ffi::duckdb_connection, name: &str, descr
     let c_desc = CString::new(description).unwrap();
     ffi::duckdb_config_option_set_description(option.as_raw(), c_desc.as_ptr());
 
-    // Registration copies the builder; the guard destroys it on either result.
+    // DuckDB 1.5.4's config_options-c.cpp copies this builder's fields into
+    // AddExtensionOption and never takes or deletes the CConfigOption. The C API
+    // header also requires callers to destroy every duckdb_create_config_option
+    // result, so keep the guard armed on both success and failure.
     let rc = ffi::duckdb_register_config_option(con, option.as_raw());
     if rc != ffi::DuckDBSuccess {
         eprintln!("[duckdb-spanner] Failed to register config option: {name}");
