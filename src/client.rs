@@ -99,8 +99,8 @@ pub async fn get_or_create_client(
     let cache_key = profile.identity();
 
     // Look up (or create) the slot for this key under the std mutex. The lock is
-    // released before any `.await` below — bind runs on `block_on`, so holding a
-    // std mutex across an await point could deadlock the runtime.
+    // released before any `.await` below; holding a std mutex across async
+    // client initialization could deadlock concurrent callers.
     let (slot, evicted) = {
         let mut cache = CLIENT_CACHE.lock().unwrap_or_else(|e| e.into_inner());
         cache.get_or_insert_with(cache_key.clone(), || Arc::new(OnceCell::new()))
