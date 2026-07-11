@@ -1,13 +1,21 @@
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use duckdb::core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId};
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab, Value};
 use google_cloud_auth::credentials::anonymous::Builder as Anonymous;
-use google_cloud_gax::paginator::ItemPaginator;
+use google_cloud_gax::options::RequestOptionsBuilder;
+use google_cloud_gax::paginator::Paginator;
+use google_cloud_gax::retry_policy::{Aip194Strict, RetryPolicy, RetryPolicyExt};
 use google_cloud_longrunning::model::{operation, Operation as InternalOperation};
 use google_cloud_spanner_admin_database_v1::client::DatabaseAdmin;
-use tokio::sync::OnceCell;
+use reqwest::{Method, StatusCode};
+use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
+use tokio::task::AbortHandle;
 
 use crate::cache::LruCache;
 use crate::error::SpannerError;
@@ -17,23 +25,753 @@ use crate::{bind_utils, runtime};
 // Admin client cache
 // ---------------------------------------------------------------------------
 
+/// The data client uses the same 15-second bound in `src/client.rs`. Keeping
+/// admin client construction aligned prevents unreachable ADC or endpoints
+/// from hanging a DDL bind indefinitely.
+const ADMIN_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Bound one HTTP/RPC attempt, including reading its response body. Half of
+/// the SDK's 60-second retry window leaves room for a second attempt instead
+/// of allowing one stalled response to consume the whole logical request.
+const ADMIN_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The pinned Google Cloud Rust transport defaults retrying requests to at
+/// most 10 attempts and 60 seconds. We make both limits explicit and apply the
+/// same contract to the emulator REST fallback.
+const ADMIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const ADMIN_MAX_ATTEMPTS: u32 = 10;
+
+/// Google Cloud Workflows uses 30 minutes as its default Spanner UpdateDdl LRO
+/// timeout. Long schema backfills can take hours, so callers that need a longer
+/// wait should submit with `spanner_ddl_async` and inspect the operation later.
+const DDL_OPERATION_DEADLINE: Duration = Duration::from_secs(30 * 60);
+
+/// Listing is not an LRO and should finish promptly even with pagination. This
+/// generous deadline still guarantees that a bad server cannot block forever.
+const OPERATIONS_LIST_DEADLINE: Duration = Duration::from_secs(2 * 60);
+
+/// A second independent guard for broken paginators. Spanner retains completed
+/// database operations for seven days, so 1,000 server-sized pages is already
+/// far beyond normal use while remaining finite.
+const MAX_OPERATION_PAGES: usize = 1_000;
+
+const RETRY_INITIAL_DELAY: Duration = Duration::from_millis(100);
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
+const POLL_INITIAL_DELAY: Duration = Duration::from_millis(500);
+const POLL_MAX_DELAY: Duration = Duration::from_secs(10);
+
+#[derive(Clone, Copy)]
+struct DdlTimeouts {
+    connect: Duration,
+    attempt: Duration,
+    request: Duration,
+    operation: Duration,
+    list: Duration,
+    retry_initial: Duration,
+    retry_max: Duration,
+    poll_initial: Duration,
+    poll_max: Duration,
+    max_attempts: u32,
+    max_pages: usize,
+}
+
+const DEFAULT_TIMEOUTS: DdlTimeouts = DdlTimeouts {
+    connect: ADMIN_CONNECT_TIMEOUT,
+    attempt: ADMIN_ATTEMPT_TIMEOUT,
+    request: ADMIN_REQUEST_TIMEOUT,
+    operation: DDL_OPERATION_DEADLINE,
+    list: OPERATIONS_LIST_DEADLINE,
+    retry_initial: RETRY_INITIAL_DELAY,
+    retry_max: RETRY_MAX_DELAY,
+    poll_initial: POLL_INITIAL_DELAY,
+    poll_max: POLL_MAX_DELAY,
+    max_attempts: ADMIN_MAX_ATTEMPTS,
+    max_pages: MAX_OPERATION_PAGES,
+};
+
+static OPERATION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static BACKOFF_SEED_COUNTER: AtomicU64 = AtomicU64::new(0x9e37_79b9_7f4a_7c15);
+
+fn duration_label(duration: Duration) -> String {
+    if duration.subsec_nanos() == 0 {
+        format!("{}s", duration.as_secs())
+    } else {
+        format!("{duration:?}")
+    }
+}
+
+fn new_operation_id() -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = OPERATION_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "duckdb_spanner_{:x}_{timestamp:x}_{sequence:x}",
+        std::process::id()
+    )
+}
+
+fn next_backoff_seed() -> u64 {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    BACKOFF_SEED_COUNTER.fetch_add(0x9e37_79b9_7f4a_7c15, Ordering::Relaxed) ^ timestamp
+}
+
+struct JitteredBackoff {
+    initial: Duration,
+    maximum: Duration,
+    attempt: u32,
+    state: u64,
+}
+
+impl JitteredBackoff {
+    fn new(initial: Duration, maximum: Duration) -> Self {
+        Self::with_seed(initial, maximum, next_backoff_seed())
+    }
+
+    fn with_seed(initial: Duration, maximum: Duration, seed: u64) -> Self {
+        Self {
+            initial,
+            maximum,
+            attempt: 0,
+            state: if seed == 0 {
+                0xa076_1d64_78bd_642f
+            } else {
+                seed
+            },
+        }
+    }
+
+    /// Full jitter over a truncated exponential cap, matching the strategy
+    /// used by the pinned Google Cloud Rust request backoff.
+    fn next_delay(&mut self) -> Duration {
+        let exponent = self.attempt.min(31);
+        self.attempt = self.attempt.saturating_add(1);
+        let cap = self
+            .initial
+            .saturating_mul(1_u32 << exponent)
+            .min(self.maximum);
+        let cap_nanos = cap.as_nanos().min(u64::MAX as u128) as u64;
+        if cap_nanos == 0 {
+            return Duration::ZERO;
+        }
+
+        let mut value = self.state;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        self.state = value;
+
+        let jitter_nanos = if cap_nanos == u64::MAX {
+            value
+        } else {
+            value % (cap_nanos + 1)
+        };
+        Duration::from_nanos(jitter_nanos)
+    }
+}
+
+type HttpFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
+
+#[derive(Clone)]
+struct EmulatorRequest {
+    method: Method,
+    url: String,
+    query: Vec<(String, String)>,
+    json: Option<serde_json::Value>,
+}
+
+struct EmulatorResponse {
+    status: StatusCode,
+    body: HttpFuture<Result<String, String>>,
+}
+
+trait EmulatorTransport: Send + Sync {
+    fn send(&self, request: EmulatorRequest) -> HttpFuture<Result<EmulatorResponse, String>>;
+}
+
+#[derive(Clone)]
+struct ReqwestEmulatorTransport {
+    client: reqwest::Client,
+}
+
+impl ReqwestEmulatorTransport {
+    fn new(connect_timeout: Duration) -> Result<Self, SpannerError> {
+        let client = reqwest::Client::builder()
+            .connect_timeout(connect_timeout)
+            .build()
+            .map_err(|error| {
+                SpannerError::Other(format!(
+                    "Failed to build emulator admin HTTP client with {} connect timeout: {error}",
+                    duration_label(connect_timeout)
+                ))
+            })?;
+        Ok(Self { client })
+    }
+}
+
+impl EmulatorTransport for ReqwestEmulatorTransport {
+    fn send(&self, request: EmulatorRequest) -> HttpFuture<Result<EmulatorResponse, String>> {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let mut builder = client
+                .request(request.method, request.url)
+                .query(&request.query);
+            if let Some(json) = request.json {
+                builder = builder.json(&json);
+            }
+
+            let response = builder
+                .send()
+                .await
+                .map_err(|error| format!("request transport failed: {error}"))?;
+            let status = response.status();
+            let body = Box::pin(async move {
+                response
+                    .text()
+                    .await
+                    .map_err(|error| format!("response body read failed: {error}"))
+            });
+            Ok(EmulatorResponse { status, body })
+        })
+    }
+}
+
+struct EmulatorResponseData {
+    status: StatusCode,
+    body: String,
+}
+
+enum EmulatorAttemptError {
+    Timeout,
+    Transport(String),
+}
+
+impl std::fmt::Display for EmulatorAttemptError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Timeout => formatter.write_str("attempt timed out while sending or reading body"),
+            Self::Transport(error) => formatter.write_str(error),
+        }
+    }
+}
+
+async fn send_emulator_attempt(
+    transport: &dyn EmulatorTransport,
+    request: EmulatorRequest,
+    timeout: Duration,
+) -> Result<EmulatorResponseData, EmulatorAttemptError> {
+    match tokio::time::timeout(timeout, async {
+        let response = transport
+            .send(request)
+            .await
+            .map_err(EmulatorAttemptError::Transport)?;
+        let body = response
+            .body
+            .await
+            .map_err(EmulatorAttemptError::Transport)?;
+        Ok(EmulatorResponseData {
+            status: response.status,
+            body,
+        })
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(EmulatorAttemptError::Timeout),
+    }
+}
+
+fn is_ambiguous_http_status(status: StatusCode) -> bool {
+    status == StatusCode::REQUEST_TIMEOUT
+        || status == StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+}
+
+fn google_error_code_and_message(body: &str) -> Option<(i64, String)> {
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error = json.get("error").unwrap_or(&json);
+    Some((
+        error.get("code")?.as_i64()?,
+        error.get("message")?.as_str()?.to_string(),
+    ))
+}
+
+fn is_emulator_schema_change_rejection(body: &str) -> bool {
+    google_error_code_and_message(body).is_some_and(|(code, message)| {
+        code == 9 && message.contains("Schema change operation rejected")
+    })
+}
+
+fn is_emulator_replay_conflict(status: StatusCode, body: &str) -> bool {
+    status == StatusCode::CONFLICT
+        && google_error_code_and_message(body).is_some_and(|(code, _)| code == 6)
+}
+
+fn body_excerpt(body: &str) -> String {
+    const MAX_CHARS: usize = 4_096;
+    let mut chars = body.chars();
+    let excerpt: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{excerpt}...[truncated]")
+    } else {
+        excerpt
+    }
+}
+
+async fn send_emulator_request(
+    transport: &dyn EmulatorTransport,
+    request: EmulatorRequest,
+    context: &str,
+    timeouts: DdlTimeouts,
+) -> Result<EmulatorResponseData, SpannerError> {
+    let started = tokio::time::Instant::now();
+    let mut backoff = JitteredBackoff::new(timeouts.retry_initial, timeouts.retry_max);
+    let mut last_error = "request was not attempted".to_string();
+
+    for attempt in 1..=timeouts.max_attempts {
+        let remaining = timeouts.request.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+
+        let attempt_timeout = timeouts.attempt.min(remaining);
+        match send_emulator_attempt(transport, request.clone(), attempt_timeout).await {
+            Ok(response) if response.status.is_success() => return Ok(response),
+            Ok(response) => {
+                let retryable = is_ambiguous_http_status(response.status);
+                let detail = format!(
+                    "status={}, body={}",
+                    response.status,
+                    body_excerpt(&response.body)
+                );
+                if !retryable {
+                    return Err(SpannerError::Other(format!(
+                        "{context} failed on attempt {attempt}: {detail}"
+                    )));
+                }
+                last_error = detail;
+            }
+            Err(error) => {
+                // This helper is used only for read-only GET requests.
+                last_error = error.to_string();
+            }
+        }
+
+        if attempt == timeouts.max_attempts {
+            break;
+        }
+        let remaining = timeouts.request.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        tokio::time::sleep(backoff.next_delay().min(remaining)).await;
+    }
+
+    Err(SpannerError::Other(format!(
+        "{context} did not succeed within {} (maximum {} attempts); last error: {last_error}",
+        duration_label(timeouts.request),
+        timeouts.max_attempts
+    )))
+}
+
+fn admin_retry_policy() -> impl RetryPolicy {
+    Aip194Strict
+        .continue_on_client_timeout()
+        .continue_on_too_many_requests()
+        .with_time_limit(ADMIN_REQUEST_TIMEOUT)
+        .with_attempt_limit(ADMIN_MAX_ATTEMPTS)
+}
+
+fn bounded_admin_request<T>(request: T) -> T
+where
+    T: RequestOptionsBuilder,
+{
+    request
+        .with_idempotency(true)
+        .with_attempt_timeout(ADMIN_ATTEMPT_TIMEOUT)
+        .with_retry_policy(admin_retry_policy())
+}
+
+enum AdminRequestError {
+    Timeout,
+    GoogleCloud(google_cloud_gax::error::Error),
+}
+
+async fn send_admin_request<T>(
+    request: impl Future<Output = Result<T, google_cloud_gax::error::Error>>,
+) -> Result<T, AdminRequestError> {
+    match tokio::time::timeout(ADMIN_REQUEST_TIMEOUT, request).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(AdminRequestError::GoogleCloud(error)),
+        Err(_) => Err(AdminRequestError::Timeout),
+    }
+}
+
+fn admin_request_error(context: &str, error: AdminRequestError) -> SpannerError {
+    SpannerError::Other(format!("{context}: {}", admin_request_detail(&error)))
+}
+
+fn admin_request_detail(error: &AdminRequestError) -> String {
+    match error {
+        AdminRequestError::Timeout => {
+            format!("timed out after {}", duration_label(ADMIN_REQUEST_TIMEOUT))
+        }
+        AdminRequestError::GoogleCloud(error) => format!(
+            "failed within the {} request bound: {error}",
+            duration_label(ADMIN_REQUEST_TIMEOUT)
+        ),
+    }
+}
+
+fn admin_request_is_already_exists(error: &AdminRequestError) -> bool {
+    matches!(
+        error,
+        AdminRequestError::GoogleCloud(error)
+            if error.status().is_some_and(|status| {
+                status.code == google_cloud_gax::error::rpc::Code::AlreadyExists
+            })
+    )
+}
+
+fn admin_request_is_ambiguous(error: &AdminRequestError) -> bool {
+    match error {
+        AdminRequestError::Timeout => true,
+        AdminRequestError::GoogleCloud(error) => {
+            // An HTTP response is more specific than the generic transport
+            // classification. Scan the whole GAX source chain first so a
+            // wrapped terminal 4xx cannot be mistaken for an ambiguous
+            // transport failure.
+            let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+            while let Some(current) = source {
+                if let Some(status) = current
+                    .downcast_ref::<google_cloud_gax::error::Error>()
+                    .and_then(google_cloud_gax::error::Error::http_status_code)
+                {
+                    return gax_submission_signals_are_ambiguous(Some(status), false, None);
+                }
+                source = current.source();
+            }
+
+            let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+            while let Some(current) = source {
+                if let Some(error) = current.downcast_ref::<google_cloud_gax::error::Error>() {
+                    if gax_submission_signals_are_ambiguous(
+                        None,
+                        error.is_timeout() || error.is_io() || error.is_transport(),
+                        error.status().map(|status| status.code),
+                    ) {
+                        return true;
+                    }
+                }
+                source = current.source();
+            }
+            false
+        }
+    }
+}
+
+fn gax_submission_signals_are_ambiguous(
+    http_status: Option<u16>,
+    timeout_io_or_transport: bool,
+    rpc_code: Option<google_cloud_gax::error::rpc::Code>,
+) -> bool {
+    use google_cloud_gax::error::rpc::Code;
+
+    if let Some(status) = http_status {
+        return is_ambiguous_submission_http_code(status);
+    }
+    timeout_io_or_transport
+        || matches!(
+            rpc_code,
+            Some(Code::DeadlineExceeded | Code::Unknown | Code::Internal | Code::Unavailable)
+        )
+}
+
+fn is_ambiguous_submission_http_code(status: u16) -> bool {
+    status == StatusCode::REQUEST_TIMEOUT.as_u16()
+        || status == StatusCode::TOO_MANY_REQUESTS.as_u16()
+        || (500..600).contains(&status)
+}
+
+async fn recover_ambiguous_submission<T>(
+    service: &str,
+    operation_name: &str,
+    submission_detail: &str,
+    lookup: impl Future<Output = Result<T, SpannerError>>,
+) -> Result<T, SpannerError> {
+    lookup.await.map_err(|lookup_error| {
+        SpannerError::Other(format!(
+            "{service} outcome is ambiguous for operation {operation_name}; submission error: {submission_detail}; deterministic operation lookup failed: {lookup_error}; do not blindly resubmit the DDL"
+        ))
+    })
+}
+
 /// Maximum number of admin client identities retained at once. The key is the
 /// same endpoint/auth identity used by the previous unbounded cache.
 const ADMIN_CACHE_CAPACITY: usize = 8;
+const ADMIN_MAX_CONCURRENT_INITIALIZATIONS: usize = 4;
 
-type CacheSlot<T> = Arc<OnceCell<Arc<T>>>;
-type AdminClientSlot = CacheSlot<DatabaseAdmin>;
+type InitializationResult<T> = Result<Arc<T>, Arc<str>>;
+type InitializationReceiver<T> = watch::Receiver<Option<InitializationResult<T>>>;
 
-static ADMIN_CLIENT_CACHE: LazyLock<Mutex<LruCache<String, AdminClientSlot>>> =
-    LazyLock::new(|| Mutex::new(LruCache::new(ADMIN_CACHE_CAPACITY)));
-
-fn get_or_insert_cache_slot<T>(
-    cache: &Mutex<LruCache<String, CacheSlot<T>>>,
-    cache_key: String,
-) -> (CacheSlot<T>, Option<CacheSlot<T>>) {
-    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
-    cache.get_or_insert_with(cache_key, || Arc::new(OnceCell::new()))
+struct ClientFlight<T> {
+    generation: u64,
+    receiver: InitializationReceiver<T>,
 }
+
+struct ClientCache<T> {
+    completed: LruCache<String, Arc<T>>,
+    in_flight: HashMap<String, ClientFlight<T>>,
+    next_generation: u64,
+    admission: Arc<Semaphore>,
+    max_concurrent_initializations: usize,
+}
+
+impl<T> ClientCache<T> {
+    fn new(completed_capacity: usize, max_concurrent_initializations: usize) -> Self {
+        assert!(
+            max_concurrent_initializations >= 1,
+            "initialization concurrency must be at least 1"
+        );
+        Self {
+            completed: LruCache::new(completed_capacity),
+            in_flight: HashMap::new(),
+            next_generation: 0,
+            admission: Arc::new(Semaphore::new(max_concurrent_initializations)),
+            max_concurrent_initializations,
+        }
+    }
+
+    fn allocate_generation(&mut self) -> u64 {
+        self.next_generation = self.next_generation.wrapping_add(1);
+        if self.next_generation == 0 {
+            self.next_generation = 1;
+        }
+        self.next_generation
+    }
+}
+
+enum ClientCacheLookup<T> {
+    Completed(Arc<T>),
+    InFlight(InitializationReceiver<T>),
+    Start {
+        receiver: InitializationReceiver<T>,
+        sender: watch::Sender<Option<InitializationResult<T>>>,
+        generation: u64,
+        permit: OwnedSemaphorePermit,
+    },
+}
+
+fn lookup_cached_client<T>(
+    cache: &Mutex<ClientCache<T>>,
+    cache_key: &String,
+) -> Result<ClientCacheLookup<T>, SpannerError> {
+    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(client) = cache.completed.get(cache_key) {
+        return Ok(ClientCacheLookup::Completed(client));
+    }
+    if let Some(flight) = cache.in_flight.get(cache_key) {
+        return Ok(ClientCacheLookup::InFlight(flight.receiver.clone()));
+    }
+
+    let permit = Arc::clone(&cache.admission)
+        .try_acquire_owned()
+        .map_err(|error| {
+            SpannerError::Other(format!(
+                "Spanner admin client initialization capacity is full (maximum {} unique in-flight endpoints; endpoint={cache_key}): {error}",
+                cache.max_concurrent_initializations
+            ))
+        })?;
+    let (sender, receiver) = watch::channel(None);
+    let generation = cache.allocate_generation();
+    cache.in_flight.insert(
+        cache_key.clone(),
+        ClientFlight {
+            generation,
+            receiver: receiver.clone(),
+        },
+    );
+    Ok(ClientCacheLookup::Start {
+        receiver,
+        sender,
+        generation,
+        permit,
+    })
+}
+
+fn flight_is_current<T>(cache: &ClientCache<T>, cache_key: &str, generation: u64) -> bool {
+    cache
+        .in_flight
+        .get(cache_key)
+        .is_some_and(|flight| flight.generation == generation)
+}
+
+struct FlightCleanupGuard<T> {
+    cache: Arc<Mutex<ClientCache<T>>>,
+    cache_key: String,
+    generation: u64,
+    sender: Option<watch::Sender<Option<InitializationResult<T>>>>,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl<T> FlightCleanupGuard<T> {
+    fn new(
+        cache: Arc<Mutex<ClientCache<T>>>,
+        cache_key: String,
+        generation: u64,
+        sender: watch::Sender<Option<InitializationResult<T>>>,
+        permit: OwnedSemaphorePermit,
+    ) -> Self {
+        Self {
+            cache,
+            cache_key,
+            generation,
+            sender: Some(sender),
+            permit: Some(permit),
+        }
+    }
+
+    fn finish(mut self, result: InitializationResult<T>) {
+        {
+            let mut cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
+            if flight_is_current(&cache, &self.cache_key, self.generation) {
+                cache.in_flight.remove(&self.cache_key);
+                if let Ok(client) = &result {
+                    drop(
+                        cache
+                            .completed
+                            .insert(self.cache_key.clone(), Arc::clone(client)),
+                    );
+                }
+            }
+        }
+        if let Some(sender) = self.sender.take() {
+            sender.send_replace(Some(result));
+        }
+        drop(self.permit.take());
+    }
+}
+
+impl<T> Drop for FlightCleanupGuard<T> {
+    fn drop(&mut self) {
+        if self.sender.is_none() {
+            return;
+        }
+        {
+            let mut cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
+            if flight_is_current(&cache, &self.cache_key, self.generation) {
+                cache.in_flight.remove(&self.cache_key);
+            }
+        }
+        // Close the old flight only after removing its matching generation.
+        // A waiter that wakes on channel closure can safely start a new flight,
+        // and this guard cannot remove that newer generation.
+        drop(self.sender.take());
+        drop(self.permit.take());
+    }
+}
+
+fn spawn_client_initialization<T, F, Fut>(
+    cache: Arc<Mutex<ClientCache<T>>>,
+    cache_key: String,
+    generation: u64,
+    permit: OwnedSemaphorePermit,
+    sender: watch::Sender<Option<InitializationResult<T>>>,
+    initialize: F,
+) -> AbortHandle
+where
+    T: Send + Sync + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<Arc<T>, SpannerError>> + Send + 'static,
+{
+    let task_cache = Arc::clone(&cache);
+    let task_key = cache_key.clone();
+    // Construct the guard before spawning. If the task is aborted before its
+    // first poll, dropping the unpolled future still removes this generation,
+    // closes its receiver, and releases its admission permit.
+    let guard = FlightCleanupGuard::new(task_cache, task_key, generation, sender, permit);
+    let task = tokio::spawn(async move {
+        let result = initialize()
+            .await
+            .map_err(|error| Arc::<str>::from(error.to_string()));
+        guard.finish(result);
+    });
+    let abort_handle = task.abort_handle();
+    drop(task);
+    abort_handle
+}
+
+async fn wait_for_cached_client<T>(
+    mut receiver: InitializationReceiver<T>,
+    timeout: Duration,
+    cache_key: &str,
+) -> Result<Arc<T>, SpannerError> {
+    let wait = async {
+        loop {
+            if let Some(result) = receiver.borrow().clone() {
+                return result.map_err(|error| SpannerError::Other(error.to_string()));
+            }
+            receiver.changed().await.map_err(|_| {
+                SpannerError::Other(format!(
+                    "Spanner admin client initialization ended without a result (endpoint={cache_key})"
+                ))
+            })?;
+        }
+    };
+
+    tokio::time::timeout(timeout, wait).await.map_err(|_| {
+        SpannerError::Other(format!(
+            "Timed out waiting for Spanner admin client initialization after {} (endpoint={cache_key})",
+            duration_label(timeout)
+        ))
+    })?
+}
+
+async fn get_or_create_cached_client<T, F, Fut>(
+    cache: Arc<Mutex<ClientCache<T>>>,
+    cache_key: String,
+    timeout: Duration,
+    initialize: F,
+) -> Result<Arc<T>, SpannerError>
+where
+    T: Send + Sync + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<Arc<T>, SpannerError>> + Send + 'static,
+{
+    let receiver = match lookup_cached_client(&cache, &cache_key)? {
+        ClientCacheLookup::Completed(client) => return Ok(client),
+        ClientCacheLookup::InFlight(receiver) => receiver,
+        ClientCacheLookup::Start {
+            receiver,
+            sender,
+            generation,
+            permit,
+        } => {
+            drop(spawn_client_initialization(
+                Arc::clone(&cache),
+                cache_key.clone(),
+                generation,
+                permit,
+                sender,
+                initialize,
+            ));
+            receiver
+        }
+    };
+
+    wait_for_cached_client(receiver, timeout, &cache_key).await
+}
+
+static ADMIN_CLIENT_CACHE: LazyLock<Arc<Mutex<ClientCache<DatabaseAdmin>>>> = LazyLock::new(|| {
+    Arc::new(Mutex::new(ClientCache::new(
+        ADMIN_CACHE_CAPACITY,
+        ADMIN_MAX_CONCURRENT_INITIALIZATIONS,
+    )))
+});
 
 /// Get or create a Spanner Admin client.
 ///
@@ -43,26 +781,14 @@ async fn get_or_create_admin_client(
     admin_endpoint: Option<&str>,
 ) -> Result<Arc<DatabaseAdmin>, SpannerError> {
     let cache_key = admin_endpoint.unwrap_or("").to_string();
-
-    // The std mutex only protects the LRU map. It is released before awaiting
-    // client construction, and the shared OnceCell makes construction for a
-    // given identity single-flight.
-    let (slot, evicted) = get_or_insert_cache_slot(&ADMIN_CLIENT_CACHE, cache_key.clone());
-
-    if let Some(evicted) = evicted {
-        // DatabaseAdmin has no public close API. Dropping the evicted slot
-        // releases the cache's ownership; active callers retain their own Arc
-        // clones and the SDK cleans up when those final references are dropped.
-        drop(evicted);
-    }
-
-    // Keep failed cells in the bounded LRU so a waiter that starts a retry uses
-    // this same OnceCell. Removing an empty slot here can race that retry and
-    // break single-flight by allowing a replacement slot to be inserted.
-    let client = slot
-        .get_or_try_init(|| create_admin_client(admin_endpoint))
-        .await?;
-    Ok(Arc::clone(client))
+    let owned_endpoint = admin_endpoint.map(str::to_string);
+    get_or_create_cached_client(
+        Arc::clone(&ADMIN_CLIENT_CACHE),
+        cache_key,
+        DEFAULT_TIMEOUTS.connect,
+        move || async move { create_admin_client(owned_endpoint.as_deref()).await },
+    )
+    .await
 }
 
 async fn create_admin_client(
@@ -78,7 +804,19 @@ async fn create_admin_client(
             .with_credentials(Anonymous::new().build());
     }
 
-    Ok(Arc::new(builder.build().await?))
+    match tokio::time::timeout(DEFAULT_TIMEOUTS.connect, builder.build()).await {
+        Ok(Ok(client)) => Ok(Arc::new(client)),
+        Ok(Err(error)) => Err(SpannerError::Other(format!(
+            "Failed to build Spanner admin client within the {} connect bound (endpoint={}): {error}",
+            duration_label(DEFAULT_TIMEOUTS.connect),
+            admin_endpoint.unwrap_or("<default>")
+        ))),
+        Err(_) => Err(SpannerError::Other(format!(
+            "Timed out building Spanner admin client after {} (endpoint={})",
+            duration_label(DEFAULT_TIMEOUTS.connect),
+            admin_endpoint.unwrap_or("<default>")
+        ))),
+    }
 }
 
 fn emulator_endpoint(endpoint: Option<&str>) -> Option<String> {
@@ -100,16 +838,18 @@ async fn update_database_ddl(
     endpoint: Option<&str>,
     admin_endpoint: Option<&str>,
 ) -> Result<InternalOperation, SpannerError> {
+    let operation_id = new_operation_id();
     if let Some(admin_endpoint) = emulator_admin_endpoint(endpoint, admin_endpoint) {
-        return update_emulator_database_ddl(&admin_endpoint, &database_path, statements).await;
+        return update_emulator_database_ddl(
+            &admin_endpoint,
+            &database_path,
+            statements,
+            &operation_id,
+        )
+        .await;
     }
 
-    Ok(admin
-        .update_database_ddl()
-        .set_database(database_path)
-        .set_statements(statements)
-        .send()
-        .await?)
+    update_real_database_ddl(admin, database_path, statements, operation_id).await
 }
 
 async fn wait_database_operation(
@@ -117,18 +857,100 @@ async fn wait_database_operation(
     operation_name: &str,
     endpoint: Option<&str>,
     admin_endpoint: Option<&str>,
+    remaining: Duration,
 ) -> Result<InternalOperation, SpannerError> {
-    if let Some(admin_endpoint) = emulator_admin_endpoint(endpoint, admin_endpoint) {
-        return wait_emulator_operation(&admin_endpoint, operation_name).await;
-    }
+    wait_with_operation_deadline(
+        operation_name,
+        remaining,
+        DEFAULT_TIMEOUTS.operation,
+        async {
+            if let Some(admin_endpoint) = emulator_admin_endpoint(endpoint, admin_endpoint) {
+                wait_emulator_operation(&admin_endpoint, operation_name).await
+            } else {
+                wait_operation(admin, operation_name).await
+            }
+        },
+    )
+    .await
+}
 
-    wait_operation(admin, operation_name).await
+async fn update_real_database_ddl(
+    admin: &DatabaseAdmin,
+    database_path: String,
+    statements: Vec<String>,
+    operation_id: String,
+) -> Result<InternalOperation, SpannerError> {
+    let operation_name = format!("{database_path}/operations/{operation_id}");
+    let request = bounded_admin_request(
+        admin
+            .update_database_ddl()
+            .set_database(database_path)
+            .set_statements(statements)
+            .set_operation_id(operation_id),
+    );
+
+    match send_admin_request(request.send()).await {
+        Ok(operation) => {
+            validate_operation(
+                &operation,
+                Some(&operation_name),
+                "Spanner UpdateDatabaseDdl",
+            )?;
+            Ok(operation)
+        }
+        Err(error) if admin_request_is_already_exists(&error) => {
+            // The explicit operation ID makes retries replay-safe. If a prior
+            // attempt reached Spanner but its response was lost, the replay
+            // returns ALREADY_EXISTS; recover the operation by its known name.
+            let update_error = admin_request_detail(&error);
+            get_real_operation(admin, &operation_name).await.map_err(|lookup_error| {
+                SpannerError::Other(format!(
+                    "Spanner UpdateDatabaseDdl replay returned ALREADY_EXISTS for {operation_name}; update error: {update_error}; operation lookup failed: {lookup_error}"
+                ))
+            })
+        }
+        Err(error) if admin_request_is_ambiguous(&error) => {
+            let detail = admin_request_detail(&error);
+            recover_ambiguous_submission(
+                "Spanner UpdateDatabaseDdl",
+                &operation_name,
+                &detail,
+                get_real_operation(admin, &operation_name),
+            )
+            .await
+        }
+        Err(error) => Err(SpannerError::Other(format!(
+            "Spanner UpdateDatabaseDdl failed for operation {operation_name}: {}",
+            admin_request_detail(&error)
+        ))),
+    }
 }
 
 async fn update_emulator_database_ddl(
     admin_endpoint: &str,
     database_path: &str,
     statements: Vec<String>,
+    operation_id: &str,
+) -> Result<InternalOperation, SpannerError> {
+    let transport = ReqwestEmulatorTransport::new(DEFAULT_TIMEOUTS.connect)?;
+    update_emulator_database_ddl_with(
+        &transport,
+        admin_endpoint,
+        database_path,
+        statements,
+        operation_id,
+        DEFAULT_TIMEOUTS,
+    )
+    .await
+}
+
+async fn update_emulator_database_ddl_with(
+    transport: &dyn EmulatorTransport,
+    admin_endpoint: &str,
+    database_path: &str,
+    statements: Vec<String>,
+    operation_id: &str,
+    timeouts: DdlTimeouts,
 ) -> Result<InternalOperation, SpannerError> {
     // google-cloud-rust's generated REST client currently sends system query
     // parameters that the Spanner emulator rejects for UpdateDatabaseDdl.
@@ -137,113 +959,283 @@ async fn update_emulator_database_ddl(
         admin_endpoint.trim_end_matches('/'),
         database_path
     );
-    let client = reqwest::Client::new();
-    let payload = serde_json::json!({ "statements": statements });
-    const MAX_ATTEMPTS: u32 = 25;
+    let operation_name = format!("{database_path}/operations/{operation_id}");
+    let request = EmulatorRequest {
+        method: Method::PATCH,
+        url,
+        query: Vec::new(),
+        json: Some(serde_json::json!({
+            "statements": statements,
+            "operationId": operation_id,
+        })),
+    };
+    let started = tokio::time::Instant::now();
+    let mut backoff = JitteredBackoff::new(timeouts.retry_initial, timeouts.retry_max);
 
-    for attempt in 1..=MAX_ATTEMPTS {
-        let response = client
-            .patch(&url)
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| SpannerError::Other(format!("Failed to update emulator DDL: {e:?}")))?;
-        let status = response.status();
-        let body = response.text().await.map_err(|e| {
-            SpannerError::Other(format!("Failed to read emulator DDL response: {e}"))
-        })?;
-
-        if status.is_success() {
-            return operation_from_json(&body);
+    for attempt in 1..=timeouts.max_attempts {
+        let remaining = timeouts.request.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(SpannerError::Other(format!(
+                "Emulator UpdateDatabaseDdl was definitively rejected by schema contention for operation {operation_name} until the {} submission bound expired",
+                duration_label(timeouts.request)
+            )));
         }
 
-        if body.contains("\"code\":9")
-            && body.contains("Schema change operation rejected")
-            && attempt < MAX_ATTEMPTS
+        let attempt_timeout = timeouts.attempt.min(remaining);
+        let response = match send_emulator_attempt(transport, request.clone(), attempt_timeout)
+            .await
         {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            Ok(response) => response,
+            Err(error) => {
+                let detail = format!("attempt {attempt}: {error}");
+                return recover_ambiguous_submission(
+                    "Emulator UpdateDatabaseDdl",
+                    &operation_name,
+                    &detail,
+                    fetch_emulator_operation(transport, admin_endpoint, &operation_name, timeouts),
+                )
+                .await;
+            }
+        };
+
+        if response.status.is_success() {
+            match operation_from_json(&response.body).and_then(|operation| {
+                validate_operation(
+                    &operation,
+                    Some(&operation_name),
+                    "emulator UpdateDatabaseDdl",
+                )?;
+                Ok(operation)
+            }) {
+                Ok(operation) => return Ok(operation),
+                Err(error) => {
+                    let detail =
+                        format!("attempt {attempt} returned an unusable success response: {error}");
+                    return recover_ambiguous_submission(
+                        "Emulator UpdateDatabaseDdl",
+                        &operation_name,
+                        &detail,
+                        fetch_emulator_operation(
+                            transport,
+                            admin_endpoint,
+                            &operation_name,
+                            timeouts,
+                        ),
+                    )
+                    .await;
+                }
+            }
+        }
+
+        if is_emulator_replay_conflict(response.status, &response.body) {
+            return fetch_emulator_operation(
+                transport,
+                admin_endpoint,
+                &operation_name,
+                timeouts,
+            )
+            .await
+            .map_err(|error| {
+                SpannerError::Other(format!(
+                    "Emulator UpdateDatabaseDdl returned ALREADY_EXISTS for operation {operation_name}; operation lookup failed: {error}; submission body={}",
+                    body_excerpt(&response.body)
+                ))
+            });
+        }
+
+        let detail = format!(
+            "attempt {attempt}: status={}, body={}",
+            response.status,
+            body_excerpt(&response.body)
+        );
+        if is_ambiguous_http_status(response.status) {
+            return recover_ambiguous_submission(
+                "Emulator UpdateDatabaseDdl",
+                &operation_name,
+                &detail,
+                fetch_emulator_operation(transport, admin_endpoint, &operation_name, timeouts),
+            )
+            .await;
+        }
+
+        if !is_emulator_schema_change_rejection(&response.body) {
+            return Err(SpannerError::Other(format!(
+                "Emulator UpdateDatabaseDdl failed for operation {operation_name}: {detail}"
+            )));
+        }
+
+        if attempt == timeouts.max_attempts {
+            return Err(SpannerError::Other(format!(
+                "Emulator UpdateDatabaseDdl was definitively rejected by schema contention for operation {operation_name} after {attempt} attempts; last rejection: {detail}"
+            )));
+        }
+        let remaining = timeouts.request.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
             continue;
         }
-
-        return Err(SpannerError::Other(format!(
-            "Failed to update emulator DDL: status={status}, body={body}"
-        )));
+        tokio::time::sleep(backoff.next_delay().min(remaining)).await;
     }
 
-    Err(SpannerError::Other(
-        "Failed to update emulator DDL: retry loop exhausted".to_string(),
-    ))
+    unreachable!("submission loop returns on every terminal condition")
 }
 
 async fn wait_emulator_operation(
     admin_endpoint: &str,
     operation_name: &str,
 ) -> Result<InternalOperation, SpannerError> {
-    let url = format!(
-        "{}/v1/{}",
-        admin_endpoint.trim_end_matches('/'),
-        operation_name
-    );
-    let client = reqwest::Client::new();
+    let transport = ReqwestEmulatorTransport::new(DEFAULT_TIMEOUTS.connect)?;
+    wait_emulator_operation_with(&transport, admin_endpoint, operation_name, DEFAULT_TIMEOUTS).await
+}
 
+async fn wait_emulator_operation_with(
+    transport: &dyn EmulatorTransport,
+    admin_endpoint: &str,
+    operation_name: &str,
+    timeouts: DdlTimeouts,
+) -> Result<InternalOperation, SpannerError> {
+    let mut poll_backoff = JitteredBackoff::new(timeouts.poll_initial, timeouts.poll_max);
     loop {
-        let response = client.get(&url).send().await.map_err(|e| {
-            SpannerError::Other(format!("Failed to fetch emulator operation: {e:?}"))
-        })?;
-        let status = response.status();
-        let body = response.text().await.map_err(|e| {
-            SpannerError::Other(format!("Failed to read emulator operation response: {e}"))
-        })?;
-
-        if !status.is_success() {
-            return Err(SpannerError::Other(format!(
-                "Failed to fetch emulator operation: status={status}, body={body}"
-            )));
-        }
-
-        let op = operation_from_json(&body)?;
+        let op =
+            fetch_emulator_operation(transport, admin_endpoint, operation_name, timeouts).await?;
         if op.done {
             return Ok(op);
         }
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(poll_backoff.next_delay()).await;
     }
 }
 
+async fn fetch_emulator_operation(
+    transport: &dyn EmulatorTransport,
+    admin_endpoint: &str,
+    operation_name: &str,
+    timeouts: DdlTimeouts,
+) -> Result<InternalOperation, SpannerError> {
+    let request = EmulatorRequest {
+        method: Method::GET,
+        url: format!(
+            "{}/v1/{}",
+            admin_endpoint.trim_end_matches('/'),
+            operation_name
+        ),
+        query: Vec::new(),
+        json: None,
+    };
+    let response =
+        send_emulator_request(transport, request, "Emulator GetOperation", timeouts).await?;
+    let operation = operation_from_json(&response.body)?;
+    validate_operation(&operation, Some(operation_name), "emulator GetOperation")?;
+    Ok(operation)
+}
+
 fn operation_from_json(body: &str) -> Result<InternalOperation, SpannerError> {
-    let json: serde_json::Value = serde_json::from_str(body)
-        .map_err(|e| SpannerError::Other(format!("Failed to parse emulator operation: {e}")))?;
-    let name = json
+    let json: serde_json::Value = serde_json::from_str(body).map_err(|error| {
+        SpannerError::Other(format!(
+            "Emulator operation protocol error: malformed JSON: {error}; body={}",
+            body_excerpt(body)
+        ))
+    })?;
+    operation_from_value(json, body)
+}
+
+fn operation_from_value(
+    json: serde_json::Value,
+    source: &str,
+) -> Result<InternalOperation, SpannerError> {
+    let object = json.as_object().ok_or_else(|| {
+        SpannerError::Other(format!(
+            "Emulator operation protocol error: operation must be a JSON object; body={}",
+            body_excerpt(source)
+        ))
+    })?;
+    let name = object
         .get("name")
         .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.is_empty())
         .ok_or_else(|| {
             SpannerError::Other(format!(
-                "Emulator operation response is missing a string name: {body}"
+                "Emulator operation protocol error: missing or empty string name; body={}",
+                body_excerpt(source)
             ))
-        })?;
-    let done = json
-        .get("done")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-
-    let mut op = InternalOperation::new().set_name(name).set_done(done);
-    if let Some(error) = json.get("error") {
-        let code = error
-            .get("code")
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or_default() as i32;
-        let message = error
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("Spanner DDL operation failed");
-        op = op.set_error(
-            google_cloud_rpc::model::Status::new()
-                .set_code(code)
-                .set_message(message),
-        );
+        })?
+        .to_string();
+    let done = match object.get("done") {
+        // Protobuf JSON legitimately omits scalar fields at their default.
+        None => false,
+        Some(value) => value.as_bool().ok_or_else(|| {
+            SpannerError::Other(format!(
+                "Emulator operation protocol error: operation {name} has non-boolean done; body={}",
+                body_excerpt(source)
+            ))
+        })?,
+    };
+    let has_error = object.contains_key("error");
+    let has_response = object.contains_key("response");
+    if has_error && has_response {
+        return Err(SpannerError::Other(format!(
+            "Emulator operation protocol error: operation {name} has both error and response"
+        )));
+    }
+    if !done && (has_error || has_response) {
+        return Err(SpannerError::Other(format!(
+            "Emulator operation protocol error: unfinished operation {name} has a result"
+        )));
     }
 
-    Ok(op)
+    let operation: InternalOperation = serde_json::from_value(json).map_err(|error| {
+        SpannerError::Other(format!(
+            "Emulator operation protocol error: malformed operation {name}: {error}; body={}",
+            body_excerpt(source)
+        ))
+    })?;
+    validate_operation(&operation, None, "emulator operation response")?;
+    Ok(operation)
+}
+
+fn validate_operation(
+    operation: &InternalOperation,
+    expected_name: Option<&str>,
+    source: &str,
+) -> Result<(), SpannerError> {
+    if operation.name.is_empty() {
+        return Err(SpannerError::Other(format!(
+            "{source} protocol error: operation name is empty"
+        )));
+    }
+    if let Some(expected_name) = expected_name {
+        if operation.name != expected_name {
+            return Err(SpannerError::Other(format!(
+                "{source} protocol error: expected operation {expected_name}, got {}",
+                operation.name
+            )));
+        }
+    }
+    if !operation.done && operation.result.is_some() {
+        return Err(SpannerError::Other(format!(
+            "{source} protocol error: unfinished operation {} has a result",
+            operation.name
+        )));
+    }
+    Ok(())
+}
+
+fn operation_deadline_error(operation_name: &str, deadline: Duration) -> SpannerError {
+    SpannerError::Other(format!(
+        "Spanner DDL operation {operation_name} did not complete within the {} overall deadline; the server-side operation may still be running",
+        duration_label(deadline)
+    ))
+}
+
+async fn wait_with_operation_deadline<T>(
+    operation_name: &str,
+    remaining: Duration,
+    overall_deadline: Duration,
+    wait: impl Future<Output = Result<T, SpannerError>>,
+) -> Result<T, SpannerError> {
+    match tokio::time::timeout(remaining, wait).await {
+        Ok(result) => result,
+        Err(_) => Err(operation_deadline_error(operation_name, overall_deadline)),
+    }
 }
 
 fn ddl_operation_error(op: &InternalOperation) -> Option<String> {
@@ -456,6 +1448,7 @@ impl VTab for SpannerDdlVTab {
                 emulator_admin_endpoint(endpoint.as_deref(), admin_endpoint.as_deref());
 
             runtime::block_on(async {
+                let overall_start = Instant::now();
                 let admin = get_or_create_admin_client(effective_admin_endpoint.as_deref()).await?;
 
                 let start = Instant::now();
@@ -469,11 +1462,18 @@ impl VTab for SpannerDdlVTab {
                 .await?;
 
                 let operation_name = op.name.clone();
+                let remaining = DEFAULT_TIMEOUTS
+                    .operation
+                    .checked_sub(overall_start.elapsed())
+                    .ok_or_else(|| {
+                        operation_deadline_error(&operation_name, DEFAULT_TIMEOUTS.operation)
+                    })?;
                 let op = wait_database_operation(
                     &admin,
                     &operation_name,
                     endpoint.as_deref(),
                     admin_endpoint.as_deref(),
+                    remaining,
                 )
                 .await?;
                 if let Some(err) = ddl_operation_error(&op) {
@@ -857,20 +1857,27 @@ async fn wait_operation(
     admin: &DatabaseAdmin,
     operation_name: &str,
 ) -> Result<InternalOperation, SpannerError> {
-    let mut op = admin
-        .get_operation()
-        .set_name(operation_name)
-        .send()
-        .await?;
-    while !op.done {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        op = admin
-            .get_operation()
-            .set_name(operation_name)
-            .send()
-            .await?;
+    let mut poll_backoff =
+        JitteredBackoff::new(DEFAULT_TIMEOUTS.poll_initial, DEFAULT_TIMEOUTS.poll_max);
+    loop {
+        let operation = get_real_operation(admin, operation_name).await?;
+        if operation.done {
+            return Ok(operation);
+        }
+        tokio::time::sleep(poll_backoff.next_delay()).await;
     }
-    Ok(op)
+}
+
+async fn get_real_operation(
+    admin: &DatabaseAdmin,
+    operation_name: &str,
+) -> Result<InternalOperation, SpannerError> {
+    let request = bounded_admin_request(admin.get_operation().set_name(operation_name));
+    let operation = send_admin_request(request.send())
+        .await
+        .map_err(|error| admin_request_error("Spanner GetOperation", error))?;
+    validate_operation(&operation, Some(operation_name), "Spanner GetOperation")?;
+    Ok(operation)
 }
 
 async fn list_database_operations(
@@ -879,13 +1886,24 @@ async fn list_database_operations(
     admin_endpoint: Option<&str>,
     filter: Option<&str>,
 ) -> Result<Vec<OperationRow>, SpannerError> {
-    // The emulator only implements google.longrunning.Operations/ListOperations,
-    // while real Spanner exposes DatabaseAdmin/ListDatabaseOperations with auth.
-    let mut operations = match emulator_admin_endpoint(endpoint, admin_endpoint) {
-        Some(admin_endpoint) => {
-            list_emulator_database_operations(database_path, &admin_endpoint, filter).await?
+    let listing = async {
+        // The emulator only implements google.longrunning.Operations/ListOperations,
+        // while real Spanner exposes DatabaseAdmin/ListDatabaseOperations with auth.
+        match emulator_admin_endpoint(endpoint, admin_endpoint) {
+            Some(admin_endpoint) => {
+                list_emulator_database_operations(database_path, &admin_endpoint, filter).await
+            }
+            None => list_real_database_operations(database_path, filter).await,
         }
-        None => list_real_database_operations(database_path, filter).await?,
+    };
+    let mut operations = match tokio::time::timeout(DEFAULT_TIMEOUTS.list, listing).await {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(SpannerError::Other(format!(
+                "Listing Spanner database operations timed out after {}",
+                duration_label(DEFAULT_TIMEOUTS.list)
+            )));
+        }
     };
 
     // ListDatabaseOperations is instance-scoped, so keep the table function's
@@ -901,15 +1919,36 @@ async fn list_real_database_operations(
     filter: Option<&str>,
 ) -> Result<Vec<InternalOperation>, SpannerError> {
     let admin = get_or_create_admin_client(None).await?;
-    let mut items = admin
-        .list_database_operations()
-        .set_parent(instance_path_from_database_path(database_path)?.to_string())
-        .set_filter(filter.unwrap_or_default())
-        .by_item();
+    let request = bounded_admin_request(
+        admin
+            .list_database_operations()
+            .set_parent(instance_path_from_database_path(database_path)?.to_string())
+            .set_filter(filter.unwrap_or_default()),
+    );
+    let mut pages = request.by_page();
 
     let mut operations = Vec::new();
-    while let Some(op) = items.next().await.transpose()? {
-        operations.push(op);
+    let mut seen_tokens = HashSet::new();
+    let mut page_count = 0;
+    while let Some(page) = pages.next().await {
+        page_count += 1;
+        let page = page.map_err(|error| {
+            SpannerError::Other(format!(
+                "Spanner ListDatabaseOperations failed on page {page_count} within the {} per-request bound: {error}",
+                duration_label(DEFAULT_TIMEOUTS.request)
+            ))
+        })?;
+        for operation in &page.operations {
+            validate_operation(operation, None, "Spanner ListDatabaseOperations")?;
+        }
+        operations.extend(page.operations);
+        record_next_page_token(
+            &mut seen_tokens,
+            &page.next_page_token,
+            page_count,
+            DEFAULT_TIMEOUTS.max_pages,
+            "Spanner ListDatabaseOperations",
+        )?;
     }
     Ok(operations)
 }
@@ -919,19 +1958,139 @@ async fn list_emulator_database_operations(
     endpoint: &str,
     filter: Option<&str>,
 ) -> Result<Vec<InternalOperation>, SpannerError> {
-    let admin = get_or_create_admin_client(Some(endpoint)).await?;
-    let mut items = admin
-        .list_operations()
-        .set_name(format!("{database_path}/operations"))
-        .set_filter(filter.unwrap_or_default())
-        .by_item();
+    let transport = ReqwestEmulatorTransport::new(DEFAULT_TIMEOUTS.connect)?;
+    list_emulator_database_operations_with(
+        &transport,
+        database_path,
+        endpoint,
+        filter,
+        DEFAULT_TIMEOUTS,
+    )
+    .await
+}
 
+async fn list_emulator_database_operations_with(
+    transport: &dyn EmulatorTransport,
+    database_path: &str,
+    endpoint: &str,
+    filter: Option<&str>,
+    timeouts: DdlTimeouts,
+) -> Result<Vec<InternalOperation>, SpannerError> {
     let mut operations = Vec::new();
-    while let Some(op) = items.next().await.transpose()? {
-        operations.push(op);
+    let mut page_token = String::new();
+    let mut seen_tokens = HashSet::new();
+
+    for page_count in 1..=timeouts.max_pages {
+        let mut query = Vec::new();
+        if let Some(filter) = filter {
+            query.push(("filter".to_string(), filter.to_string()));
+        }
+        if !page_token.is_empty() {
+            query.push(("pageToken".to_string(), page_token));
+        }
+        let request = EmulatorRequest {
+            method: Method::GET,
+            url: format!(
+                "{}/v1/{database_path}/operations",
+                endpoint.trim_end_matches('/')
+            ),
+            query,
+            json: None,
+        };
+        let response =
+            send_emulator_request(transport, request, "Emulator ListOperations", timeouts).await?;
+        let page = operations_page_from_json(&response.body)?;
+        operations.extend(page.operations);
+        page_token = page.next_page_token;
+        if page_token.is_empty() {
+            return Ok(operations);
+        }
+        record_next_page_token(
+            &mut seen_tokens,
+            &page_token,
+            page_count,
+            timeouts.max_pages,
+            "emulator ListOperations",
+        )?;
     }
 
-    Ok(operations)
+    Err(SpannerError::Other(format!(
+        "Emulator ListOperations exceeded the {} page limit",
+        timeouts.max_pages
+    )))
+}
+
+struct OperationsPage {
+    operations: Vec<InternalOperation>,
+    next_page_token: String,
+}
+
+fn operations_page_from_json(body: &str) -> Result<OperationsPage, SpannerError> {
+    let json: serde_json::Value = serde_json::from_str(body).map_err(|error| {
+        SpannerError::Other(format!(
+            "Emulator ListOperations protocol error: malformed JSON: {error}; body={}",
+            body_excerpt(body)
+        ))
+    })?;
+    let object = json.as_object().ok_or_else(|| {
+        SpannerError::Other(format!(
+            "Emulator ListOperations protocol error: response must be a JSON object; body={}",
+            body_excerpt(body)
+        ))
+    })?;
+
+    let mut operations = Vec::new();
+    if let Some(value) = object.get("operations") {
+        let values = value.as_array().ok_or_else(|| {
+            SpannerError::Other(format!(
+                "Emulator ListOperations protocol error: operations must be an array; body={}",
+                body_excerpt(body)
+            ))
+        })?;
+        for (index, value) in values.iter().enumerate() {
+            operations.push(operation_from_value(
+                value.clone(),
+                &format!("ListOperations operations[{index}]={value}"),
+            )?);
+        }
+    }
+
+    let next_page_token = match object.get("nextPageToken") {
+        Some(value) => value.as_str().map(str::to_string).ok_or_else(|| {
+            SpannerError::Other(format!(
+                "Emulator ListOperations protocol error: nextPageToken must be a string; body={}",
+                body_excerpt(body)
+            ))
+        })?,
+        None => String::new(),
+    };
+    Ok(OperationsPage {
+        operations,
+        next_page_token,
+    })
+}
+
+fn record_next_page_token(
+    seen_tokens: &mut HashSet<String>,
+    token: &str,
+    page_count: usize,
+    max_pages: usize,
+    context: &str,
+) -> Result<(), SpannerError> {
+    if token.is_empty() {
+        return Ok(());
+    }
+    if !seen_tokens.insert(token.to_string()) {
+        return Err(SpannerError::Other(format!(
+            "{context} protocol error: repeated next page token after page {page_count}: {token}"
+        )));
+    }
+    if page_count >= max_pages {
+        return Err(SpannerError::Other(format!(
+            "{context} exceeded the {max_pages} page limit; last next page token: {token}"
+        )));
+    }
+    Ok(())
 }
 
 fn admin_endpoint_url(endpoint: &str) -> String {
@@ -966,9 +2125,11 @@ fn instance_path_from_database_path(database_path: &str) -> Result<&str, Spanner
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::ffi::CString;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use duckdb::ffi::{
         duckdb_create_int64, duckdb_create_list_value, duckdb_create_logical_type,
@@ -976,14 +2137,24 @@ mod tests {
         duckdb_destroy_value, duckdb_value, DUCKDB_TYPE_DUCKDB_TYPE_BIGINT,
         DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
     };
+    use google_cloud_gax::error::rpc::{Code, Status};
     use google_cloud_longrunning::model::Operation as InternalOperation;
+    use reqwest::{Method, StatusCode};
 
-    use crate::cache::LruCache;
+    use crate::error::SpannerError;
 
     use super::{
-        admin_endpoint_url, cached_init_result, database_operation_prefix, ddl_operation_error,
-        ddl_statements_from_values, get_or_insert_cache_slot, instance_path_from_database_path,
-        operation_from_json, CacheSlot,
+        admin_endpoint_url, admin_request_is_ambiguous, cached_init_result,
+        database_operation_prefix, ddl_operation_error, ddl_statements_from_values,
+        fetch_emulator_operation, gax_submission_signals_are_ambiguous,
+        get_or_create_cached_client, google_error_code_and_message,
+        instance_path_from_database_path, is_emulator_replay_conflict,
+        is_emulator_schema_change_rejection, list_emulator_database_operations_with,
+        lookup_cached_client, operation_from_json, recover_ambiguous_submission,
+        spawn_client_initialization, update_emulator_database_ddl_with,
+        wait_emulator_operation_with, wait_with_operation_deadline, AdminRequestError, ClientCache,
+        ClientCacheLookup, ClientFlight, DdlTimeouts, EmulatorResponse, EmulatorTransport,
+        FlightCleanupGuard, HttpFuture,
     };
 
     #[test]
@@ -1079,44 +2250,315 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_admin_cache_slot_is_single_flight() {
-        let cache = Arc::new(Mutex::new(LruCache::new(2)));
+    async fn test_admin_cache_is_single_flight_during_completed_lru_churn() {
+        let cache = Arc::new(Mutex::new(ClientCache::new(1, 2)));
         let constructions = Arc::new(AtomicUsize::new(0));
 
-        let (first, second) = tokio::join!(
-            initialize_test_cache_slot(Arc::clone(&cache), Arc::clone(&constructions)),
-            initialize_test_cache_slot(Arc::clone(&cache), Arc::clone(&constructions)),
+        let first = initialize_test_cached_client(
+            Arc::clone(&cache),
+            "shared-admin",
+            Arc::clone(&constructions),
+            Duration::from_millis(30),
+            Duration::from_millis(200),
+            42,
         );
+        let churn = initialize_test_cached_client(
+            Arc::clone(&cache),
+            "other-admin",
+            Arc::new(AtomicUsize::new(0)),
+            Duration::ZERO,
+            Duration::from_millis(200),
+            7,
+        );
+        let second = initialize_test_cached_client(
+            Arc::clone(&cache),
+            "shared-admin",
+            Arc::clone(&constructions),
+            Duration::from_millis(30),
+            Duration::from_millis(200),
+            99,
+        );
+        let (first, _, second) = tokio::join!(first, churn, second);
+        let first = first.unwrap();
+        let second = second.unwrap();
 
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(constructions.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn test_admin_cache_failed_slot_retries_single_flight() {
-        let cache = Arc::new(Mutex::new(LruCache::new(1)));
-        let key = "shared-admin".to_string();
-        let (slot, evicted) = get_or_insert_cache_slot(&cache, key.clone());
-        assert!(evicted.is_none());
-
-        let error = slot
-            .get_or_try_init(|| async { Err::<Arc<usize>, _>("initialization failed") })
-            .await
-            .unwrap_err();
-        assert_eq!(error, "initialization failed");
-
-        let (retained, evicted) = get_or_insert_cache_slot(&cache, key);
-        assert!(evicted.is_none());
-        assert!(Arc::ptr_eq(&slot, &retained));
-
+    async fn test_admin_cache_wait_timeout_does_not_restart_initialization() {
+        let cache = Arc::new(Mutex::new(ClientCache::new(1, 1)));
         let constructions = Arc::new(AtomicUsize::new(0));
-        let (first, second) = tokio::join!(
-            initialize_test_cache_slot(Arc::clone(&cache), Arc::clone(&constructions)),
-            initialize_test_cache_slot(Arc::clone(&cache), Arc::clone(&constructions)),
+        let first = initialize_test_cached_client(
+            Arc::clone(&cache),
+            "shared-admin",
+            Arc::clone(&constructions),
+            Duration::from_millis(30),
+            Duration::from_millis(5),
+            42,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(first.contains("Timed out waiting"), "{first}");
+
+        let second = initialize_test_cached_client(
+            Arc::clone(&cache),
+            "shared-admin",
+            Arc::clone(&constructions),
+            Duration::from_millis(30),
+            Duration::from_millis(200),
+            99,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*second, 42);
+        assert_eq!(constructions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_admin_cache_completed_entries_remain_lru_bounded() {
+        let cache = Arc::new(Mutex::new(ClientCache::new(1, 1)));
+        let constructions = Arc::new(AtomicUsize::new(0));
+
+        for (key, value) in [("admin-a", 1), ("admin-b", 2), ("admin-a", 3)] {
+            let client = initialize_test_cached_client(
+                Arc::clone(&cache),
+                key,
+                Arc::clone(&constructions),
+                Duration::ZERO,
+                Duration::from_millis(200),
+                value,
+            )
+            .await
+            .unwrap();
+            assert_eq!(*client, value);
+        }
+
+        assert_eq!(constructions.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn test_stale_cleanup_guard_cannot_remove_newer_flight_generation() {
+        let cache = Arc::new(Mutex::new(ClientCache::<usize>::new(1, 1)));
+        let cache_key = "shared-admin".to_string();
+        let (sender, generation, permit) = match lookup_cached_client(&cache, &cache_key).unwrap() {
+            ClientCacheLookup::Start {
+                sender,
+                generation,
+                permit,
+                ..
+            } => (sender, generation, permit),
+            _ => panic!("first lookup must start a flight"),
+        };
+        let stale_guard = FlightCleanupGuard::new(
+            Arc::clone(&cache),
+            cache_key.clone(),
+            generation,
+            sender,
+            permit,
         );
 
-        assert!(Arc::ptr_eq(&first, &second));
-        assert_eq!(constructions.load(Ordering::SeqCst), 1);
+        let (_replacement_sender, replacement_receiver) = tokio::sync::watch::channel(None);
+        let replacement_generation = {
+            let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+            let replacement_generation = cache.allocate_generation();
+            cache.in_flight.insert(
+                cache_key.clone(),
+                ClientFlight {
+                    generation: replacement_generation,
+                    receiver: replacement_receiver,
+                },
+            );
+            replacement_generation
+        };
+
+        drop(stale_guard);
+        assert_eq!(
+            cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .in_flight
+                .get(&cache_key)
+                .map(|flight| flight.generation),
+            Some(replacement_generation)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_admin_cache_panic_cleans_flight_and_allows_retry() {
+        let cache = Arc::new(Mutex::new(ClientCache::new(1, 1)));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let panic_attempts = Arc::clone(&attempts);
+        let error = get_or_create_cached_client(
+            Arc::clone(&cache),
+            "panic-admin".to_string(),
+            Duration::from_millis(200),
+            move || async move {
+                if panic_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("simulated admin initialization panic");
+                }
+                Ok(Arc::new(1_usize))
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("ended without a result"), "{error}");
+
+        let client = get_or_create_cached_client(
+            Arc::clone(&cache),
+            "panic-admin".to_string(),
+            Duration::from_millis(200),
+            move || async move { Ok(Arc::new(42_usize)) },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*client, 42);
+        assert!(cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .in_flight
+            .is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_admin_cache_abort_before_first_poll_cleans_flight_and_allows_retry() {
+        let cache = Arc::new(Mutex::new(ClientCache::new(1, 1)));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let (sender, generation, permit) =
+            match lookup_cached_client(&cache, &"aborted-admin".to_string()).unwrap() {
+                ClientCacheLookup::Start {
+                    sender,
+                    generation,
+                    permit,
+                    ..
+                } => (sender, generation, permit),
+                _ => panic!("first lookup must start a flight"),
+            };
+        let task_starts = Arc::clone(&starts);
+        let abort_handle = spawn_client_initialization(
+            Arc::clone(&cache),
+            "aborted-admin".to_string(),
+            generation,
+            permit,
+            sender,
+            move || async move {
+                task_starts.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<Result<Arc<usize>, SpannerError>>().await
+            },
+        );
+        // The current-thread runtime cannot poll the spawned task before this
+        // synchronous abort, exercising the pre-first-poll cancellation path.
+        abort_handle.abort();
+        tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                let flight_exists = cache
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .in_flight
+                    .contains_key("aborted-admin");
+                if !flight_exists {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+
+        let client = get_or_create_cached_client(
+            Arc::clone(&cache),
+            "aborted-admin".to_string(),
+            Duration::from_millis(200),
+            move || async move { Ok(Arc::new(43_usize)) },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*client, 43);
+        assert!(cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .in_flight
+            .is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_admin_cache_rejects_fifth_unique_flight_before_spawning() {
+        let cache = Arc::new(Mutex::new(ClientCache::new(8, 4)));
+        let mut abort_handles = Vec::new();
+        for index in 0..4 {
+            let cache_key = format!("admin-{index}");
+            let (sender, generation, permit) =
+                match lookup_cached_client(&cache, &cache_key).unwrap() {
+                    ClientCacheLookup::Start {
+                        sender,
+                        generation,
+                        permit,
+                        ..
+                    } => (sender, generation, permit),
+                    _ => panic!("unique lookup must start a flight"),
+                };
+            abort_handles.push(spawn_client_initialization(
+                Arc::clone(&cache),
+                cache_key,
+                generation,
+                permit,
+                sender,
+                move || std::future::pending::<Result<Arc<usize>, SpannerError>>(),
+            ));
+        }
+
+        let fifth_starts = Arc::new(AtomicUsize::new(0));
+        let task_fifth_starts = Arc::clone(&fifth_starts);
+        let error = get_or_create_cached_client(
+            Arc::clone(&cache),
+            "admin-4".to_string(),
+            Duration::from_millis(200),
+            move || async move {
+                task_fifth_starts.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(4_usize))
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("capacity is full"), "{error}");
+        assert!(error.contains("maximum 4"), "{error}");
+        assert_eq!(fifth_starts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .in_flight
+                .len(),
+            4
+        );
+
+        for abort_handle in abort_handles {
+            abort_handle.abort();
+        }
+        tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                let in_flight = cache
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .in_flight
+                    .len();
+                if in_flight == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[test]
@@ -1165,6 +2607,525 @@ mod tests {
     }
 
     #[test]
+    fn test_operation_from_json_defaults_missing_done_and_rejects_non_boolean_done() {
+        let pending =
+            operation_from_json(r#"{"name":"projects/p/instances/i/databases/d/operations/op1"}"#)
+                .unwrap();
+        assert!(!pending.done);
+
+        let error = operation_from_json(
+            r#"{"name":"projects/p/instances/i/databases/d/operations/op1","done":"false"}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("non-boolean done"), "{error}");
+    }
+
+    #[test]
+    fn test_operation_from_json_rejects_malformed_json_and_operation() {
+        let error = operation_from_json("{not-json").unwrap_err().to_string();
+        assert!(error.contains("protocol error: malformed JSON"), "{error}");
+
+        let error = operation_from_json(
+            r#"{"name":"projects/p/instances/i/databases/d/operations/op1","done":false,"error":{"code":3,"message":"premature"}}"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unfinished operation"), "{error}");
+    }
+
+    #[test]
+    fn test_google_status_parser_accepts_wrapped_and_direct_status_json() {
+        assert_eq!(
+            google_error_code_and_message(r#"{"error":{"code":9,"message":"wrapped rejection"}}"#),
+            Some((9, "wrapped rejection".to_string()))
+        );
+        assert_eq!(
+            google_error_code_and_message(r#"{"code":9,"message":"direct rejection"}"#),
+            Some((9, "direct rejection".to_string()))
+        );
+        assert!(is_emulator_schema_change_rejection(
+            r#"{"code":9,"message":"Schema change operation rejected because another update is running"}"#
+        ));
+        assert!(is_emulator_replay_conflict(
+            StatusCode::CONFLICT,
+            r#"{"code":6,"message":"operation already exists"}"#
+        ));
+    }
+
+    #[test]
+    fn test_real_submission_ambiguity_classification() {
+        assert!(admin_request_is_ambiguous(&AdminRequestError::Timeout));
+        assert!(admin_request_is_ambiguous(&AdminRequestError::GoogleCloud(
+            google_cloud_gax::error::Error::timeout(std::io::Error::other("client timeout"))
+        )));
+        assert!(admin_request_is_ambiguous(&AdminRequestError::GoogleCloud(
+            google_cloud_gax::error::Error::io(std::io::Error::other("response body reset"))
+        )));
+        assert!(admin_request_is_ambiguous(&AdminRequestError::GoogleCloud(
+            google_cloud_gax::error::Error::exhausted(google_cloud_gax::error::Error::service(
+                Status::default().set_code(Code::Unavailable),
+            ))
+        )));
+        assert!(!admin_request_is_ambiguous(
+            &AdminRequestError::GoogleCloud(google_cloud_gax::error::Error::exhausted(
+                "definitive pre-RPC failure"
+            ))
+        ));
+
+        for code in [
+            Code::DeadlineExceeded,
+            Code::Unknown,
+            Code::Internal,
+            Code::Unavailable,
+        ] {
+            let error = AdminRequestError::GoogleCloud(google_cloud_gax::error::Error::service(
+                Status::default().set_code(code),
+            ));
+            assert!(admin_request_is_ambiguous(&error), "code={code:?}");
+        }
+
+        let permission_denied =
+            AdminRequestError::GoogleCloud(google_cloud_gax::error::Error::service(
+                Status::default().set_code(Code::PermissionDenied),
+            ));
+        assert!(!admin_request_is_ambiguous(&permission_denied));
+    }
+
+    #[test]
+    fn test_gax_http_status_precedes_generic_transport_classification() {
+        for status in [408, 429, 500, 501, 505, 599] {
+            assert!(
+                gax_submission_signals_are_ambiguous(
+                    Some(status),
+                    false,
+                    Some(Code::PermissionDenied),
+                ),
+                "status={status}"
+            );
+        }
+        for status in [400, 401, 403, 404, 409, 422] {
+            assert!(
+                !gax_submission_signals_are_ambiguous(Some(status), true, Some(Code::Unavailable),),
+                "terminal status={status} must override generic transport signals"
+            );
+        }
+        assert!(gax_submission_signals_are_ambiguous(None, true, None));
+        assert!(gax_submission_signals_are_ambiguous(
+            None,
+            false,
+            Some(Code::DeadlineExceeded)
+        ));
+        assert!(!gax_submission_signals_are_ambiguous(
+            None,
+            false,
+            Some(Code::PermissionDenied)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_ambiguous_submission_recovery_preserves_operation_and_errors() {
+        let operation_name = "projects/p/instances/i/databases/d/operations/recover";
+        let recovered = recover_ambiguous_submission(
+            "Spanner UpdateDatabaseDdl",
+            operation_name,
+            "deadline exceeded",
+            async { Ok::<_, SpannerError>(42) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered, 42);
+
+        let error = recover_ambiguous_submission::<usize>(
+            "Spanner UpdateDatabaseDdl",
+            operation_name,
+            "deadline exceeded",
+            async { Err(SpannerError::Other("lookup unavailable".to_string())) },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("outcome is ambiguous"), "{error}");
+        assert!(error.contains(operation_name), "{error}");
+        assert!(error.contains("deadline exceeded"), "{error}");
+        assert!(error.contains("lookup unavailable"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_emulator_update_recovers_ambiguous_status_without_second_patch() {
+        let database = "projects/p/instances/i/databases/d";
+        let operation_id = "test_ambiguous_recovery";
+        let operation_name = format!("{database}/operations/{operation_id}");
+        let transport = FakeTransport::sequence([
+            FakeReply::text(
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"code":14,"message":"response lost after acceptance"}"#,
+            ),
+            FakeReply::text(
+                StatusCode::OK,
+                format!(r#"{{"name":"{operation_name}","done":false}}"#),
+            ),
+        ]);
+
+        let operation = update_emulator_database_ddl_with(
+            &transport,
+            "http://emulator",
+            database,
+            vec!["CREATE TABLE T (Id INT64) PRIMARY KEY (Id)".to_string()],
+            operation_id,
+            test_timeouts(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(operation.name, operation_name);
+        assert!(!operation.done);
+        assert_eq!(transport.methods(), vec![Method::PATCH, Method::GET]);
+    }
+
+    #[tokio::test]
+    async fn test_emulator_update_recovers_request_timeout_without_second_patch() {
+        let database = "projects/p/instances/i/databases/d";
+        let operation_id = "test_request_timeout_recovery";
+        let operation_name = format!("{database}/operations/{operation_id}");
+        let transport = FakeTransport::sequence([
+            FakeReply::text(
+                StatusCode::REQUEST_TIMEOUT,
+                r#"{"code":4,"message":"request timed out after dispatch"}"#,
+            ),
+            FakeReply::text(
+                StatusCode::OK,
+                format!(r#"{{"name":"{operation_name}","done":false}}"#),
+            ),
+        ]);
+
+        let operation = update_emulator_database_ddl_with(
+            &transport,
+            "http://emulator",
+            database,
+            vec!["CREATE TABLE T (Id INT64) PRIMARY KEY (Id)".to_string()],
+            operation_id,
+            test_timeouts(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(operation.name, operation_name);
+        assert_eq!(transport.methods(), vec![Method::PATCH, Method::GET]);
+    }
+
+    #[tokio::test]
+    async fn test_emulator_get_retries_request_timeout_within_attempt_bound() {
+        let operation_name = "projects/p/instances/i/databases/d/operations/get-408";
+        let transport = FakeTransport::sequence([
+            FakeReply::text(
+                StatusCode::REQUEST_TIMEOUT,
+                r#"{"code":4,"message":"request timed out"}"#,
+            ),
+            FakeReply::text(
+                StatusCode::OK,
+                format!(r#"{{"name":"{operation_name}","done":false}}"#),
+            ),
+        ]);
+        let mut timeouts = test_timeouts();
+        timeouts.max_attempts = 2;
+
+        let operation =
+            fetch_emulator_operation(&transport, "http://emulator", operation_name, timeouts)
+                .await
+                .unwrap();
+
+        assert_eq!(operation.name, operation_name);
+        assert_eq!(transport.methods(), vec![Method::GET, Method::GET]);
+    }
+
+    #[tokio::test]
+    async fn test_emulator_update_recovers_all_server_error_classes_without_second_patch() {
+        for status in [
+            StatusCode::NOT_IMPLEMENTED,
+            StatusCode::HTTP_VERSION_NOT_SUPPORTED,
+        ] {
+            let database = "projects/p/instances/i/databases/d";
+            let operation_id = format!("test_server_error_{}", status.as_u16());
+            let operation_name = format!("{database}/operations/{operation_id}");
+            let transport = FakeTransport::sequence([
+                FakeReply::text(
+                    status,
+                    format!(
+                        r#"{{"code":{},"message":"server rejected response path"}}"#,
+                        status.as_u16()
+                    ),
+                ),
+                FakeReply::text(
+                    StatusCode::OK,
+                    format!(r#"{{"name":"{operation_name}","done":false}}"#),
+                ),
+                FakeReply::text(
+                    StatusCode::OK,
+                    format!(r#"{{"name":"{operation_name}","done":false}}"#),
+                ),
+            ]);
+
+            let operation = update_emulator_database_ddl_with(
+                &transport,
+                "http://emulator",
+                database,
+                vec!["CREATE TABLE T (Id INT64) PRIMARY KEY (Id)".to_string()],
+                &operation_id,
+                test_timeouts(),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(operation.name, operation_name);
+            assert_eq!(
+                transport.methods(),
+                vec![Method::PATCH, Method::GET],
+                "status={status}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_emulator_update_reports_ambiguous_status_when_lookup_fails() {
+        let database = "projects/p/instances/i/databases/d";
+        let operation_id = "test_ambiguous_missing";
+        let operation_name = format!("{database}/operations/{operation_id}");
+        let transport = FakeTransport::sequence([
+            FakeReply::text(
+                StatusCode::TOO_MANY_REQUESTS,
+                r#"{"code":8,"message":"rate limited after dispatch"}"#,
+            ),
+            FakeReply::text(
+                StatusCode::NOT_FOUND,
+                r#"{"code":5,"message":"operation not found"}"#,
+            ),
+            FakeReply::text(
+                StatusCode::OK,
+                format!(r#"{{"name":"{operation_name}","done":false}}"#),
+            ),
+        ]);
+
+        let error = update_emulator_database_ddl_with(
+            &transport,
+            "http://emulator",
+            database,
+            vec!["CREATE TABLE T (Id INT64) PRIMARY KEY (Id)".to_string()],
+            operation_id,
+            test_timeouts(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("outcome is ambiguous"), "{error}");
+        assert!(error.contains(&operation_name), "{error}");
+        assert!(error.contains("rate limited after dispatch"), "{error}");
+        assert!(error.contains("operation not found"), "{error}");
+        assert_eq!(transport.methods(), vec![Method::PATCH, Method::GET]);
+    }
+
+    #[tokio::test]
+    async fn test_emulator_update_recovers_attempt_timeout_without_second_patch() {
+        let database = "projects/p/instances/i/databases/d";
+        let operation_id = "test_timeout_recovery";
+        let operation_name = format!("{database}/operations/{operation_id}");
+        let transport = FakeTransport::sequence([
+            FakeReply::stalled(StatusCode::OK),
+            FakeReply::text(
+                StatusCode::OK,
+                format!(r#"{{"name":"{operation_name}","done":false}}"#),
+            ),
+        ]);
+        let mut timeouts = test_timeouts();
+        timeouts.attempt = Duration::from_millis(2);
+
+        let operation = update_emulator_database_ddl_with(
+            &transport,
+            "http://emulator",
+            database,
+            vec!["CREATE TABLE T (Id INT64) PRIMARY KEY (Id)".to_string()],
+            operation_id,
+            timeouts,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(operation.name, operation_name);
+        assert_eq!(transport.methods(), vec![Method::PATCH, Method::GET]);
+    }
+
+    #[tokio::test]
+    async fn test_emulator_update_recovers_transport_error_without_second_patch() {
+        let database = "projects/p/instances/i/databases/d";
+        let operation_id = "test_transport_recovery";
+        let operation_name = format!("{database}/operations/{operation_id}");
+        let transport = FakeTransport::sequence([
+            FakeReply::body_error(StatusCode::OK, "connection closed while reading response"),
+            FakeReply::text(
+                StatusCode::OK,
+                format!(r#"{{"name":"{operation_name}","done":false}}"#),
+            ),
+        ]);
+
+        let operation = update_emulator_database_ddl_with(
+            &transport,
+            "http://emulator",
+            database,
+            vec!["CREATE TABLE T (Id INT64) PRIMARY KEY (Id)".to_string()],
+            operation_id,
+            test_timeouts(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(operation.name, operation_name);
+        assert_eq!(transport.methods(), vec![Method::PATCH, Method::GET]);
+    }
+
+    #[tokio::test]
+    async fn test_emulator_update_preserves_schema_rejection_retry() {
+        let database = "projects/p/instances/i/databases/d";
+        let operation_id = "test_schema_retry";
+        let operation_name = format!("{database}/operations/{operation_id}");
+        let transport = FakeTransport::sequence([
+            FakeReply::text(
+                StatusCode::BAD_REQUEST,
+                r#"{"code":9,"message":"Schema change operation rejected because another update is running"}"#,
+            ),
+            FakeReply::text(
+                StatusCode::OK,
+                format!(r#"{{"name":"{operation_name}","done":false}}"#),
+            ),
+        ]);
+
+        update_emulator_database_ddl_with(
+            &transport,
+            "http://emulator",
+            database,
+            vec!["ALTER TABLE T ADD COLUMN C INT64".to_string()],
+            operation_id,
+            test_timeouts(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(transport.methods(), vec![Method::PATCH, Method::PATCH]);
+    }
+
+    #[tokio::test]
+    async fn test_emulator_update_does_not_retry_terminal_error() {
+        let database = "projects/p/instances/i/databases/d";
+        let operation_id = "test_terminal";
+        let operation_name = format!("{database}/operations/{operation_id}");
+        let transport = FakeTransport::sequence([
+            FakeReply::text(
+                StatusCode::FORBIDDEN,
+                r#"{"code":7,"message":"permission denied"}"#,
+            ),
+            FakeReply::text(
+                StatusCode::OK,
+                format!(r#"{{"name":"{operation_name}","done":false}}"#),
+            ),
+        ]);
+
+        let error = update_emulator_database_ddl_with(
+            &transport,
+            "http://emulator",
+            database,
+            vec!["ALTER TABLE T ADD COLUMN C INT64".to_string()],
+            operation_id,
+            test_timeouts(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("403 Forbidden"), "{error}");
+        assert!(error.contains("permission denied"), "{error}");
+        assert!(error.contains(&operation_name), "{error}");
+        assert_eq!(transport.methods(), vec![Method::PATCH]);
+    }
+
+    #[tokio::test]
+    async fn test_emulator_operation_perpetual_not_done_hits_deadline() {
+        let operation_name = "projects/p/instances/i/databases/d/operations/never";
+        let transport = FakeTransport::repeating(FakeReply::text(
+            StatusCode::OK,
+            format!(r#"{{"name":"{operation_name}","done":false}}"#),
+        ));
+        let timeouts = test_timeouts();
+
+        let error = wait_with_operation_deadline(
+            operation_name,
+            timeouts.operation,
+            timeouts.operation,
+            wait_emulator_operation_with(&transport, "http://emulator", operation_name, timeouts),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains(operation_name), "{error}");
+        assert!(error.contains("20ms overall deadline"), "{error}");
+        assert!(transport.calls() > 0);
+    }
+
+    #[tokio::test]
+    async fn test_emulator_operation_body_stall_hits_attempt_timeout() {
+        let operation_name = "projects/p/instances/i/databases/d/operations/stalled";
+        let transport = FakeTransport::sequence([FakeReply::stalled(StatusCode::OK)]);
+        let mut timeouts = test_timeouts();
+        timeouts.max_attempts = 1;
+        timeouts.attempt = Duration::from_millis(5);
+
+        let error =
+            fetch_emulator_operation(&transport, "http://emulator", operation_name, timeouts)
+                .await
+                .unwrap_err()
+                .to_string();
+
+        assert!(
+            error.contains("attempt timed out while sending or reading body"),
+            "{error}"
+        );
+        assert!(error.contains("maximum 1 attempts"), "{error}");
+        assert_eq!(transport.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_emulator_operation_listing_rejects_repeated_page_token() {
+        let operation_name = "projects/p/instances/i/databases/d/operations/op1";
+        let transport = FakeTransport::sequence([
+            FakeReply::text(
+                StatusCode::OK,
+                format!(
+                    r#"{{"operations":[{{"name":"{operation_name}","done":false}}],"nextPageToken":"repeat"}}"#
+                ),
+            ),
+            FakeReply::text(
+                StatusCode::OK,
+                r#"{"operations":[],"nextPageToken":"repeat"}"#,
+            ),
+        ]);
+
+        let error = list_emulator_database_operations_with(
+            &transport,
+            "projects/p/instances/i/databases/d",
+            "http://emulator",
+            None,
+            test_timeouts(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("repeated next page token"), "{error}");
+        assert!(error.contains("repeat"), "{error}");
+        assert_eq!(transport.calls(), 2);
+    }
+
+    #[test]
     fn test_database_operation_prefix_filters_other_databases() {
         let database_path = "projects/p/instances/i/databases/d";
         let prefix = database_operation_prefix(database_path);
@@ -1186,22 +3147,142 @@ mod tests {
         );
     }
 
-    async fn initialize_test_cache_slot(
-        cache: Arc<Mutex<LruCache<String, CacheSlot<usize>>>>,
-        constructions: Arc<AtomicUsize>,
-    ) -> Arc<usize> {
-        let (slot, evicted) = get_or_insert_cache_slot(&cache, "shared-admin".to_string());
-        assert!(evicted.is_none());
+    #[derive(Clone)]
+    enum FakeBody {
+        Text(String),
+        Error(String),
+        Stall,
+    }
 
-        let client = slot
-            .get_or_try_init(|| async move {
-                constructions.fetch_add(1, Ordering::SeqCst);
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                Ok::<Arc<usize>, &'static str>(Arc::new(42))
+    #[derive(Clone)]
+    struct FakeReply {
+        status: StatusCode,
+        body: FakeBody,
+    }
+
+    impl FakeReply {
+        fn text(status: StatusCode, body: impl Into<String>) -> Self {
+            Self {
+                status,
+                body: FakeBody::Text(body.into()),
+            }
+        }
+
+        fn stalled(status: StatusCode) -> Self {
+            Self {
+                status,
+                body: FakeBody::Stall,
+            }
+        }
+
+        fn body_error(status: StatusCode, error: impl Into<String>) -> Self {
+            Self {
+                status,
+                body: FakeBody::Error(error.into()),
+            }
+        }
+    }
+
+    struct FakeTransport {
+        replies: Mutex<VecDeque<FakeReply>>,
+        fallback: Option<FakeReply>,
+        calls: AtomicUsize,
+        methods: Mutex<Vec<Method>>,
+    }
+
+    impl FakeTransport {
+        fn sequence(replies: impl IntoIterator<Item = FakeReply>) -> Self {
+            Self {
+                replies: Mutex::new(replies.into_iter().collect()),
+                fallback: None,
+                calls: AtomicUsize::new(0),
+                methods: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn repeating(reply: FakeReply) -> Self {
+            Self {
+                replies: Mutex::new(VecDeque::new()),
+                fallback: Some(reply),
+                calls: AtomicUsize::new(0),
+                methods: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+
+        fn methods(&self) -> Vec<Method> {
+            self.methods
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+        }
+    }
+
+    impl EmulatorTransport for FakeTransport {
+        fn send(
+            &self,
+            request: super::EmulatorRequest,
+        ) -> HttpFuture<Result<EmulatorResponse, String>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.methods
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(request.method);
+            let reply = self
+                .replies
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .pop_front()
+                .or_else(|| self.fallback.clone());
+
+            Box::pin(async move {
+                let reply = reply.ok_or_else(|| "fake transport exhausted".to_string())?;
+                let body: HttpFuture<Result<String, String>> = match reply.body {
+                    FakeBody::Text(body) => Box::pin(async move { Ok(body) }),
+                    FakeBody::Error(error) => Box::pin(async move { Err(error) }),
+                    FakeBody::Stall => Box::pin(std::future::pending()),
+                };
+                Ok(EmulatorResponse {
+                    status: reply.status,
+                    body,
+                })
             })
-            .await
-            .unwrap();
-        Arc::clone(client)
+        }
+    }
+
+    fn test_timeouts() -> DdlTimeouts {
+        DdlTimeouts {
+            connect: Duration::from_millis(10),
+            attempt: Duration::from_millis(10),
+            request: Duration::from_millis(50),
+            operation: Duration::from_millis(20),
+            list: Duration::from_millis(50),
+            retry_initial: Duration::ZERO,
+            retry_max: Duration::ZERO,
+            poll_initial: Duration::from_millis(1),
+            poll_max: Duration::from_millis(1),
+            max_attempts: 3,
+            max_pages: 5,
+        }
+    }
+
+    async fn initialize_test_cached_client(
+        cache: Arc<Mutex<ClientCache<usize>>>,
+        key: &str,
+        constructions: Arc<AtomicUsize>,
+        initialization_delay: Duration,
+        wait_timeout: Duration,
+        value: usize,
+    ) -> Result<Arc<usize>, SpannerError> {
+        get_or_create_cached_client(cache, key.to_string(), wait_timeout, move || async move {
+            constructions.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(initialization_delay).await;
+            Ok(Arc::new(value))
+        })
+        .await
     }
 
     fn varchar_value(s: &str) -> duckdb::vtab::Value {

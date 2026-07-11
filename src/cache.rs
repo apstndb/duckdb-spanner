@@ -25,6 +25,35 @@ impl<K: Eq + Hash + Clone, V: Clone> LruCache<K, V> {
         self.tick
     }
 
+    /// Return the value for `key`, marking it most-recently-used.
+    pub(crate) fn get(&mut self, key: &K) -> Option<V> {
+        let tick = self.next_tick();
+        let entry = self.map.get_mut(key)?;
+        entry.1 = tick;
+        Some(entry.0.clone())
+    }
+
+    /// Insert or replace `key`, returning the least-recently-used value when
+    /// the insertion exceeds capacity.
+    pub(crate) fn insert(&mut self, key: K, value: V) -> Option<V> {
+        let tick = self.next_tick();
+        self.map.insert(key.clone(), (value, tick));
+
+        if self.map.len() <= self.capacity {
+            return None;
+        }
+
+        let lru_key = self
+            .map
+            .iter()
+            .filter(|(candidate, _)| *candidate != &key)
+            .min_by_key(|(_, (_, entry_tick))| *entry_tick)
+            .map(|(candidate, _)| candidate.clone());
+        lru_key
+            .and_then(|candidate| self.map.remove(&candidate))
+            .map(|(evicted, _)| evicted)
+    }
+
     /// Return the value for `key`, marking it most-recently-used, or insert one
     /// produced by `make` if absent. When inserting pushes the map over
     /// capacity, the least-recently-used entry is evicted and returned as the
@@ -118,5 +147,18 @@ mod tests {
         assert_eq!(evicted, Some(10));
         assert!(cache.map.contains_key(&2));
         assert!(!cache.map.contains_key(&1));
+    }
+
+    #[test]
+    fn get_and_insert_support_completed_value_caches() {
+        let mut cache: LruCache<&str, i32> = LruCache::new(2);
+        assert!(cache.insert("a", 1).is_none());
+        assert!(cache.insert("b", 2).is_none());
+
+        assert_eq!(cache.get(&"a"), Some(1));
+        assert_eq!(cache.insert("c", 3), Some(2));
+        assert_eq!(cache.get(&"a"), Some(1));
+        assert_eq!(cache.get(&"b"), None);
+        assert_eq!(cache.get(&"c"), Some(3));
     }
 }
