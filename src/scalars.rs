@@ -264,13 +264,15 @@ impl VScalar for SpannerTypedScalar {
                 }
             }
         }
+        let (value_is_json, child_is_json) = json_type_flags(&value_type);
         let mut strings: Vec<Option<String>> = Vec::with_capacity(len);
         for (row, typ) in types.into_iter().enumerate() {
             let Some(typ) = typ else {
                 strings.push(None);
                 continue;
             };
-            let value = vector_to_json_value(input, 0, row, &value_type)?;
+            let value =
+                vector_to_json_value(input, 0, row, &value_type, value_is_json, child_is_json)?;
             let obj = json!({"value": value, "type": typ});
             strings.push(Some(serde_json::to_string(&obj)?));
         }
@@ -297,16 +299,40 @@ impl VScalar for SpannerParamsScalar {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let len = input.len();
         let struct_ty = input.flat_vector(0).logical_type();
+        if struct_ty.id() == LogicalTypeId::SqlNull {
+            let values: Vec<Option<String>> = vec![None; len];
+            let array: std::sync::Arc<dyn Array> = std::sync::Arc::new(StringArray::from(values));
+            return write_arrow_array_to_vector(&array, output);
+        }
         validate_params_struct_type(&struct_ty)?;
+        let null_rows: Vec<bool> = {
+            let vector = input.flat_vector(0);
+            (0..len).map(|row| vector.row_is_null(row as u64)).collect()
+        };
         let struct_vec = input.struct_vector(0);
+        let fields: Vec<ParamField> = (0..struct_ty.num_children())
+            .map(|field_idx| {
+                let ty = struct_ty.child(field_idx);
+                ParamField {
+                    name: struct_ty.child_name(field_idx),
+                    is_json: is_json_type(&ty),
+                    ty,
+                }
+            })
+            .collect();
 
-        let mut strings = Vec::with_capacity(len);
-        for row in 0..len {
-            let map = struct_row_to_map(&struct_vec, row, &struct_ty, len)?;
-            strings.push(serde_json::to_string(&Value::Object(map))?);
+        let mut strings: Vec<Option<String>> = Vec::with_capacity(len);
+        for (row, is_null) in null_rows.into_iter().enumerate() {
+            if is_null {
+                strings.push(None);
+                continue;
+            }
+            let map = struct_row_to_map(&struct_vec, row, &fields, len)?;
+            strings.push(Some(serde_json::to_string(&Value::Object(map))?));
         }
 
-        write_string_array(&strings, output)
+        let array: std::sync::Arc<dyn Array> = std::sync::Arc::new(StringArray::from(strings));
+        write_arrow_array_to_vector(&array, output)
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
@@ -404,6 +430,15 @@ fn is_json_type(ty: &LogicalTypeHandle) -> bool {
             .is_some_and(|alias| alias.eq_ignore_ascii_case("JSON"))
 }
 
+fn json_type_flags(ty: &LogicalTypeHandle) -> (bool, bool) {
+    let value_is_json = is_json_type(ty);
+    let child_is_json = match ty.id() {
+        LogicalTypeId::List | LogicalTypeId::Array => is_json_type(&ty.child(0)),
+        _ => false,
+    };
+    (value_is_json, child_is_json)
+}
+
 fn validate_spanner_value_type(
     ty: &LogicalTypeHandle,
     function: &str,
@@ -469,19 +504,26 @@ fn spanner_type_name(ty: &LogicalTypeHandle) -> Option<String> {
     }
 }
 
+struct ParamField {
+    name: String,
+    ty: LogicalTypeHandle,
+    is_json: bool,
+}
+
 fn struct_row_to_map(
     struct_vec: &StructVector,
     row: usize,
-    ty: &LogicalTypeHandle,
+    fields: &[ParamField],
     cap: usize,
 ) -> Result<Map<String, Value>, Box<dyn std::error::Error>> {
     let mut map = Map::new();
-    for field_idx in 0..ty.num_children() {
-        let name = ty.child_name(field_idx);
-        let child_ty = ty.child(field_idx);
+    for (field_idx, field) in fields.iter().enumerate() {
         let child_vec = struct_vec.child(field_idx, cap);
-        let value = flat_vector_to_json_value(&child_vec, row, &child_ty)?;
-        map.insert(name, struct_field_to_param_json(value, &child_ty));
+        let value = flat_vector_to_json_value(&child_vec, row, &field.ty, field.is_json)?;
+        map.insert(
+            field.name.clone(),
+            struct_field_to_param_json(value, &field.ty, field.is_json),
+        );
     }
     Ok(map)
 }
@@ -494,9 +536,10 @@ fn write_spanner_value_strings(
     type_name: impl Fn(&LogicalTypeHandle) -> String,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let len = input.len();
+    let (value_is_json, child_is_json) = json_type_flags(ty);
     let mut strings = Vec::with_capacity(len);
     for row in 0..len {
-        let value = vector_to_json_value(input, col, row, ty)?;
+        let value = vector_to_json_value(input, col, row, ty, value_is_json, child_is_json)?;
         let obj = json!({"value": value, "type": type_name(ty)});
         strings.push(serde_json::to_string(&obj)?);
     }
@@ -508,6 +551,8 @@ fn vector_to_json_value(
     col: usize,
     row: usize,
     ty: &LogicalTypeHandle,
+    value_is_json: bool,
+    child_is_json: bool,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     if input.flat_vector(col).row_is_null(row as u64) {
         return Ok(Value::Null);
@@ -516,15 +561,15 @@ fn vector_to_json_value(
     match ty.id() {
         LogicalTypeId::List => {
             let list_vec = input.list_vector(col);
-            list_vector_to_json_value(&list_vec, row, ty)
+            list_vector_to_json_value(&list_vec, row, ty, child_is_json)
         }
         LogicalTypeId::Array => {
             let array_vec = input.array_vector(col);
-            array_vector_to_json_value(&array_vec, row, ty)
+            array_vector_to_json_value(&array_vec, row, ty, child_is_json)
         }
         _ => {
             let vec = input.flat_vector(col);
-            flat_vector_to_json_value(&vec, row, ty)
+            flat_vector_to_json_value(&vec, row, ty, value_is_json)
         }
     }
 }
@@ -533,6 +578,7 @@ fn list_vector_to_json_value(
     list_vec: &ListVector,
     row: usize,
     ty: &LogicalTypeHandle,
+    child_is_json: bool,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     let (offset, length) = list_vec.get_entry(row);
     if length == 0 {
@@ -542,7 +588,12 @@ fn list_vector_to_json_value(
     let child = list_vec.child(offset + length);
     let mut out = Vec::with_capacity(length);
     for j in 0..length {
-        out.push(flat_vector_to_json_value(&child, offset + j, &child_ty)?);
+        out.push(flat_vector_to_json_value(
+            &child,
+            offset + j,
+            &child_ty,
+            child_is_json,
+        )?);
     }
     Ok(Value::Array(out))
 }
@@ -551,6 +602,7 @@ fn array_vector_to_json_value(
     array_vec: &duckdb::core::ArrayVector,
     row: usize,
     ty: &LogicalTypeHandle,
+    child_is_json: bool,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     let array_size = array_vec.get_array_size() as usize;
     let child_ty = ty.child(0);
@@ -558,7 +610,12 @@ fn array_vector_to_json_value(
     let child = array_vec.child(base + array_size);
     let mut out = Vec::with_capacity(array_size);
     for j in 0..array_size {
-        out.push(flat_vector_to_json_value(&child, base + j, &child_ty)?);
+        out.push(flat_vector_to_json_value(
+            &child,
+            base + j,
+            &child_ty,
+            child_is_json,
+        )?);
     }
     Ok(Value::Array(out))
 }
@@ -567,12 +624,13 @@ fn flat_vector_to_json_value(
     vec: &FlatVector,
     row: usize,
     ty: &LogicalTypeHandle,
+    is_json: bool,
 ) -> Result<Value, Box<dyn std::error::Error>> {
     if vec.row_is_null(row as u64) {
         return Ok(Value::Null);
     }
 
-    if is_json_type(ty) {
+    if is_json {
         let json_text = read_varchar_at(vec, row)?;
         return serde_json::from_str(&json_text)
             .map_err(|e| format!("Invalid DuckDB JSON value: {e}").into());
@@ -785,8 +843,8 @@ fn read_varchar_at(vec: &FlatVector, row: usize) -> Result<String, Box<dyn std::
     Ok(DuckString::new(&mut s).as_str().to_string())
 }
 
-fn struct_field_to_param_json(value: Value, ty: &LogicalTypeHandle) -> Value {
-    if is_json_type(ty) {
+fn struct_field_to_param_json(value: Value, ty: &LogicalTypeHandle, is_json: bool) -> Value {
+    if is_json {
         return json!({"value": value, "type": "JSON"});
     }
 
@@ -1281,6 +1339,17 @@ mod tests {
     #[test]
     fn test_spanner_params_scalar() {
         let conn = open_test_connection();
+
+        let absent: Option<String> = conn
+            .query_row("SELECT spanner_params(NULL)", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(absent, None);
+        let typed_absent: Option<String> = conn
+            .query_row("SELECT spanner_params(NULL::STRUCT(x BIGINT))", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(typed_absent, None);
 
         let json: String = conn
             .query_row(
