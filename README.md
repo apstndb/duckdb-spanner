@@ -41,6 +41,8 @@ brew install cargo-sweep
 - DuckDB `GEOMETRY` is not used yet.
   DuckDB 1.5 exposes `GEOMETRY` in the C API, and duckdb-rs `1.10504.0` now wraps it in `LogicalTypeId`, but this extension has no current Spanner type mapping that requires geometry output.
 
+- GoogleSQL `DATETIME` is unsupported until the Spanner data-plane API exposes a lossless type representation. It is never silently mapped to `STRING`.
+
 - Some DuckDB vector writes still cross unsafe API boundaries:
   fast UTF-8 string vector writes use raw C API escape hatches because safe duckdb-rs wrappers are missing for the exact operation (`src/convert.rs`), and fixed-size vector slices use duckdb-rs `unsafe` APIs (`src/ddl.rs`, `src/convert.rs`).
   Keep the layout checks and local safety comments when touching those paths.
@@ -484,6 +486,8 @@ See [DuckDB to Spanner type mapping](#duckdb-to-spanner-query-parameters) for th
 ### `spanner_typed(val, type_name)` -- Explicit Type
 
 For cases where auto-detection is insufficient, specify the Spanner type name directly.
+The type name is validated when the query binds its parameters; an unknown or
+malformed name returns an error and is never silently sent as `STRING`.
 
 ```sql
 spanner_typed(NULL, 'INT64')    -- {"value":null,"type":"INT64"}

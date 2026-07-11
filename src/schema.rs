@@ -273,6 +273,12 @@ pub struct ColumnInfo {
     pub is_generated: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TableSchemaDiscoveryPolicy {
+    Strict,
+    CopyTarget,
+}
+
 /// Parse a dialect string from user input.
 pub fn parse_dialect(s: &str) -> Result<DatabaseDialect, Box<dyn std::error::Error>> {
     match s.to_ascii_lowercase().as_str() {
@@ -470,6 +476,45 @@ pub async fn discover_table_schema(
     database: &str,
     endpoint: Option<&str>,
 ) -> Result<Vec<ColumnInfo>, SpannerError> {
+    discover_table_schema_with_policy(
+        client,
+        table,
+        dialect,
+        database,
+        endpoint,
+        TableSchemaDiscoveryPolicy::Strict,
+    )
+    .await
+}
+
+/// Discover table metadata for COPY, retaining unsupported generated columns so
+/// COPY can exclude them before any value conversion occurs.
+pub(crate) async fn discover_table_schema_for_copy(
+    client: &DatabaseClient,
+    table: &str,
+    dialect: DatabaseDialect,
+    database: &str,
+    endpoint: Option<&str>,
+) -> Result<Vec<ColumnInfo>, SpannerError> {
+    discover_table_schema_with_policy(
+        client,
+        table,
+        dialect,
+        database,
+        endpoint,
+        TableSchemaDiscoveryPolicy::CopyTarget,
+    )
+    .await
+}
+
+async fn discover_table_schema_with_policy(
+    client: &DatabaseClient,
+    table: &str,
+    dialect: DatabaseDialect,
+    database: &str,
+    endpoint: Option<&str>,
+    policy: TableSchemaDiscoveryPolicy,
+) -> Result<Vec<ColumnInfo>, SpannerError> {
     let dialect = resolve_dialect(dialect, || detect_dialect(client, database, endpoint)).await?;
 
     let (schema_name, table_name) = split_schema_table(table);
@@ -485,23 +530,13 @@ pub async fn discover_table_schema(
         let spanner_type_str: String = row.try_get(2)?;
         let is_generated_str: String = row.try_get(3)?;
 
-        // Use the detected database dialect, not TABLE_SCHEMA (PG tables in named
-        // schemas such as myschema.Users still use PostgreSQL type strings).
-        let spanner_type = match dialect {
-            DatabaseDialect::Postgresql => types::parse_pg_spanner_type(&spanner_type_str),
-            _ => types::parse_spanner_type(&spanner_type_str),
-        };
-
-        // INFORMATION_SCHEMA.IS_GENERATED is 'NEVER' for ordinary columns and
-        // 'ALWAYS' for generated columns in both the GoogleSQL and PostgreSQL
-        // dialects. Anything other than 'NEVER' is treated as generated.
-        let is_generated = !is_generated_str.eq_ignore_ascii_case("NEVER");
-
-        columns.push(ColumnInfo {
+        columns.push(parse_information_schema_column(
+            dialect.clone(),
             name,
-            spanner_type,
-            is_generated,
-        });
+            &spanner_type_str,
+            &is_generated_str,
+            policy,
+        )?);
     }
 
     if columns.is_empty() {
@@ -517,6 +552,52 @@ pub async fn discover_table_schema(
     }
 
     Ok(columns)
+}
+
+fn parse_information_schema_column(
+    dialect: DatabaseDialect,
+    name: String,
+    type_text: &str,
+    is_generated_text: &str,
+    policy: TableSchemaDiscoveryPolicy,
+) -> Result<ColumnInfo, SpannerError> {
+    // INFORMATION_SCHEMA.IS_GENERATED is 'NEVER' for ordinary columns and
+    // 'ALWAYS' for generated columns in both dialects. Anything other than
+    // 'NEVER' is treated as generated.
+    let is_generated = !is_generated_text.eq_ignore_ascii_case("NEVER");
+
+    // Use the detected database dialect, not TABLE_SCHEMA (PG tables in named
+    // schemas such as myschema.Users still use PostgreSQL type strings).
+    let spanner_type = match parse_information_schema_type(dialect, &name, type_text) {
+        Ok(spanner_type) => spanner_type,
+        Err(_) if policy == TableSchemaDiscoveryPolicy::CopyTarget && is_generated => {
+            Type::default()
+        }
+        Err(error) => return Err(error),
+    };
+
+    Ok(ColumnInfo {
+        name,
+        spanner_type,
+        is_generated,
+    })
+}
+
+fn parse_information_schema_type(
+    dialect: DatabaseDialect,
+    column_name: &str,
+    type_text: &str,
+) -> Result<Type, SpannerError> {
+    let parsed = match dialect {
+        DatabaseDialect::Postgresql => types::parse_pg_spanner_type(type_text),
+        _ => types::parse_spanner_type(type_text),
+    };
+    parsed.map_err(|error| {
+        SpannerError::Other(format!(
+            "Unsupported {} SPANNER_TYPE for column '{column_name}': {error}",
+            error.dialect
+        ))
+    })
 }
 
 /// Build an INFORMATION_SCHEMA.COLUMNS query with dialect-appropriate parameter syntax.
@@ -707,6 +788,95 @@ mod tests {
             schema_value_for_table(DatabaseDialect::Postgresql, "custom"),
             "custom"
         );
+    }
+
+    #[test]
+    fn schema_type_parse_error_keeps_server_type_text() {
+        for (dialect, type_text, dialect_name) in [
+            (
+                DatabaseDialect::Postgresql,
+                "not_a_postgresql_spanner_type",
+                "PostgreSQL Spanner",
+            ),
+            (
+                DatabaseDialect::GoogleStandardSql,
+                "NOT_A_GOOGLESQL_SPANNER_TYPE",
+                "GoogleSQL Spanner",
+            ),
+        ] {
+            let error = parse_information_schema_type(dialect, "unsupported_column", type_text)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("unsupported_column"));
+            assert!(error.contains(type_text));
+            assert!(error.contains(dialect_name));
+        }
+    }
+
+    #[test]
+    fn copy_discovery_preserves_unsupported_generated_tokenlist_metadata() {
+        for (dialect, type_text) in [
+            (DatabaseDialect::GoogleStandardSql, "TOKENLIST"),
+            (DatabaseDialect::Postgresql, "spanner.tokenlist"),
+        ] {
+            let column = parse_information_schema_column(
+                dialect,
+                "SearchTokens".to_string(),
+                type_text,
+                "ALWAYS",
+                TableSchemaDiscoveryPolicy::CopyTarget,
+            )
+            .unwrap();
+
+            assert_eq!(column.name, "SearchTokens");
+            assert!(column.is_generated);
+            assert_eq!(
+                column.spanner_type.code(),
+                google_cloud_spanner::types::TypeCode::Unspecified
+            );
+        }
+    }
+
+    #[test]
+    fn strict_discovery_rejects_generated_tokenlist_columns() {
+        for (dialect, type_text) in [
+            (DatabaseDialect::GoogleStandardSql, "TOKENLIST"),
+            (DatabaseDialect::Postgresql, "spanner.tokenlist"),
+        ] {
+            let error = parse_information_schema_column(
+                dialect,
+                "SearchTokens".to_string(),
+                type_text,
+                "ALWAYS",
+                TableSchemaDiscoveryPolicy::Strict,
+            )
+            .unwrap_err()
+            .to_string();
+
+            assert!(error.contains("SearchTokens"), "{error}");
+            assert!(error.contains(type_text), "{error}");
+        }
+    }
+
+    #[test]
+    fn copy_discovery_rejects_writable_tokenlist_columns() {
+        for (dialect, type_text) in [
+            (DatabaseDialect::GoogleStandardSql, "TOKENLIST"),
+            (DatabaseDialect::Postgresql, "spanner.tokenlist"),
+        ] {
+            let error = parse_information_schema_column(
+                dialect,
+                "SearchTokens".to_string(),
+                type_text,
+                "NEVER",
+                TableSchemaDiscoveryPolicy::CopyTarget,
+            )
+            .unwrap_err()
+            .to_string();
+
+            assert!(error.contains("SearchTokens"), "{error}");
+            assert!(error.contains(type_text), "{error}");
+        }
     }
 
     #[test]
