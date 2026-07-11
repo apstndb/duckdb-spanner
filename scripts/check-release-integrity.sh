@@ -32,7 +32,7 @@ if ((${#workflow_files[@]} == 0)); then
   echo "error: no GitHub Actions workflows found" >&2
   exit 1
 fi
-readonly full_sha_use_pattern='^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]+[^@[:space:]]+@[0-9a-fA-F]{40}[[:space:]]+#.+$'
+readonly full_sha_use_pattern="^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]+['\"]?[^@'\"[:space:]]+@[0-9a-fA-F]{40}['\"]?[[:space:]]+#.+$"
 
 invalid_uses=0
 for workflow in "${workflow_files[@]}"; do
@@ -100,9 +100,13 @@ if [[ -n "$release_tag" ]]; then
       /^[[:space:]]*\[/ && in_package { exit }
       in_package && /^[[:space:]]*version[[:space:]]*=/ {
         line=$0
-        sub(/^[^"]*"/, "", line)
-        sub(/".*$/, "", line)
-        print line
+        sub(/^[^=]*=[[:space:]]*/, "", line)
+        quote=substr(line, 1, 1)
+        if (quote != "\"" && quote != "\047") { exit }
+        line=substr(line, 2)
+        end=index(line, quote)
+        if (end == 0) { exit }
+        print substr(line, 1, end - 1)
         exit
       }
     ' Cargo.toml
