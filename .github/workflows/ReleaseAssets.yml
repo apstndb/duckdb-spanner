@@ -21,7 +21,16 @@ jobs:
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           ref: refs/tags/${{ github.event.release.tag_name }}
-          fetch-depth: 1
+          fetch-depth: 0
+
+      - name: Verify the release commit is on main
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          if ! git merge-base --is-ancestor HEAD refs/remotes/origin/main; then
+            echo "Release tag $RELEASE_TAG does not point to a commit reachable from main." >&2
+            exit 1
+          fi
 
       - name: Validate release metadata and CI integrity
         run: scripts/check-release-integrity.sh --release-tag "$RELEASE_TAG"
