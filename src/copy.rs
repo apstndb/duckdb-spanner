@@ -36,6 +36,7 @@ use prost_types::{ListValue, Value};
 
 use crate::client;
 use crate::config;
+use crate::connection::{ConnectionProfile, EndpointMode};
 use crate::runtime;
 use crate::schema;
 use crate::RegistrationError;
@@ -173,8 +174,7 @@ struct StructFieldMeta {
 
 /// Bind-phase data stored for the lifetime of the COPY operation.
 struct CopyBindData {
-    database_path: String,
-    endpoint: Option<String>,
+    profile: ConnectionProfile,
     dialect: DatabaseDialect,
     mode: MutationMode,
     batch_size: usize,
@@ -366,6 +366,18 @@ unsafe fn copy_bind_inner(info: ffi::duckdb_copy_function_bind_info) -> Result<(
     let endpoint = option_value(&opts, "endpoint")
         .map(ToOwned::to_owned)
         .or_else(|| cfg("spanner_endpoint"));
+    let endpoint_mode = option_value(&opts, "endpoint_mode")
+        .map(ToOwned::to_owned)
+        .or_else(|| cfg("spanner_endpoint_mode"));
+    let emulator_host = std::env::var("SPANNER_EMULATOR_HOST").ok();
+    let profile = ConnectionProfile::resolve(
+        database_path,
+        endpoint,
+        endpoint_mode.as_deref(),
+        None,
+        emulator_host.as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
 
     let dialect = option_value(&opts, "dialect")
         .map(schema::parse_dialect)
@@ -393,8 +405,7 @@ unsafe fn copy_bind_inner(info: ffi::duckdb_copy_function_bind_info) -> Result<(
     }
 
     let data = Box::new(CopyBindData {
-        database_path,
-        endpoint,
+        profile,
         dialect,
         mode,
         batch_size,
@@ -433,13 +444,10 @@ unsafe fn copy_global_init_inner(
     validate_batch_size(bind_data.batch_size)?;
 
     // Connect to Spanner
-    let database_path = bind_data.database_path.clone();
-    let endpoint = bind_data.endpoint.clone();
-    let client = runtime::run(async move {
-        client::get_or_create_client(&database_path, endpoint.as_deref()).await
-    })
-    .map_err(|e| format!("Runtime error: {e}"))?
-    .map_err(|e| format!("Failed to connect to Spanner: {e}"))?;
+    let profile = bind_data.profile.clone();
+    let client = runtime::run(async move { client::get_or_create_client(&profile).await })
+        .map_err(|e| format!("Runtime error: {e}"))?
+        .map_err(|e| format!("Failed to connect to Spanner: {e}"))?;
 
     // An explicit dialect avoids metadata discovery for endpoints that do not
     // expose INFORMATION_SCHEMA.DATABASE_OPTIONS. COPY discovery retains
@@ -447,15 +455,13 @@ unsafe fn copy_global_init_inner(
     let schema_client = Arc::clone(&client);
     let schema_table_name = table_name.clone();
     let schema_dialect = bind_data.dialect.clone();
-    let schema_database_path = bind_data.database_path.clone();
-    let schema_endpoint = bind_data.endpoint.clone();
+    let schema_profile = bind_data.profile.clone();
     let schema_columns = runtime::run(async move {
         schema::discover_table_schema_for_copy(
             &schema_client,
             &schema_table_name,
             schema_dialect,
-            &schema_database_path,
-            schema_endpoint.as_deref(),
+            &schema_profile,
         )
         .await
     })
@@ -483,11 +489,14 @@ unsafe fn copy_global_init_inner(
         apply_spanner_type(col, &target.spanner_type)?;
     }
 
-    let sdk_emulator_mode = std::env::var("SPANNER_EMULATOR_HOST")
-        .ok()
-        .is_some_and(|host| !host.is_empty());
-    let emulator_retry_route =
-        emulator_retry_route(bind_data.endpoint.as_deref(), sdk_emulator_mode);
+    let emulator_retry_route = if bind_data.profile.endpoint_mode() == EndpointMode::Emulator {
+        emulator_retry_route(
+            bind_data.profile.data_endpoint(),
+            bind_data.profile.sdk_emulator_mode(),
+        )
+    } else {
+        EmulatorRetryRoute::None
+    };
     let state = Box::new(CopyGlobalState {
         client,
         emulator_retry_route,

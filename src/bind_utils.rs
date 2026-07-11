@@ -3,6 +3,7 @@ use google_cloud_spanner::model::request_options::Priority;
 use google_cloud_spanner::transaction::TimestampBound;
 
 use crate::config;
+use crate::connection::ConnectionProfile;
 
 /// Configuration for Spanner read timestamp bounds.
 ///
@@ -286,6 +287,31 @@ pub fn resolve_endpoint(bind: &BindInfo) -> Option<String> {
 pub fn resolve_admin_endpoint(bind: &BindInfo) -> Option<String> {
     get_named_string(bind, "admin_endpoint")
         .or_else(|| config::get_config_string(bind, "spanner_admin_endpoint"))
+}
+
+/// Resolve the complete connection target from one BindInfo snapshot.
+///
+/// Named values override session config independently, preserving the existing
+/// database-component precedence while making endpoint mode and the emulator
+/// environment part of the same typed decision.
+pub(crate) fn resolve_connection_profile(
+    bind: &BindInfo,
+) -> Result<ConnectionProfile, Box<dyn std::error::Error>> {
+    let database_path = resolve_database_path(bind)?;
+    let endpoint = resolve_endpoint(bind);
+    let endpoint_mode = get_named_string(bind, "endpoint_mode")
+        .or_else(|| config::get_config_string(bind, "spanner_endpoint_mode"));
+    let admin_endpoint = resolve_admin_endpoint(bind);
+    let emulator_host = std::env::var("SPANNER_EMULATOR_HOST").ok();
+
+    ConnectionProfile::resolve(
+        database_path,
+        endpoint,
+        endpoint_mode.as_deref(),
+        admin_endpoint,
+        emulator_host.as_deref(),
+    )
+    .map_err(Into::into)
 }
 
 #[cfg(test)]

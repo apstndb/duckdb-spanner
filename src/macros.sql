@@ -11,7 +11,8 @@
 CREATE MACRO spanner_query(
     sql,
     database_path := NULL, project := NULL, instance := NULL, database := NULL,
-    params := NULL, endpoint := NULL, use_parallelism := NULL, parallelism_mode := NULL,
+    params := NULL, endpoint := NULL, endpoint_mode := NULL,
+    use_parallelism := NULL, parallelism_mode := NULL,
     use_data_boost := NULL, max_parallelism := NULL,
     exact_staleness_secs := NULL, max_staleness_secs := NULL,
     read_timestamp := NULL, min_read_timestamp := NULL,
@@ -24,6 +25,7 @@ SELECT * FROM spanner_query_raw(
     instance := instance,
     database := database,
     endpoint := endpoint,
+    endpoint_mode := endpoint_mode,
     params := spanner_params(params),
     use_parallelism := use_parallelism,
     parallelism_mode := parallelism_mode,
@@ -39,7 +41,7 @@ SELECT * FROM spanner_query_raw(
 CREATE MACRO spanner_ddl(
     sql := NULL,
     database_path := NULL, project := NULL, instance := NULL, database := NULL,
-    endpoint := NULL, admin_endpoint := NULL, statements := NULL
+    endpoint := NULL, endpoint_mode := NULL, admin_endpoint := NULL, statements := NULL
 ) AS TABLE
 SELECT * FROM spanner_ddl_raw(
     sql,
@@ -48,6 +50,7 @@ SELECT * FROM spanner_ddl_raw(
     instance := instance,
     database := database,
     endpoint := endpoint,
+    endpoint_mode := endpoint_mode,
     admin_endpoint := admin_endpoint,
     statements := statements
 );
@@ -55,7 +58,7 @@ SELECT * FROM spanner_ddl_raw(
 CREATE MACRO spanner_ddl_async(
     sql := NULL,
     database_path := NULL, project := NULL, instance := NULL, database := NULL,
-    endpoint := NULL, admin_endpoint := NULL, statements := NULL
+    endpoint := NULL, endpoint_mode := NULL, admin_endpoint := NULL, statements := NULL
 ) AS TABLE
 SELECT * FROM spanner_ddl_async_raw(
     sql,
@@ -64,13 +67,14 @@ SELECT * FROM spanner_ddl_async_raw(
     instance := instance,
     database := database,
     endpoint := endpoint,
+    endpoint_mode := endpoint_mode,
     admin_endpoint := admin_endpoint,
     statements := statements
 );
 
 CREATE MACRO spanner_operations(
     database_path := NULL, project := NULL, instance := NULL, database := NULL,
-    endpoint := NULL, admin_endpoint := NULL, filter := NULL
+    endpoint := NULL, endpoint_mode := NULL, admin_endpoint := NULL, filter := NULL
 ) AS TABLE
 SELECT * FROM spanner_operations_raw(
     database_path := database_path,
@@ -78,6 +82,7 @@ SELECT * FROM spanner_operations_raw(
     instance := instance,
     database := database,
     endpoint := endpoint,
+    endpoint_mode := endpoint_mode,
     admin_endpoint := admin_endpoint,
     filter := filter
 );

@@ -9,6 +9,7 @@ use google_cloud_spanner::types::Type;
 use google_cloud_spanner_admin_database_v1::model::DatabaseDialect;
 use tokio::sync::Notify;
 
+use crate::connection::ConnectionProfile;
 use crate::error::SpannerError;
 use crate::types;
 
@@ -310,10 +311,9 @@ pub fn parse_dialect(s: &str) -> Result<DatabaseDialect, Box<dyn std::error::Err
 /// invoke this on every bind.
 pub async fn detect_dialect(
     client: &DatabaseClient,
-    database: &str,
-    endpoint: Option<&str>,
+    profile: &ConnectionProfile,
 ) -> Result<DatabaseDialect, SpannerError> {
-    let key = crate::client::cache_key(database, endpoint);
+    let key = profile.cache_key();
     get_or_detect_dialect(&DIALECT_CACHE, key, || {
         detect_dialect_via_database_options(client)
     })
@@ -473,15 +473,13 @@ pub async fn discover_table_schema(
     client: &DatabaseClient,
     table: &str,
     dialect: DatabaseDialect,
-    database: &str,
-    endpoint: Option<&str>,
+    profile: &ConnectionProfile,
 ) -> Result<Vec<ColumnInfo>, SpannerError> {
     discover_table_schema_with_policy(
         client,
         table,
         dialect,
-        database,
-        endpoint,
+        profile,
         TableSchemaDiscoveryPolicy::Strict,
     )
     .await
@@ -493,15 +491,13 @@ pub(crate) async fn discover_table_schema_for_copy(
     client: &DatabaseClient,
     table: &str,
     dialect: DatabaseDialect,
-    database: &str,
-    endpoint: Option<&str>,
+    profile: &ConnectionProfile,
 ) -> Result<Vec<ColumnInfo>, SpannerError> {
     discover_table_schema_with_policy(
         client,
         table,
         dialect,
-        database,
-        endpoint,
+        profile,
         TableSchemaDiscoveryPolicy::CopyTarget,
     )
     .await
@@ -511,11 +507,10 @@ async fn discover_table_schema_with_policy(
     client: &DatabaseClient,
     table: &str,
     dialect: DatabaseDialect,
-    database: &str,
-    endpoint: Option<&str>,
+    profile: &ConnectionProfile,
     policy: TableSchemaDiscoveryPolicy,
 ) -> Result<Vec<ColumnInfo>, SpannerError> {
-    let dialect = resolve_dialect(dialect, || detect_dialect(client, database, endpoint)).await?;
+    let dialect = resolve_dialect(dialect, || detect_dialect(client, profile)).await?;
 
     let (schema_name, table_name) = split_schema_table(table);
 
@@ -881,14 +876,23 @@ mod tests {
 
     #[test]
     fn dialect_cache_key_matches_client_cache() {
-        // Sanity check that the same (database, endpoint) pair used to key
-        // the client cache also keys the dialect cache, so a cached client
-        // and its cached dialect stay associated.
-        let key_a = crate::client::cache_key("db1", Some("localhost:9010"));
-        let key_b = crate::client::cache_key("db1", Some("localhost:9010"));
+        // Sanity check that dialect and client caches derive their identity
+        // from the same resolved profile.
+        let profile = |database: &str| {
+            crate::connection::ConnectionProfile::resolve(
+                database.to_owned(),
+                Some("localhost:9010".to_owned()),
+                Some("emulator"),
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let key_a = profile("db1").cache_key();
+        let key_b = profile("db1").cache_key();
         assert_eq!(key_a, key_b);
 
-        let key_c = crate::client::cache_key("db2", Some("localhost:9010"));
+        let key_c = profile("db2").cache_key();
         assert_ne!(key_a, key_c);
     }
 

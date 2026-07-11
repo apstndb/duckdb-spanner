@@ -2,6 +2,7 @@ mod bind_utils;
 mod cache;
 mod client;
 mod config;
+mod connection;
 mod convert;
 mod copy;
 mod ddl;
@@ -140,6 +141,7 @@ const CONFIG_OPTION_NAMES: &[&str] = &[
     "spanner_database",
     "spanner_database_path",
     "spanner_endpoint",
+    "spanner_endpoint_mode",
     "spanner_admin_endpoint",
 ];
 

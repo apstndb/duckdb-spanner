@@ -118,6 +118,10 @@ pub(crate) unsafe fn prepare_config_options() -> Result<PreparedConfigOptions, R
         ),
         ("spanner_endpoint", "Default Spanner gRPC endpoint"),
         (
+            "spanner_endpoint_mode",
+            "Spanner endpoint mode: default, emulator, custom, or omni",
+        ),
+        (
             "spanner_admin_endpoint",
             "Default Spanner admin REST endpoint",
         ),

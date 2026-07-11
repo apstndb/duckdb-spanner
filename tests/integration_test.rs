@@ -308,14 +308,71 @@ fn open_extension_connection() -> ExtensionTestConnection {
 #[test]
 fn test_config_option_registration_survives_builder_cleanup() {
     let conn = open_extension_connection();
-    conn.execute_batch("SET spanner_project = 'config-lifetime-test'")
-        .unwrap();
+    conn.execute_batch(
+        "SET spanner_project = 'config-lifetime-test'; SET spanner_endpoint_mode = 'omni'",
+    )
+    .unwrap();
     let value: String = conn
         .query_row("SELECT current_setting('spanner_project')", [], |row| {
             row.get(0)
         })
         .unwrap();
     assert_eq!(value, "config-lifetime-test");
+    let endpoint_mode: String = conn
+        .query_row(
+            "SELECT current_setting('spanner_endpoint_mode')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(endpoint_mode, "omni");
+}
+
+#[test]
+fn test_endpoint_mode_is_enforced_on_every_connection_surface() {
+    let conn = open_extension_connection();
+    let database = "projects/p/instances/i/databases/d";
+    let cases = [
+        format!(
+            "SELECT * FROM spanner_query('SELECT 1', database_path := '{database}', \
+             endpoint := 'http://custom.example', endpoint_mode := 'custom')"
+        ),
+        format!(
+            "SELECT * FROM spanner_scan('T', database_path := '{database}', \
+             endpoint := 'http://custom.example', endpoint_mode := 'custom')"
+        ),
+        format!(
+            "SELECT * FROM spanner_tables(database_path := '{database}', \
+             endpoint := 'http://custom.example', endpoint_mode := 'custom')"
+        ),
+        format!(
+            "SELECT * FROM spanner_ddl('CREATE TABLE T (Id INT64) PRIMARY KEY (Id)', \
+             database_path := '{database}', endpoint := 'http://custom.example', \
+             endpoint_mode := 'custom')"
+        ),
+        format!(
+            "SELECT * FROM spanner_ddl_async('CREATE TABLE T (Id INT64) PRIMARY KEY (Id)', \
+             database_path := '{database}', endpoint := 'http://custom.example', \
+             endpoint_mode := 'custom')"
+        ),
+        format!(
+            "SELECT * FROM spanner_operations(database_path := '{database}', \
+             endpoint := 'http://custom.example', endpoint_mode := 'custom')"
+        ),
+        format!(
+            "COPY (SELECT 1::BIGINT AS Id) TO 'T' (FORMAT spanner, \
+             database_path '{database}', endpoint 'http://custom.example', \
+             endpoint_mode 'custom')"
+        ),
+    ];
+
+    for sql in cases {
+        let error = conn.execute_batch(&sql).unwrap_err().to_string();
+        assert!(
+            error.contains("endpoint_mode 'custom' requires an https endpoint"),
+            "unexpected error for {sql}: {error}"
+        );
+    }
 }
 
 fn vtab_query_sql(spanner_sql: &str) -> String {
@@ -1423,7 +1480,8 @@ fn make_ddl_sql(db: &spanemuboost::SpanEmuDatabase, ddl: &str) -> String {
     // Testcontainers maps the emulator gRPC and REST ports independently, so
     // pass both endpoints while keeping `endpoint` on the public gRPC contract.
     format!(
-        "SELECT * FROM spanner_ddl('{}', database_path := '{}', endpoint := '{}', admin_endpoint := '{}')",
+        "SELECT * FROM spanner_ddl('{}', database_path := '{}', endpoint := '{}', \
+         endpoint_mode := 'emulator', admin_endpoint := '{}')",
         ddl.replace('\'', "''"),
         db.database_path(),
         db.emulator_host(),
@@ -1433,7 +1491,8 @@ fn make_ddl_sql(db: &spanemuboost::SpanEmuDatabase, ddl: &str) -> String {
 
 fn make_ddl_async_sql(db: &spanemuboost::SpanEmuDatabase, ddl: &str) -> String {
     format!(
-        "SELECT * FROM spanner_ddl_async('{}', database_path := '{}', endpoint := '{}', admin_endpoint := '{}')",
+        "SELECT * FROM spanner_ddl_async('{}', database_path := '{}', endpoint := '{}', \
+         endpoint_mode := 'emulator', admin_endpoint := '{}')",
         ddl.replace('\'', "''"),
         db.database_path(),
         db.emulator_host(),
@@ -1994,15 +2053,20 @@ fn test_copy_rejects_mixed_database_options_during_bind() {
 fn test_copy_to_basic() {
     let conn = create_duckdb_connection_with_copy();
     let db = get_gsql_db();
+    conn.execute_batch(&format!(
+        "SET spanner_database_path = '{}'; SET spanner_endpoint = '{}'; \
+         SET spanner_endpoint_mode = 'emulator'",
+        db.database_path(),
+        db.emulator_host()
+    ))
+    .unwrap();
 
     // COPY 3 rows to CopyTarget — Value is DECIMAL from VALUES clause,
     // which should auto-convert to NumberValue for Spanner FLOAT64 columns.
-    let sql = format!(
+    let sql = String::from(
         "COPY (SELECT CAST(Id AS BIGINT) AS Id, Name, Value \
          FROM (VALUES (100, 'alice', 1.5), (101, 'bob', 2.5), (102, 'charlie', 3.5)) AS t(Id, Name, Value)) \
-         TO 'CopyTarget' (FORMAT spanner, database_path '{}', endpoint '{}')",
-        db.database_path(),
-        db.emulator_host()
+         TO 'CopyTarget' (FORMAT spanner)"
     );
     conn.execute_batch(&sql).unwrap();
 
