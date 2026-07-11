@@ -258,6 +258,19 @@ fn open_extension_connection() -> Connection {
     }
 }
 
+#[test]
+fn test_config_option_registration_survives_builder_cleanup() {
+    let conn = open_extension_connection();
+    conn.execute_batch("SET spanner_project = 'config-lifetime-test'")
+        .unwrap();
+    let value: String = conn
+        .query_row("SELECT current_setting('spanner_project')", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(value, "config-lifetime-test");
+}
+
 fn vtab_query_sql(spanner_sql: &str) -> String {
     let db = get_gsql_db();
     format!(
@@ -1746,6 +1759,44 @@ fn test_copy_to_registration() {
 }
 
 #[test]
+fn test_copy_rejects_zero_batch_size_during_bind() {
+    let conn = open_extension_connection();
+    let err = conn
+        .execute_batch(
+            "COPY (SELECT CAST(1 AS BIGINT) AS Id) TO 'T' (\
+                FORMAT spanner, \
+                database_path 'projects/p/instances/i/databases/d', \
+                batch_size 0\
+            )",
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("batch_size '0'") && err.contains("greater than zero"),
+        "unexpected COPY bind error: {err}"
+    );
+}
+
+#[test]
+fn test_copy_rejects_mixed_database_options_during_bind() {
+    let conn = open_extension_connection();
+    let err = conn
+        .execute_batch(
+            "COPY (SELECT CAST(1 AS BIGINT) AS Id) TO 'T' (\
+                FORMAT spanner, \
+                database_path 'projects/p/instances/i/databases/d', \
+                project 'p'\
+            )",
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("cannot combine database_path with project, instance, or database"),
+        "unexpected COPY bind error: {err}"
+    );
+}
+
+#[test]
 fn test_copy_to_basic() {
     let conn = create_duckdb_connection_with_copy();
     let db = get_gsql_db();
@@ -1776,6 +1827,34 @@ fn test_copy_to_basic() {
     assert_eq!(rows[0], (100, "alice".to_string(), 1.5));
     assert_eq!(rows[1], (101, "bob".to_string(), 2.5));
     assert_eq!(rows[2], (102, "charlie".to_string(), 3.5));
+}
+
+#[test]
+fn test_copy_reports_partial_progress_after_later_batch_failure() {
+    let conn = create_duckdb_connection_with_copy();
+    let db = get_gsql_db();
+
+    let sql = format!(
+        "COPY (SELECT CAST(Id AS BIGINT) AS Id, Name, CAST(Value AS DOUBLE) AS Value \
+         FROM (VALUES (9800, 'first', 1.0), (9800, 'duplicate', 2.0)) AS t(Id, Name, Value)) \
+         TO 'CopyTarget' (FORMAT spanner, database_path '{}', endpoint '{}', \
+         mode 'insert', batch_size 1)",
+        db.database_path(),
+        db.emulator_host()
+    );
+    let err = conn.execute_batch(&sql).unwrap_err().to_string();
+    assert!(
+        err.contains("rows_written=1"),
+        "unexpected COPY error: {err}"
+    );
+    assert!(
+        err.contains("earlier batches remain committed"),
+        "unexpected COPY error: {err}"
+    );
+
+    let read_sql = vtab_query_sql("SELECT Name FROM CopyTarget WHERE Id = 9800");
+    let name: String = conn.query_row(&read_sql, [], |row| row.get(0)).unwrap();
+    assert_eq!(name, "first");
 }
 
 #[test]

@@ -404,8 +404,12 @@ Options:
 | `database` | VARCHAR | (config) | Spanner database ID |
 | `endpoint` | VARCHAR | (config) | Custom gRPC endpoint |
 | `mode` | VARCHAR | `insert_or_update` | Mutation mode: `insert`, `update`, `insert_or_update`, or `replace` |
-| `batch_size` | VARCHAR | `1000` | Number of rows per commit |
+| `batch_size` | VARCHAR | `1000` | Rows per independent commit (1 to 80,000) |
 | `columns` | VARCHAR[] | (none) | Target Spanner column names in source-column order |
+
+`batch_size` must be between 1 and 80,000. The upper bound matches Spanner's absolute mutations-per-commit ceiling, not a generally safe row count: each affected cell and secondary index entry counts toward that ceiling. Wide or indexed tables need a lower value. The mutation buffer grows with actual input rather than reserving the requested size up front.
+
+Each batch commits independently; COPY is not atomic across batches. After writing begins, an error reports `rows_written` for confirmed commits and states that earlier batches remain committed. A cancellation or deadline can leave the final batch's commit outcome unknown. The default `insert_or_update` mode is idempotent and remains the safest choice when retrying after a partial failure.
 
 The file path argument specifies the target Spanner table name. Source columns are mapped to the table's **writable** Spanner columns by position. Generated columns (`INFORMATION_SCHEMA.IS_GENERATED != 'NEVER'`) are computed by Spanner and reject writes, so they are excluded from the target column list — the source column count must match the number of non-generated columns, not the total column count.
 
