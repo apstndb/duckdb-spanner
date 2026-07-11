@@ -5,6 +5,9 @@ use google_cloud_spanner::types::{self as spanner_types, Type, TypeCode};
 use crate::error::SpannerError;
 use crate::types;
 
+pub(crate) const JSON_TRANSPORT_FORMAT: &str = "$duckdb_spanner_json_format";
+pub(crate) const JSON_TRANSPORT_FORMAT_V1: &str = "json-text-v1";
+
 /// Create a Statement from SQL and an optional JSON params string.
 ///
 /// Each entry in the JSON object is either:
@@ -112,13 +115,22 @@ fn add_typed_param(
 
     let spanner_type = types::parse_spanner_type(type_str);
     let value = obj.get("value").unwrap_or(&serde_json::Value::Null);
+    let json_text_transport = match obj.get(JSON_TRANSPORT_FORMAT) {
+        None => false,
+        Some(serde_json::Value::String(format)) if format == JSON_TRANSPORT_FORMAT_V1 => true,
+        Some(other) => {
+            return Err(SpannerError::Other(format!(
+                "Unsupported JSON transport format for parameter '{key}': {other}"
+            )));
+        }
+    };
 
     match spanner_type.code() {
-        TypeCode::Array => add_array_param(builder, key, value, spanner_type),
+        TypeCode::Array => add_array_param(builder, key, value, spanner_type, json_text_transport),
         TypeCode::Struct => Err(SpannerError::Other(format!(
             "STRUCT parameters are not yet supported (parameter '{key}')"
         ))),
-        _ => add_scalar_param(builder, key, value, spanner_type),
+        _ => add_scalar_param(builder, key, value, spanner_type, json_text_transport),
     }
 }
 
@@ -127,6 +139,7 @@ fn add_scalar_param(
     key: &str,
     value: &serde_json::Value,
     spanner_type: Type,
+    json_text_transport: bool,
 ) -> Result<StatementBuilder, SpannerError> {
     if value.is_null() {
         return Ok(builder.add_typed_param(key, &Option::<String>::None, spanner_type));
@@ -154,7 +167,11 @@ fn add_scalar_param(
             builder.add_typed_param(key, &value, spanner_type)
         }
         TypeCode::String => {
-            let s = json_to_string_coerce(value);
+            let s = if json_text_transport {
+                json_text_to_string(key, value)?
+            } else {
+                json_to_string_coerce(value)
+            };
             builder.add_typed_param(key, &s, spanner_type)
         }
         TypeCode::Bytes => {
@@ -178,11 +195,10 @@ fn add_scalar_param(
             builder.add_typed_param(key, &s, spanner_type)
         }
         TypeCode::Json => {
-            let s = match value {
-                serde_json::Value::String(s) => s.clone(),
-                other => serde_json::to_string(other).map_err(|e| {
-                    SpannerError::Other(format!("Failed to serialize JSON param '{key}': {e}"))
-                })?,
+            let s = if json_text_transport {
+                require_valid_json_text(key, value)?.to_string()
+            } else {
+                json_param_string(key, value, "JSON param")?
             };
             builder.add_typed_param(key, &s, spanner_type)
         }
@@ -208,6 +224,7 @@ fn add_array_param(
     key: &str,
     value: &serde_json::Value,
     spanner_type: Type,
+    json_text_transport: bool,
 ) -> Result<StatementBuilder, SpannerError> {
     if value.is_null() {
         return Ok(builder.add_typed_param(key, &Option::<String>::None, spanner_type));
@@ -249,7 +266,11 @@ fn add_array_param(
             builder.add_typed_param(key, &v, spanner_type)
         }
         TypeCode::String => {
-            let v = parse_array(key, arr, |_, v| Ok(json_to_string_coerce(v)))?;
+            let v = if json_text_transport {
+                parse_array(key, arr, json_text_to_string)?
+            } else {
+                parse_array(key, arr, |_, v| Ok(json_to_string_coerce(v)))?
+            };
             builder.add_typed_param(key, &v, spanner_type)
         }
         TypeCode::Bytes => {
@@ -279,14 +300,15 @@ fn add_array_param(
             builder.add_typed_param(key, &v, spanner_type)
         }
         TypeCode::Json => {
-            let v = parse_array(key, arr, |k, v| match v {
-                serde_json::Value::String(s) => Ok(s.clone()),
-                other => serde_json::to_string(other).map_err(|e| {
-                    SpannerError::Other(format!(
-                        "Failed to serialize JSON array element for '{k}': {e}"
-                    ))
-                }),
-            })?;
+            let v = if json_text_transport {
+                parse_array(key, arr, |k, v| {
+                    Ok(require_valid_json_text(k, v)?.to_string())
+                })?
+            } else {
+                parse_array(key, arr, |k, v| {
+                    json_param_string(k, v, "JSON array element")
+                })?
+            };
             builder.add_typed_param(key, &v, spanner_type)
         }
         TypeCode::Uuid => {
@@ -386,6 +408,46 @@ fn json_to_string_coerce(value: &serde_json::Value) -> String {
     }
 }
 
+fn json_param_string(
+    key: &str,
+    value: &serde_json::Value,
+    description: &str,
+) -> Result<String, SpannerError> {
+    match value {
+        // Preserve the low-level API's existing contract: an untagged string is
+        // already serialized JSON text. Scalar helpers tag structural strings.
+        serde_json::Value::String(value) => Ok(value.clone()),
+        other => serde_json::to_string(other).map_err(|error| {
+            SpannerError::Other(format!(
+                "Failed to serialize {description} for '{key}': {error}"
+            ))
+        }),
+    }
+}
+
+fn json_text_to_string(key: &str, value: &serde_json::Value) -> Result<String, SpannerError> {
+    let text = require_valid_json_text(key, value)?;
+    let value: serde_json::Value = serde_json::from_str(text).map_err(|error| {
+        SpannerError::Other(format!(
+            "Invalid tagged JSON text for parameter '{key}': {error}"
+        ))
+    })?;
+    Ok(json_to_string_coerce(&value))
+}
+
+fn require_valid_json_text<'a>(
+    key: &str,
+    value: &'a serde_json::Value,
+) -> Result<&'a str, SpannerError> {
+    let text = require_string(key, "tagged JSON text", value)?;
+    serde_json::from_str::<serde_json::Value>(text).map_err(|error| {
+        SpannerError::Other(format!(
+            "Invalid tagged JSON text for parameter '{key}': {error}"
+        ))
+    })?;
+    Ok(text)
+}
+
 fn require_string<'a>(
     key: &str,
     type_name: &str,
@@ -436,6 +498,20 @@ mod tests {
         )
         .unwrap();
         create_statement("SELECT @v", Some(r#"{"v":{"value":null,"type":"INT64"}}"#)).unwrap();
+        create_statement(
+            "SELECT @v",
+            Some(
+                r#"{"v":{"$duckdb_spanner_json_format":"json-text-v1","value":"\"abc\"","type":"JSON"}}"#,
+            ),
+        )
+        .unwrap();
+        create_statement(
+            "SELECT @v",
+            Some(
+                r#"{"v":{"$duckdb_spanner_json_format":"json-text-v1","value":"null","type":"JSON"}}"#,
+            ),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -448,6 +524,13 @@ mod tests {
         create_statement(
             "SELECT @v",
             Some(r#"{"v":{"value":["a",null,"c"],"type":"ARRAY<STRING>"}}"#),
+        )
+        .unwrap();
+        create_statement(
+            "SELECT @v",
+            Some(
+                r#"{"v":{"$duckdb_spanner_json_format":"json-text-v1","value":["\"abc\"","null",null],"type":"ARRAY<JSON>"}}"#,
+            ),
         )
         .unwrap();
     }
@@ -483,5 +566,44 @@ mod tests {
     fn test_rejects_bad_json_and_plain_arrays() {
         assert!(create_statement("SELECT @x", Some("not json")).is_err());
         assert!(create_statement("SELECT @x", Some(r#"{"x": [1,2,3]}"#)).is_err());
+    }
+
+    #[test]
+    fn untagged_json_object_cannot_collide_with_transport_metadata() {
+        let value = serde_json::json!({
+            "$duckdb_spanner_json_format": "json-text-v1",
+            "$duckdb_spanner_json_value": {"a": 1}
+        });
+        let encoded = json_param_string("v", &value, "JSON param").unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&encoded).unwrap(),
+            value
+        );
+    }
+
+    #[test]
+    fn tagged_json_text_is_validated_locally() {
+        assert!(
+            create_statement(
+                "SELECT @v",
+                Some(
+                    r#"{"v":{"$duckdb_spanner_json_format":"json-text-v1","value":"not-json","type":"JSON"}}"#,
+                ),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid tagged JSON text")
+        );
+        assert!(
+            create_statement(
+                "SELECT @v",
+                Some(
+                    r#"{"v":{"$duckdb_spanner_json_format":"json-text-v1","value":["{}","not-json"],"type":"ARRAY<JSON>"}}"#,
+                ),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid tagged JSON text")
+        );
     }
 }

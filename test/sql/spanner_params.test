@@ -28,6 +28,48 @@ SELECT IF(StringCol = 'hello', 1, error('expected param round-trip hello')) FROM
 statement ok
 SELECT IF(count = 1, 1, error('expected one filtered row')) FROM (SELECT COUNT(*)::INT AS count FROM spanner_query('SELECT Id FROM ScalarTypes WHERE Id = @id', params := {'id': spanner_value(1::BIGINT)}));
 
+# Plain fields that JSON cannot represent losslessly are emitted as typed
+# parameter envelopes by spanner_params(). Exercise the complete emulator wire
+# path rather than checking only the local JSON string.
+statement ok
+SELECT IF(typeof(ExactNum) = 'DECIMAL(38,9)' AND ExactNum = '12345678901234567890123456789.123456789'::DECIMAL(38,9), 1, error('expected exact DECIMAL param round-trip')) FROM spanner_query('SELECT @v AS ExactNum', params := {'v': '12345678901234567890123456789.123456789'::DECIMAL(38,9)});
+
+statement ok
+SELECT IF(typeof(WideInt) = 'DECIMAL(38,9)' AND WideInt = '18446744073709551615'::DECIMAL(38,9), 1, error('expected UBIGINT param round-trip')) FROM spanner_query('SELECT @v AS WideInt', params := {'v': '18446744073709551615'::UBIGINT});
+
+statement ok
+SELECT IF(typeof(SpecialFloat) = 'DOUBLE' AND isnan(SpecialFloat), 1, error('expected NaN FLOAT64 param round-trip')) FROM spanner_query('SELECT @v AS SpecialFloat', params := {'v': 'NaN'::DOUBLE});
+
+statement ok
+SELECT IF(typeof(JsonParam) = 'JSON' AND json_extract(JsonParam, '$.a') = 1, 1, error('expected structural JSON param round-trip')) FROM spanner_query('SELECT @v AS JsonParam', params := {'v': json('{"a":1}')});
+
+statement ok
+SELECT IF(typeof(JsonParam) = 'JSON' AND JsonParam = json('"abc"'), 1, error('expected JSON string param round-trip')) FROM spanner_query('SELECT @v AS JsonParam', params := {'v': json('"abc"')});
+
+statement ok
+SELECT IF(typeof(JsonParam) = 'JSON' AND JsonParam IS NOT NULL AND JsonParam = json('null'), 1, error('expected JSON null distinct from SQL NULL')) FROM spanner_query('SELECT @v AS JsonParam', params := {'v': json('null')});
+
+statement ok
+SELECT IF(JsonParam IS NULL, 1, error('expected typed SQL NULL JSON param')) FROM spanner_query('SELECT @v AS JsonParam', params := {'v': spanner_value(NULL::JSON)});
+
+statement ok
+SELECT IF(JsonValues[1] = json('"abc"') AND JsonValues[2] IS NOT NULL AND JsonValues[2] = json('null') AND JsonValues[3] IS NULL, 1, error('expected ARRAY<JSON> value/null distinctions')) FROM spanner_query('SELECT @v AS JsonValues', params := {'v': spanner_value([json('"abc"'), json('null'), NULL::JSON])});
+
+statement ok
+SELECT IF(StringParam = 'abc', 1, error('expected JSON-to-STRING transport tag to be transparent')) FROM spanner_query('SELECT @v AS StringParam', params := {'v': spanner_typed(json('"abc"'), 'STRING')});
+
+# Compare inside Spanner so DuckDB's microsecond result conversion cannot hide
+# loss of the final three outbound nanosecond digits.
+statement ok
+SELECT IF(Exact, 1, error('expected exact TIMESTAMP_NS wire value')) FROM spanner_query('SELECT @v = TIMESTAMP "2024-01-15T12:34:56.123456789Z" AS Exact', params := {'v': '2024-01-15 12:34:56.123456789'::TIMESTAMP_NS});
+
+# spanner_scalars.test verifies that TIMESTAMP_NS preserves all nine outbound
+# fractional digits. Independently verify the inbound half: Spanner TIMESTAMP
+# currently maps to DuckDB TIMESTAMPTZ at microsecond precision, so the final
+# three digits are intentionally truncated.
+statement ok
+SELECT IF(typeof(Ts) = 'TIMESTAMP WITH TIME ZONE' AND Ts = '2024-01-15 12:34:56.123456+00'::TIMESTAMPTZ, 1, error('expected documented Spanner TIMESTAMP return precision')) FROM spanner_query('SELECT TIMESTAMP "2024-01-15T12:34:56.123456789Z" AS Ts');
+
 statement ok
 SELECT IF(len(Intervals) = 2, 1, error('expected ARRAY<INTERVAL> param round-trip')) FROM spanner_query('SELECT @v AS Intervals', params := {'v': spanner_typed(['P1D', 'P1Y3M'], 'ARRAY<INTERVAL>')});
 

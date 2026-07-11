@@ -101,6 +101,11 @@ SELECT spanner_value('2024-01-15 12:34:56'::TIMESTAMP_S);
 ----
 {"type":"TIMESTAMP","value":"2024-01-15T12:34:56.000000Z"}
 
+query T
+SELECT spanner_value('2024-01-15 12:34:56.123456789'::TIMESTAMP_NS);
+----
+{"type":"TIMESTAMP","value":"2024-01-15T12:34:56.123456789Z"}
+
 query TTTT
 SELECT spanner_value(NULL::BIGINT[]), spanner_value([]::BIGINT[]), spanner_value(NULL::BIGINT[2]), spanner_value([NULL, NULL]::BIGINT[2]);
 ----
@@ -133,22 +138,42 @@ SELECT spanner_params({'x': 'NaN'::DOUBLE});
 query T
 SELECT spanner_value(json('{"a":1}'));
 ----
-{"type":"JSON","value":{"a":1}}
+{"$duckdb_spanner_json_format":"json-text-v1","type":"JSON","value":"{\"a\":1}"}
 
 query T
 SELECT spanner_params({'x': spanner_value(json('{"a":1}'))});
 ----
-{"x":{"type":"JSON","value":{"a":1}}}
+{"x":{"$duckdb_spanner_json_format":"json-text-v1","type":"JSON","value":"{\"a\":1}"}}
 
 query T
 SELECT spanner_params({'x': json('{"a":1}')});
 ----
-{"x":{"type":"JSON","value":{"a":1}}}
+{"x":{"$duckdb_spanner_json_format":"json-text-v1","type":"JSON","value":"{\"a\":1}"}}
+
+query T
+SELECT spanner_value(json('"abc"'));
+----
+{"$duckdb_spanner_json_format":"json-text-v1","type":"JSON","value":"\"abc\""}
+
+query T
+SELECT spanner_value(json('null'));
+----
+{"$duckdb_spanner_json_format":"json-text-v1","type":"JSON","value":"null"}
+
+query T
+SELECT spanner_params({'x': spanner_typed(json('"abc"'), 'STRING')});
+----
+{"x":{"$duckdb_spanner_json_format":"json-text-v1","type":"STRING","value":"\"abc\""}}
 
 statement error
 SELECT spanner_value({'a': 1});
 ----
 Unsupported DuckDB type Struct for spanner_value
+
+statement error
+SELECT spanner_value(NULL);
+----
+Unsupported DuckDB type SqlNull for spanner_value
 
 statement error
 SELECT spanner_typed({'a': 1}, 'JSON');
@@ -169,6 +194,11 @@ statement error
 SELECT spanner_params({'x': [1, 2]});
 ----
 Unsupported DuckDB type List for spanner_params field 'x'
+
+statement error
+SELECT spanner_params({'x': {'a': 1}});
+----
+Unsupported DuckDB type Struct for spanner_params field 'x'
 
 statement ok
 SELECT IF(

@@ -273,7 +273,7 @@ impl VScalar for SpannerTypedScalar {
             };
             let value =
                 vector_to_json_value(input, 0, row, &value_type, value_is_json, child_is_json)?;
-            let obj = json!({"value": value, "type": typ});
+            let obj = typed_param_envelope(value, typ, value_is_json || child_is_json);
             strings.push(Some(serde_json::to_string(&obj)?));
         }
 
@@ -540,10 +540,27 @@ fn write_spanner_value_strings(
     let mut strings = Vec::with_capacity(len);
     for row in 0..len {
         let value = vector_to_json_value(input, col, row, ty, value_is_json, child_is_json)?;
-        let obj = json!({"value": value, "type": type_name(ty)});
+        let obj = typed_param_envelope(value, type_name(ty), value_is_json || child_is_json);
         strings.push(serde_json::to_string(&obj)?);
     }
     write_string_array(&strings, output)
+}
+
+fn typed_param_envelope(
+    value: Value,
+    type_name: impl Into<String>,
+    json_text_transport: bool,
+) -> Value {
+    let mut object = Map::new();
+    object.insert("type".to_string(), Value::String(type_name.into()));
+    object.insert("value".to_string(), value);
+    if json_text_transport {
+        object.insert(
+            crate::params::JSON_TRANSPORT_FORMAT.to_string(),
+            Value::String(crate::params::JSON_TRANSPORT_FORMAT_V1.to_string()),
+        );
+    }
+    Value::Object(object)
 }
 
 fn vector_to_json_value(
@@ -632,8 +649,9 @@ fn flat_vector_to_json_value(
 
     if is_json {
         let json_text = read_varchar_at(vec, row)?;
-        return serde_json::from_str(&json_text)
-            .map_err(|e| format!("Invalid DuckDB JSON value: {e}").into());
+        let value: Value = serde_json::from_str(&json_text)
+            .map_err(|e| format!("Invalid DuckDB JSON value: {e}"))?;
+        return Ok(Value::String(serde_json::to_string(&value)?));
     }
 
     match ty.id() {
@@ -694,6 +712,8 @@ fn flat_vector_to_json_value(
         LogicalTypeId::TimestampNs => {
             let nanos = unsafe { vec.as_slice_with_len::<i64>(row + 1)[row] };
             let timestamp = OffsetDateTime::from_unix_timestamp_nanos(nanos as i128)?;
+            // Preserve the source's nanosecond precision. Other timestamp
+            // physical types intentionally use their microsecond-exact helper.
             Ok(Value::String(
                 timestamp.format(&time::format_description::well_known::Rfc3339)?,
             ))
@@ -845,7 +865,7 @@ fn read_varchar_at(vec: &FlatVector, row: usize) -> Result<String, Box<dyn std::
 
 fn struct_field_to_param_json(value: Value, ty: &LogicalTypeHandle, is_json: bool) -> Value {
     if is_json {
-        return json!({"value": value, "type": "JSON"});
+        return typed_param_envelope(value, "JSON", true);
     }
 
     if ty.id() == LogicalTypeId::Varchar {
@@ -1172,6 +1192,10 @@ mod tests {
                 "spanner_value('2024-01-15 12:34:56'::TIMESTAMP_S)",
                 r#"{"type":"TIMESTAMP","value":"2024-01-15T12:34:56.000000Z"}"#,
             ),
+            (
+                "spanner_value('2024-01-15 12:34:56.123456789'::TIMESTAMP_NS)",
+                r#"{"type":"TIMESTAMP","value":"2024-01-15T12:34:56.123456789Z"}"#,
+            ),
         ];
 
         for (expression, expected) in cases {
@@ -1247,18 +1271,43 @@ mod tests {
 
         assert_eq!(
             query_string(&conn, r#"spanner_value(json('{"a":1}'))"#),
-            r#"{"type":"JSON","value":{"a":1}}"#
+            r#"{"$duckdb_spanner_json_format":"json-text-v1","type":"JSON","value":"{\"a\":1}"}"#
         );
         assert_eq!(
             query_string(
                 &conn,
                 r#"spanner_params({'x': spanner_value(json('{"a":1}'))})"#,
             ),
-            r#"{"x":{"type":"JSON","value":{"a":1}}}"#
+            r#"{"x":{"$duckdb_spanner_json_format":"json-text-v1","type":"JSON","value":"{\"a\":1}"}}"#
         );
         let plain_json = query_string(&conn, r#"spanner_params({'x': json('{"a":1}')})"#);
-        assert_eq!(plain_json, r#"{"x":{"type":"JSON","value":{"a":1}}}"#);
+        assert_eq!(
+            plain_json,
+            r#"{"x":{"$duckdb_spanner_json_format":"json-text-v1","type":"JSON","value":"{\"a\":1}"}}"#
+        );
         crate::params::create_statement("SELECT @x", Some(&plain_json)).unwrap();
+
+        assert_eq!(
+            query_string(&conn, r#"spanner_value(json('"abc"'))"#),
+            r#"{"$duckdb_spanner_json_format":"json-text-v1","type":"JSON","value":"\"abc\""}"#
+        );
+        assert_eq!(
+            query_string(&conn, "spanner_value(json('null'))"),
+            r#"{"$duckdb_spanner_json_format":"json-text-v1","type":"JSON","value":"null"}"#
+        );
+        assert_eq!(
+            query_string(&conn, r#"spanner_typed(json('"abc"'), 'STRING')"#),
+            r#"{"$duckdb_spanner_json_format":"json-text-v1","type":"STRING","value":"\"abc\""}"#
+        );
+        let as_string = query_string(
+            &conn,
+            r#"spanner_params({'x': spanner_typed(json('"abc"'), 'STRING')})"#,
+        );
+        assert_eq!(
+            as_string,
+            r#"{"x":{"$duckdb_spanner_json_format":"json-text-v1","type":"STRING","value":"\"abc\""}}"#
+        );
+        crate::params::create_statement("SELECT @x", Some(&as_string)).unwrap();
     }
 
     #[test]

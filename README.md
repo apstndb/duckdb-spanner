@@ -468,7 +468,7 @@ spanner_value(42::BIGINT)                           -- {"value":42,"type":"INT64
 spanner_value('2024-01-15'::DATE)                   -- {"value":"2024-01-15","type":"DATE"}
 spanner_value('\xDEAD'::BLOB)                       -- {"value":"3kFE","type":"BYTES"}
 spanner_value('2024-06-15T10:30:00Z'::TIMESTAMPTZ)  -- {"value":"2024-06-15T10:30:00.000000Z","type":"TIMESTAMP"}
-spanner_value(json('{"active":true}'))              -- {"value":{"active":true},"type":"JSON"}
+spanner_value(json('{"active":true}'))              -- {"$duckdb_spanner_json_format":"json-text-v1","type":"JSON","value":"{\"active\":true}"}
 spanner_value(NULL::BIGINT)                         -- {"value":null,"type":"INT64"}
 ```
 
@@ -489,6 +489,10 @@ Values without `spanner_value()` or `spanner_typed()` wrappers are passed as raw
 `spanner_params()` preserves DECIMAL and wide integer fields as typed NUMERIC
 strings, and preserves non-finite FLOAT/DOUBLE fields as typed special values,
 because those values cannot be represented safely as plain JSON numbers.
+Its output is a Spanner parameter transport envelope, not a plain JSON mirror of
+the input STRUCT; callers that inspect the JSON directly must accept these typed
+objects. An untyped SQL `NULL` has no lossless Spanner type and is rejected by
+`spanner_value()`; cast it or use `spanner_typed(NULL, 'TYPE')`.
 
 ```sql
 -- Mix plain and typed values
@@ -509,16 +513,32 @@ params := {'id': 1, 'name': spanner_value('Alice')}
 | DOUBLE | FLOAT64 | number, or `"NaN"`/`"Infinity"`/`"-Infinity"` |
 | VARCHAR | STRING | string |
 | DATE | DATE | string |
-| TIMESTAMP | TIMESTAMP | string (RFC 3339: `%Y-%m-%dT%H:%M:%S.%fZ`) |
+| TIMESTAMP, TIMESTAMP_S, TIMESTAMP_MS | TIMESTAMP | string (UTC RFC 3339, up to microsecond precision) |
+| TIMESTAMP_NS | TIMESTAMP | string (UTC RFC 3339, nanosecond precision) |
 | TIMESTAMP WITH TIME ZONE | TIMESTAMP | string (normalized to UTC, RFC 3339) |
 | BLOB | BYTES | string (base64 encoded) |
-| HUGEINT, UHUGEINT, UBIGINT, DECIMAL | NUMERIC | string (preserves precision) |
+| HUGEINT, UHUGEINT, UBIGINT, DECIMAL | NUMERIC | string (preserves the source digits; accepted range depends on the database dialect) |
 | UUID | UUID | string |
 | INTERVAL | INTERVAL | string (ISO 8601 duration) |
-| JSON | JSON | structural JSON value (not a quoted JSON string) |
+| JSON | JSON | tagged canonical JSON text (preserves JSON strings and JSON `null` distinctly from SQL `NULL`) |
 | TIME | STRING | string (`HH:MM:SS.ffffff`) |
+| TIME_NS | STRING | string (`HH:MM:SS.nnnnnnnnn`) |
 | BIT | BYTES | string (base64 encoded) |
 | T[] | ARRAY\<T\> | JSON array (elements follow scalar conversion rules) |
+
+The `$duckdb_spanner_json_format` field versions the parameter envelope, not
+the JSON payload. JSON object keys remain unrestricted; untagged low-level JSON
+envelopes keep their existing pre-serialized-string/structural-value behavior.
+
+`TIMESTAMP_NS` preserves nanoseconds in the outbound Spanner parameter. Spanner
+`TIMESTAMP` query results map to DuckDB `TIMESTAMP WITH TIME ZONE`, whose current
+conversion path has microsecond precision, so a nanosecond round trip truncates
+the final three fractional digits.
+
+NUMERIC bounds are enforced by Spanner after the target database dialect is
+known. GoogleSQL NUMERIC has precision 38 and scale 9; PostgreSQL-dialect
+NUMERIC supports arbitrary precision up to Spanner's documented limits. For
+arbitrary-precision values in GoogleSQL, use an explicit STRING target.
 
 `spanner_value()` also supports array types:
 
