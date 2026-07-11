@@ -15,6 +15,8 @@ use duckdb::vtab::arrow::{write_arrow_array_to_vector, WritableVector};
 use serde_json::{json, Map, Value};
 use time::OffsetDateTime;
 
+use crate::RegistrationError;
+
 pub struct SpannerValueScalar;
 pub struct SpannerTypedScalar;
 pub struct SpannerParamsScalar;
@@ -24,39 +26,113 @@ pub struct IntervalToIso8601Scalar;
 ///
 /// # Safety
 /// `raw_con` must be a valid `duckdb_connection`.
-pub unsafe fn register_scalars_c_api(raw_con: duckdb::ffi::duckdb_connection) {
-    unsafe {
-        register_nullable_scalar::<SpannerValueScalar>(
-            raw_con,
-            "spanner_value",
-            &[duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_ANY],
-        );
-        register_nullable_scalar::<SpannerTypedScalar>(
-            raw_con,
-            "spanner_typed",
-            &[
-                duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_ANY,
-                duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
-            ],
-        );
-        register_nullable_scalar::<SpannerParamsScalar>(
-            raw_con,
-            "spanner_params",
-            &[duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_ANY],
-        );
-        register_nullable_scalar::<IntervalToIso8601Scalar>(
-            raw_con,
-            "interval_to_iso8601",
-            &[duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTERVAL],
-        );
+pub(crate) struct PreparedScalars(Vec<(&'static str, OwnedScalarFunctionSet)>);
+
+impl PreparedScalars {
+    /// # Safety
+    /// `raw_con` must be a valid `duckdb_connection`.
+    pub(crate) unsafe fn register(
+        self,
+        raw_con: duckdb::ffi::duckdb_connection,
+    ) -> Result<(), RegistrationError> {
+        for (name, set) in self.0 {
+            let rc = if crate::should_fail_status("register scalar function") {
+                duckdb::ffi::DuckDBError
+            } else {
+                unsafe { duckdb::ffi::duckdb_register_scalar_function_set(raw_con, set.0) }
+            };
+            if rc != duckdb::ffi::DuckDBSuccess {
+                return Err(RegistrationError::new(
+                    "register scalar function",
+                    name,
+                    format!("DuckDB returned status {rc}"),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
-unsafe fn register_nullable_scalar<S: VScalar>(
+struct OwnedScalarFunctionSet(duckdb::ffi::duckdb_scalar_function_set);
+
+impl Drop for OwnedScalarFunctionSet {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { duckdb::ffi::duckdb_destroy_scalar_function_set(&mut self.0) };
+        }
+    }
+}
+
+struct OwnedScalarFunction(duckdb::ffi::duckdb_scalar_function);
+
+impl Drop for OwnedScalarFunction {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { duckdb::ffi::duckdb_destroy_scalar_function(&mut self.0) };
+        }
+    }
+}
+
+struct OwnedLogicalType(duckdb::ffi::duckdb_logical_type);
+
+impl Drop for OwnedLogicalType {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { duckdb::ffi::duckdb_destroy_logical_type(&mut self.0) };
+        }
+    }
+}
+
+pub(crate) unsafe fn prepare_scalars_c_api() -> Result<PreparedScalars, RegistrationError> {
+    unsafe {
+        Ok(PreparedScalars(vec![
+            (
+                "spanner_value",
+                prepare_nullable_scalar::<SpannerValueScalar>(
+                    "spanner_value",
+                    &[duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_ANY],
+                )?,
+            ),
+            (
+                "spanner_typed",
+                prepare_nullable_scalar::<SpannerTypedScalar>(
+                    "spanner_typed",
+                    &[
+                        duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_ANY,
+                        duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
+                    ],
+                )?,
+            ),
+            (
+                "spanner_params",
+                prepare_nullable_scalar::<SpannerParamsScalar>(
+                    "spanner_params",
+                    &[duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_ANY],
+                )?,
+            ),
+            (
+                "interval_to_iso8601",
+                prepare_nullable_scalar::<IntervalToIso8601Scalar>(
+                    "interval_to_iso8601",
+                    &[duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTERVAL],
+                )?,
+            ),
+        ]))
+    }
+}
+
+#[cfg(test)]
+pub(crate) unsafe fn register_scalars_c_api(
     raw_con: duckdb::ffi::duckdb_connection,
+) -> Result<(), RegistrationError> {
+    unsafe { prepare_scalars_c_api()?.register(raw_con) }
+}
+
+unsafe fn prepare_nullable_scalar<S: VScalar>(
     name: &str,
     param_type_ids: &[u32],
-) where
+) -> Result<OwnedScalarFunctionSet, RegistrationError>
+where
     S::State: Default,
 {
     use std::ffi::CString;
@@ -65,9 +141,7 @@ unsafe fn register_nullable_scalar<S: VScalar>(
     use duckdb::ffi::{
         duckdb_add_scalar_function_to_set, duckdb_create_logical_type,
         duckdb_create_scalar_function, duckdb_create_scalar_function_set, duckdb_data_chunk,
-        duckdb_destroy_logical_type, duckdb_destroy_scalar_function,
-        duckdb_destroy_scalar_function_set, duckdb_function_info,
-        duckdb_register_scalar_function_set, duckdb_scalar_function_add_parameter,
+        duckdb_function_info, duckdb_scalar_function_add_parameter,
         duckdb_scalar_function_set_error, duckdb_scalar_function_set_extra_info,
         duckdb_scalar_function_set_function, duckdb_scalar_function_set_name,
         duckdb_scalar_function_set_return_type, duckdb_scalar_function_set_special_handling,
@@ -126,35 +200,63 @@ unsafe fn register_nullable_scalar<S: VScalar>(
     }
 
     let c_name = CString::new(name).expect("scalar name must be valid UTF-8");
-    let set = duckdb_create_scalar_function_set(c_name.as_ptr());
-    let scalar_function = duckdb_create_scalar_function();
-    duckdb_scalar_function_set_name(scalar_function, c_name.as_ptr());
-    let return_type = duckdb_create_logical_type(DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR);
-    duckdb_scalar_function_set_return_type(scalar_function, return_type);
-    duckdb_destroy_logical_type(&mut { return_type });
-    for type_id in param_type_ids {
-        let param_type = duckdb_create_logical_type(*type_id);
-        duckdb_scalar_function_add_parameter(scalar_function, param_type);
-        duckdb_destroy_logical_type(&mut { param_type });
+    let set = OwnedScalarFunctionSet(duckdb_create_scalar_function_set(c_name.as_ptr()));
+    if set.0.is_null() || crate::should_fail_allocation("scalar function set") {
+        return Err(RegistrationError::new(
+            "allocate scalar function set",
+            name,
+            "duckdb_create_scalar_function_set returned null",
+        ));
     }
-    duckdb_scalar_function_set_function(scalar_function, Some(scalar_invoke::<S>));
-    duckdb_scalar_function_set_special_handling(scalar_function);
+    let scalar_function = OwnedScalarFunction(duckdb_create_scalar_function());
+    if scalar_function.0.is_null() || crate::should_fail_allocation("scalar function") {
+        return Err(RegistrationError::new(
+            "allocate scalar function",
+            name,
+            "duckdb_create_scalar_function returned null",
+        ));
+    }
+    duckdb_scalar_function_set_name(scalar_function.0, c_name.as_ptr());
+    let return_type = OwnedLogicalType(duckdb_create_logical_type(DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR));
+    if return_type.0.is_null() || crate::should_fail_allocation("scalar return type") {
+        return Err(RegistrationError::new(
+            "allocate scalar return type",
+            name,
+            "duckdb_create_logical_type returned null",
+        ));
+    }
+    duckdb_scalar_function_set_return_type(scalar_function.0, return_type.0);
+    for type_id in param_type_ids {
+        let param_type = OwnedLogicalType(duckdb_create_logical_type(*type_id));
+        if param_type.0.is_null() || crate::should_fail_allocation("scalar parameter type") {
+            return Err(RegistrationError::new(
+                "allocate scalar parameter type",
+                name,
+                format!("duckdb_create_logical_type returned null for type {type_id}"),
+            ));
+        }
+        duckdb_scalar_function_add_parameter(scalar_function.0, param_type.0);
+    }
+    duckdb_scalar_function_set_function(scalar_function.0, Some(scalar_invoke::<S>));
+    duckdb_scalar_function_set_special_handling(scalar_function.0);
     if S::volatile() {
-        duckdb_scalar_function_set_volatile(scalar_function);
+        duckdb_scalar_function_set_volatile(scalar_function.0);
     }
     let state = Box::new(S::State::default());
     duckdb_scalar_function_set_extra_info(
-        scalar_function,
+        scalar_function.0,
         Box::into_raw(state) as *mut std::ffi::c_void,
         Some(drop_scalar_state::<S::State>),
     );
-    duckdb_add_scalar_function_to_set(set, scalar_function);
-    duckdb_destroy_scalar_function(&mut { scalar_function });
-    let rc = duckdb_register_scalar_function_set(raw_con, set);
+    let rc = duckdb_add_scalar_function_to_set(set.0, scalar_function.0);
     if rc != DuckDBSuccess {
-        eprintln!("[duckdb-spanner] Failed to register scalar function set: {name}");
+        return Err(RegistrationError::new(
+            "add scalar overload",
+            name,
+            format!("DuckDB returned status {rc}"),
+        ));
     }
-    duckdb_destroy_scalar_function_set(&mut { set });
+    Ok(set)
 }
 
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
@@ -1028,12 +1130,17 @@ mod tests {
             let mut raw_con = std::ptr::null_mut();
             let rc = ffi::duckdb_connect(db, &mut raw_con);
             assert_eq!(rc, DuckDBSuccess, "duckdb_connect failed");
-            register_scalars_c_api(raw_con);
-            register_nullable_scalar::<PanickingScalar>(
-                raw_con,
+            register_scalars_c_api(raw_con).unwrap();
+            PreparedScalars(vec![(
                 "test_panicking_scalar",
-                &[ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER],
-            );
+                prepare_nullable_scalar::<PanickingScalar>(
+                    "test_panicking_scalar",
+                    &[ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER],
+                )
+                .unwrap(),
+            )])
+            .register(raw_con)
+            .unwrap();
             ffi::duckdb_disconnect(&mut raw_con);
             Connection::open_from_raw(db).unwrap()
         }

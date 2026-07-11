@@ -38,6 +38,7 @@ use crate::client;
 use crate::config;
 use crate::runtime;
 use crate::schema;
+use crate::RegistrationError;
 
 const DEFAULT_BATCH_SIZE: usize = 1000;
 const MAX_BATCH_SIZE: usize = 80_000;
@@ -204,21 +205,45 @@ struct CopyGlobalState {
 
 // ─── Registration ───────────────────────────────────────────────────────────
 
-/// Register the `spanner` copy function on a raw DuckDB connection.
-///
-/// Set `config_enabled` when `register_config_options` was also called on the
-/// same database so COPY bind can fall back to `SET spanner_*` session defaults.
-///
-/// # Safety
-/// `con` must be a valid `duckdb_connection`.
-pub unsafe fn register_copy_function(con: ffi::duckdb_connection, config_enabled: bool) {
+/// A fully allocated COPY-function builder that has not mutated DuckDB yet.
+pub(crate) struct PreparedCopyFunction(OwnedDuckDbCopyFunction);
+
+impl PreparedCopyFunction {
+    /// # Safety
+    /// `con` must be a valid `duckdb_connection`.
+    pub(crate) unsafe fn register(
+        self,
+        con: ffi::duckdb_connection,
+    ) -> Result<(), RegistrationError> {
+        let rc = if crate::should_fail_status("register COPY function") {
+            ffi::DuckDBError
+        } else {
+            unsafe { ffi::duckdb_register_copy_function(con, self.0.as_raw()) }
+        };
+        if rc != ffi::DuckDBSuccess {
+            return Err(RegistrationError::new(
+                "register COPY function",
+                "spanner",
+                format!("DuckDB returned status {rc}"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) unsafe fn prepare_copy_function(
+    config_enabled: bool,
+) -> Result<PreparedCopyFunction, RegistrationError> {
     crate::ensure_rustls_crypto_provider();
 
     unsafe {
         let copy_fn = OwnedDuckDbCopyFunction::from_raw(ffi::duckdb_create_copy_function());
-        if copy_fn.as_raw().is_null() {
-            eprintln!("[duckdb-spanner] Failed to allocate copy function");
-            return;
+        if copy_fn.as_raw().is_null() || crate::should_fail_allocation("COPY function") {
+            return Err(RegistrationError::new(
+                "allocate COPY function",
+                "spanner",
+                "duckdb_create_copy_function returned null",
+            ));
         }
 
         let name = c"spanner";
@@ -234,11 +259,23 @@ pub unsafe fn register_copy_function(con: ffi::duckdb_connection, config_enabled
         ffi::duckdb_copy_function_set_sink(copy_fn.as_raw(), Some(copy_sink));
         ffi::duckdb_copy_function_set_finalize(copy_fn.as_raw(), Some(copy_finalize));
 
-        let rc = ffi::duckdb_register_copy_function(con, copy_fn.as_raw());
-        if rc != ffi::DuckDBSuccess {
-            eprintln!("[duckdb-spanner] Failed to register copy function");
-        }
+        Ok(PreparedCopyFunction(copy_fn))
     }
+}
+
+/// Register the `spanner` copy function on a raw DuckDB connection.
+///
+/// Set `config_enabled` when `register_config_options` was also called on the
+/// same database so COPY bind can fall back to `SET spanner_*` session defaults.
+///
+/// # Safety
+/// `con` must be a valid `duckdb_connection`.
+#[cfg(test)]
+pub(crate) unsafe fn register_copy_function(
+    con: ffi::duckdb_connection,
+    config_enabled: bool,
+) -> Result<(), RegistrationError> {
+    unsafe { prepare_copy_function(config_enabled)?.register(con) }
 }
 
 // ─── Callbacks ──────────────────────────────────────────────────────────────
@@ -1602,28 +1639,29 @@ fn decimal_i128_to_string(raw: i128, scale: u8) -> String {
 
 // ─── Error setters ──────────────────────────────────────────────────────────
 
+fn copy_callback_error_message(msg: &str) -> CString {
+    let sanitized = msg.replace('\0', "\\0");
+    CString::new(sanitized).unwrap_or_else(|_| c"spanner COPY callback failed".to_owned())
+}
+
 unsafe fn set_bind_error(info: ffi::duckdb_copy_function_bind_info, msg: &str) {
-    if let Ok(c_msg) = CString::new(msg) {
-        ffi::duckdb_copy_function_bind_set_error(info, c_msg.as_ptr());
-    }
+    let c_msg = copy_callback_error_message(msg);
+    ffi::duckdb_copy_function_bind_set_error(info, c_msg.as_ptr());
 }
 
 unsafe fn set_global_init_error(info: ffi::duckdb_copy_function_global_init_info, msg: &str) {
-    if let Ok(c_msg) = CString::new(msg) {
-        ffi::duckdb_copy_function_global_init_set_error(info, c_msg.as_ptr());
-    }
+    let c_msg = copy_callback_error_message(msg);
+    ffi::duckdb_copy_function_global_init_set_error(info, c_msg.as_ptr());
 }
 
 unsafe fn set_sink_error(info: ffi::duckdb_copy_function_sink_info, msg: &str) {
-    if let Ok(c_msg) = CString::new(msg) {
-        ffi::duckdb_copy_function_sink_set_error(info, c_msg.as_ptr());
-    }
+    let c_msg = copy_callback_error_message(msg);
+    ffi::duckdb_copy_function_sink_set_error(info, c_msg.as_ptr());
 }
 
 unsafe fn set_finalize_error(info: ffi::duckdb_copy_function_finalize_info, msg: &str) {
-    if let Ok(c_msg) = CString::new(msg) {
-        ffi::duckdb_copy_function_finalize_set_error(info, c_msg.as_ptr());
-    }
+    let c_msg = copy_callback_error_message(msg);
+    ffi::duckdb_copy_function_finalize_set_error(info, c_msg.as_ptr());
 }
 
 // ─── Memory management ─────────────────────────────────────────────────────
@@ -1641,6 +1679,12 @@ mod tests {
     use super::*;
     use google_cloud_gax::error::rpc::Status;
     use google_cloud_spanner::types as spanner_types;
+
+    #[test]
+    fn copy_callback_error_message_sanitizes_nul() {
+        let message = copy_callback_error_message("bind failed\0with context");
+        assert_eq!(message.to_str().unwrap(), "bind failed\\0with context");
+    }
 
     fn col(name: &str, is_generated: bool) -> schema::ColumnInfo {
         schema::ColumnInfo {

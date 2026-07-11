@@ -36,7 +36,7 @@ impl Drop for OwnedDuckDbValue {
 ///
 /// # Safety
 /// `db` must be a valid `duckdb_database`.
-pub unsafe fn register_replacement_scan(db: ffi::duckdb_database) {
+pub(crate) unsafe fn register_replacement_scan(db: ffi::duckdb_database) {
     unsafe {
         ffi::duckdb_add_replacement_scan(db, Some(replacement_scan), ptr::null_mut(), None);
     }

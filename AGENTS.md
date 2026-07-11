@@ -41,7 +41,7 @@ Docker (Colima on macOS) must be running. `RUST_TEST_THREADS=4` is set in `.carg
 - **Config options**: registered via DuckDB Config Options C API (`src/config.rs`)
 - **SQL macros**: `src/macros.sql` (loaded at extension init)
 - Manual C API init in `src/lib.rs` (not using `#[duckdb_entrypoint_c_api]` macro because raw `duckdb_connection` is needed for config/copy registration)
-- Scalars register via `register_scalars_c_api` (null-input special handling); VTabs/macros via `register_extension_functions`
+- `register_spanner_extension` orchestrates prepared config/COPY/scalar C registrations, VTabs/macros, and final replacement-scan installation as one checked initialization path
 
 ## Google Cloud Rust client
 
