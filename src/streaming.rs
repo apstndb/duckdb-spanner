@@ -333,14 +333,19 @@ mod tests {
 
     #[test]
     fn next_batch_drains_available_rows_after_the_first_row() {
-        let state = StreamingState::spawn(4, |tx, _cancellation| async move {
+        let (sent_tx, sent_rx) = sync_channel(1);
+        let state = StreamingState::spawn(4, move |tx, _cancellation| async move {
             for row in 1..=4 {
                 tx.send(Ok(row)).await.unwrap();
             }
+            sent_tx.send(()).unwrap();
             Ok(())
         })
         .unwrap();
 
+        sent_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("producer should enqueue the complete batch");
         assert_eq!(state.next_batch().unwrap(), Some(vec![1, 2, 3, 4]));
         assert_eq!(state.next_batch().unwrap(), None);
     }
