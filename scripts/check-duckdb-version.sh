@@ -14,6 +14,8 @@ normalize_version() {
 	printf 'v%s\n' "$version"
 }
 
+# These assignments are guarded OR-list commands. Bash 3.2 therefore defers
+# errexit until the explicit diagnostic handler has had a chance to run.
 target="$(normalize_version "$1")" || {
 	echo "error: invalid compiled DuckDB target version '$1'" >&2
 	exit 2
