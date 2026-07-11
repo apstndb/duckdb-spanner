@@ -1,4 +1,4 @@
-.PHONY: build build-sweep build-release check-google-cloud-rust check-duckdb-version check-target-duckdb-version extension duckdb emulator-start emulator-stop emulator-status test test_debug test_release clean sweep sweep-dry-run ensure-cargo-sweep configure debug release clean_all
+.PHONY: build build-sweep build-release check-google-cloud-rust check-duckdb-version check-duckdb-cli-version check-target-duckdb-version extension duckdb emulator-start emulator-stop emulator-status test test_debug test_release clean sweep sweep-dry-run ensure-cargo-sweep configure debug release clean_all
 
 # Detect OS for library extension
 UNAME := $(shell uname)
@@ -24,7 +24,8 @@ EXTENSION := spanner.duckdb_extension
 METADATA_SCRIPT := extension-ci-tools/scripts/append_extension_metadata.py
 DUCKDB_VERSION_CHECK := scripts/check-duckdb-version.sh
 EMULATOR_NAME := spanner-emulator
-DUCKDB_TARGET_VERSION := v1.5.4
+# This is the compile-time ABI target, not a caller-selectable metadata value.
+override DUCKDB_TARGET_VERSION := v1.5.4
 DUCKDB_BIN ?= duckdb
 DUCKDB_CLI_VERSION := $(shell "$(DUCKDB_BIN)" --version 2>/dev/null | sed -nE 's/^v?([0-9]+\.[0-9]+\.[0-9]+).*/v\1/p')
 
@@ -68,6 +69,13 @@ check-google-cloud-rust:
 check-duckdb-version:
 	@bash $(DUCKDB_VERSION_CHECK) "$(DUCKDB_TARGET_VERSION)" "$(DUCKDB_VERSION)" "$(DUCKDB_CLI_VERSION)"
 
+check-duckdb-cli-version:
+	@if [ -z "$(DUCKDB_CLI_VERSION)" ]; then \
+		echo "error: DUCKDB_BIN '$(DUCKDB_BIN)' did not report a MAJOR.MINOR.PATCH version; install DuckDB $(DUCKDB_TARGET_VERSION) or set DUCKDB_BIN to that CLI" >&2; \
+		exit 1; \
+	fi
+	@bash $(DUCKDB_VERSION_CHECK) "$(DUCKDB_TARGET_VERSION)" "$(DUCKDB_TARGET_VERSION)" "$(DUCKDB_CLI_VERSION)"
+
 check-target-duckdb-version:
 	@bash $(DUCKDB_VERSION_CHECK) "$(DUCKDB_TARGET_VERSION)" "$(TARGET_DUCKDB_VERSION)"
 
@@ -87,9 +95,11 @@ endif
 	@rm -f spanner_raw.$(LIB_EXT)
 	@echo "Extension ready: $(EXTENSION)"
 
-duckdb: extension
+# Keep CLI validation ahead of the expensive build even under parallel make.
+duckdb: check-duckdb-cli-version
+	@$(MAKE) --no-print-directory extension
 	@echo "Starting DuckDB with spanner extension loaded..."
-	@$(DUCKDB_BIN) -unsigned -cmd "LOAD '$$(pwd)/$(EXTENSION)'"
+	@"$(DUCKDB_BIN)" -unsigned -cmd "LOAD '$$(pwd)/$(EXTENSION)'"
 
 emulator-start:
 	@if docker ps --format '{{.Names}}' | grep -q '^$(EMULATOR_NAME)$$'; then \
