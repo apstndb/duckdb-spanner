@@ -1,4 +1,4 @@
-use std::sync::{mpsc as std_mpsc, Mutex};
+use std::sync::{mpsc as std_mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -26,6 +26,49 @@ struct ReporterSendProbe {
     completed: Option<std_mpsc::SyncSender<()>>,
 }
 
+type StreamReceiver<T> = mpsc::Receiver<Result<T, SpannerError>>;
+type ReceiverSlot<T> = Arc<Mutex<Option<StreamReceiver<T>>>>;
+
+struct ReceiverLease<T: Send + 'static> {
+    slot: ReceiverSlot<T>,
+    receiver: Option<StreamReceiver<T>>,
+}
+
+impl<T: Send + 'static> ReceiverLease<T> {
+    fn acquire(slot: ReceiverSlot<T>) -> Result<Self, SpannerError> {
+        let receiver = slot
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .ok_or_else(|| {
+                SpannerError::Other("Streaming receiver is already in use".to_string())
+            })?;
+        Ok(Self {
+            slot,
+            receiver: Some(receiver),
+        })
+    }
+
+    fn receiver_mut(&mut self) -> &mut StreamReceiver<T> {
+        self.receiver
+            .as_mut()
+            .expect("receiver lease must own its receiver")
+    }
+}
+
+impl<T: Send + 'static> Drop for ReceiverLease<T> {
+    fn drop(&mut self) {
+        let Some(receiver) = self.receiver.take() else {
+            return;
+        };
+        let mut slot = self.slot.lock().unwrap_or_else(|error| error.into_inner());
+        debug_assert!(slot.is_none(), "receiver slot was refilled while leased");
+        if slot.is_none() {
+            *slot = Some(receiver);
+        }
+    }
+}
+
 /// Bounded row stream shared by the query and scan table functions.
 ///
 /// On drop, the producer first receives a cancellation token so partition work
@@ -34,8 +77,8 @@ struct ReporterSendProbe {
 /// that never yields after being aborted. A small reporter task translates
 /// producer errors and panics into channel errors rather than allowing them to
 /// look like a successful end of stream.
-pub struct StreamingState<T> {
-    receiver: Mutex<mpsc::Receiver<Result<T, SpannerError>>>,
+pub struct StreamingState<T: Send + 'static> {
+    receiver: ReceiverSlot<T>,
     batch_size: usize,
     producer_abort: AbortHandle,
     reporter_abort: AbortHandle,
@@ -159,7 +202,7 @@ where
         };
 
         Ok(Self {
-            receiver: Mutex::new(receiver),
+            receiver: Arc::new(Mutex::new(Some(receiver))),
             batch_size,
             producer_abort,
             reporter_abort: reporter.abort_handle(),
@@ -171,44 +214,56 @@ where
         })
     }
 
-    /// Receive one blocking row, then drain immediately available rows into a
-    /// DuckDB-sized batch. `None` is a clean end of stream.
+    /// Receive one row on the runtime owner, then drain immediately available
+    /// rows into a DuckDB-sized batch. `None` is a clean end of stream.
     pub fn next_batch(&self) -> Result<Option<Vec<T>>, SpannerError> {
-        let mut receiver = self
-            .receiver
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let mut lease = ReceiverLease::acquire(Arc::clone(&self.receiver))?;
+        let batch_size = self.batch_size;
+        let (lease, result) = runtime::run(async move {
+            let result = async {
+                let receiver = lease.receiver_mut();
+                let first = match receiver.recv().await {
+                    Some(Ok(row)) => row,
+                    Some(Err(error)) => return Err(error),
+                    None => return Ok(None),
+                };
 
-        let first = match receiver.blocking_recv() {
-            Some(Ok(row)) => row,
-            Some(Err(error)) => return Err(error),
-            None => return Ok(None),
-        };
-
-        let mut batch = Vec::with_capacity(self.batch_size);
-        batch.push(first);
-        while batch.len() < self.batch_size {
-            match receiver.try_recv() {
-                Ok(Ok(row)) => batch.push(row),
-                Ok(Err(error)) => return Err(error),
-                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
-                    break;
+                let mut batch = Vec::with_capacity(batch_size);
+                batch.push(first);
+                while batch.len() < batch_size {
+                    match receiver.try_recv() {
+                        Ok(Ok(row)) => batch.push(row),
+                        Ok(Err(error)) => return Err(error),
+                        Err(
+                            mpsc::error::TryRecvError::Empty
+                            | mpsc::error::TryRecvError::Disconnected,
+                        ) => break,
+                    }
                 }
+                Ok(Some(batch))
             }
-        }
-        Ok(Some(batch))
+            .await;
+            (lease, result)
+        })?;
+        drop(lease);
+        result
     }
 }
 
-impl<T> Drop for StreamingState<T> {
+impl<T: Send + 'static> Drop for StreamingState<T> {
     fn drop(&mut self) {
-        // Close before waiting so a reporter blocked behind buffered rows can
-        // finish its terminal-error send and report completion promptly.
-        self.receiver
-            .get_mut()
-            .unwrap_or_else(|error| error.into_inner())
-            .close();
+        // Cancellation must begin before any teardown work. Closing the locally
+        // owned receiver then unblocks a reporter waiting behind buffered rows
+        // without submitting work to a runtime whose workers may be saturated.
         self.cancellation.cancel();
+        if let Some(receiver) = self
+            .receiver
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_mut()
+        {
+            receiver.close();
+        }
 
         let reporter_done = self
             .reporter_done
@@ -271,6 +326,7 @@ async fn send_terminal_error<T>(
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc::{sync_channel, SyncSender};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use super::*;
@@ -348,6 +404,57 @@ mod tests {
             .expect("producer should enqueue the complete batch");
         assert_eq!(state.next_batch().unwrap(), Some(vec![1, 2, 3, 4]));
         assert_eq!(state.next_batch().unwrap(), None);
+    }
+
+    fn assert_next_batch_from_tokio_worker() {
+        let state = StreamingState::spawn(2, move |tx, _cancellation| async move {
+            tx.send(Ok(10)).await.unwrap();
+            tx.send(Ok(20)).await.unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(state.next_batch().unwrap(), Some(vec![10, 20]));
+        assert_eq!(state.next_batch().unwrap(), None);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn next_batch_is_safe_from_a_current_thread_runtime() {
+        tokio::task::yield_now().await;
+        assert_next_batch_from_tokio_worker();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn next_batch_is_safe_from_a_multithread_runtime_worker() {
+        tokio::task::yield_now().await;
+        assert_next_batch_from_tokio_worker();
+    }
+
+    #[test]
+    fn next_batch_restores_receiver_after_owner_reentry_rejection() {
+        let state = Arc::new(
+            StreamingState::spawn(1, move |tx, cancellation| async move {
+                tx.send(Ok(7)).await.unwrap();
+                cancellation.cancelled().await;
+                Ok(())
+            })
+            .unwrap(),
+        );
+        let task_state = Arc::clone(&state);
+        let (error_tx, error_rx) = sync_channel(1);
+        let task = runtime::spawn(async move {
+            let error = task_state.next_batch().unwrap_err();
+            error_tx.send(error.to_string()).unwrap();
+        })
+        .unwrap();
+
+        let error = error_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("owner-runtime reentry did not return an error");
+        assert!(error.contains("extension-owned runtime task"), "{error}");
+        assert_eq!(state.next_batch().unwrap(), Some(vec![7]));
+        drop(task);
+        drop(state);
     }
 
     #[test]
@@ -436,5 +543,66 @@ mod tests {
         dropped_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("hard-aborted producer did not yield and drop");
+    }
+
+    #[test]
+    fn dropping_state_is_bounded_when_owner_workers_do_not_yield_subprocess() {
+        runtime::test_support::run(
+            "streaming::tests::dropping_state_is_bounded_when_owner_workers_do_not_yield_child",
+            Duration::from_secs(5),
+        );
+    }
+
+    #[test]
+    fn dropping_state_is_bounded_when_owner_workers_do_not_yield_child() {
+        const TEST_NAME: &str =
+            "streaming::tests::dropping_state_is_bounded_when_owner_workers_do_not_yield_child";
+        if !runtime::test_support::is_child(TEST_NAME) {
+            return;
+        }
+
+        let (producer_started_tx, producer_started_rx) = sync_channel(1);
+        let (fallback_tx, fallback_rx) = sync_channel(1);
+        let state = StreamingState::<usize>::spawn_with_shutdown_timeout(
+            1,
+            move |_tx, _cancellation| async move {
+                producer_started_tx.send(()).unwrap();
+                loop {
+                    std::hint::spin_loop();
+                }
+            },
+            Duration::from_millis(20),
+            fallback_tx,
+        )
+        .unwrap();
+        producer_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("non-yielding producer did not start");
+
+        let additional_workers = runtime::worker_threads().saturating_sub(1);
+        let (saturated_tx, saturated_rx) = sync_channel(additional_workers.max(1));
+        for _ in 0..additional_workers {
+            let saturated_tx = saturated_tx.clone();
+            let _task = runtime::spawn(async move {
+                saturated_tx.send(()).unwrap();
+                loop {
+                    std::hint::spin_loop();
+                }
+            })
+            .unwrap();
+        }
+        for _ in 0..additional_workers {
+            saturated_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("runtime worker was not saturated");
+        }
+
+        let started = std::time::Instant::now();
+        drop(state);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        fallback_rx
+            .try_recv()
+            .expect("stream drop did not enter its bounded abort fallback");
+        runtime::test_support::finish_child();
     }
 }

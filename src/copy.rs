@@ -433,23 +433,32 @@ unsafe fn copy_global_init_inner(
     validate_batch_size(bind_data.batch_size)?;
 
     // Connect to Spanner
-    let client = runtime::block_on(client::get_or_create_client(
-        &bind_data.database_path,
-        bind_data.endpoint.as_deref(),
-    ))
+    let database_path = bind_data.database_path.clone();
+    let endpoint = bind_data.endpoint.clone();
+    let client = runtime::run(async move {
+        client::get_or_create_client(&database_path, endpoint.as_deref()).await
+    })
     .map_err(|e| format!("Runtime error: {e}"))?
     .map_err(|e| format!("Failed to connect to Spanner: {e}"))?;
 
     // An explicit dialect avoids metadata discovery for endpoints that do not
     // expose INFORMATION_SCHEMA.DATABASE_OPTIONS. COPY discovery retains
     // unsupported generated columns so they can be excluded before conversion.
-    let schema_columns = runtime::block_on(schema::discover_table_schema_for_copy(
-        &client,
-        &table_name,
-        bind_data.dialect.clone(),
-        &bind_data.database_path,
-        bind_data.endpoint.as_deref(),
-    ))
+    let schema_client = Arc::clone(&client);
+    let schema_table_name = table_name.clone();
+    let schema_dialect = bind_data.dialect.clone();
+    let schema_database_path = bind_data.database_path.clone();
+    let schema_endpoint = bind_data.endpoint.clone();
+    let schema_columns = runtime::run(async move {
+        schema::discover_table_schema_for_copy(
+            &schema_client,
+            &schema_table_name,
+            schema_dialect,
+            &schema_database_path,
+            schema_endpoint.as_deref(),
+        )
+        .await
+    })
     .map_err(|e| format!("Runtime error: {e}"))?
     .map_err(|e| format!("Schema discovery failed for table '{table_name}': {e}"))?;
 
@@ -1064,7 +1073,7 @@ fn flush_buffer(state: &mut CopyGlobalState) -> Result<(), String> {
     let mutations = std::mem::take(&mut state.buffer);
     let count = mutations.len();
 
-    runtime::block_on(write_mutations(
+    runtime::run(write_mutations(
         Arc::clone(&state.client),
         mutations,
         state.emulator_retry_route,

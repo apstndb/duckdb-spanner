@@ -517,6 +517,7 @@ const ADMIN_MAX_CONCURRENT_INITIALIZATIONS: usize = 4;
 
 type InitializationResult<T> = Result<Arc<T>, Arc<str>>;
 type InitializationReceiver<T> = watch::Receiver<Option<InitializationResult<T>>>;
+type InitializationTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
 struct ClientFlight<T> {
     generation: u64,
@@ -648,11 +649,15 @@ impl<T> FlightCleanupGuard<T> {
                     );
                 }
             }
+            // Keep removal and admission release atomic with respect to new
+            // lookups. A released permit may wake another task, but it cannot
+            // inspect the cache until this mutex is unlocked.
+            drop(self.permit.take());
         }
+        // Notify only after both the cache state and admission state agree.
         if let Some(sender) = self.sender.take() {
             sender.send_replace(Some(result));
         }
-        drop(self.permit.take());
     }
 }
 
@@ -666,12 +671,13 @@ impl<T> Drop for FlightCleanupGuard<T> {
             if flight_is_current(&cache, &self.cache_key, self.generation) {
                 cache.in_flight.remove(&self.cache_key);
             }
+            // Keep removal and admission release atomic with respect to new
+            // lookups, including lookups that were not waiting on this flight.
+            drop(self.permit.take());
         }
-        // Close the old flight only after removing its matching generation.
-        // A waiter that wakes on channel closure can safely start a new flight,
-        // and this guard cannot remove that newer generation.
+        // Close the old flight after the matching generation has been removed
+        // and admission is available. This guard cannot remove a newer flight.
         drop(self.sender.take());
-        drop(self.permit.take());
     }
 }
 
@@ -682,11 +688,42 @@ fn spawn_client_initialization<T, F, Fut>(
     permit: OwnedSemaphorePermit,
     sender: watch::Sender<Option<InitializationResult<T>>>,
     initialize: F,
-) -> AbortHandle
+) -> Result<AbortHandle, SpannerError>
 where
     T: Send + Sync + 'static,
     F: FnOnce() -> Fut + Send + 'static,
     Fut: Future<Output = Result<Arc<T>, SpannerError>> + Send + 'static,
+{
+    spawn_client_initialization_with(
+        cache,
+        cache_key,
+        generation,
+        permit,
+        sender,
+        initialize,
+        |future| {
+            let task = runtime::spawn(future)?;
+            let abort_handle = task.abort_handle();
+            drop(task);
+            Ok(abort_handle)
+        },
+    )
+}
+
+fn spawn_client_initialization_with<T, F, Fut, S>(
+    cache: Arc<Mutex<ClientCache<T>>>,
+    cache_key: String,
+    generation: u64,
+    permit: OwnedSemaphorePermit,
+    sender: watch::Sender<Option<InitializationResult<T>>>,
+    initialize: F,
+    spawn: S,
+) -> Result<AbortHandle, SpannerError>
+where
+    T: Send + Sync + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<Arc<T>, SpannerError>> + Send + 'static,
+    S: FnOnce(InitializationTask) -> Result<AbortHandle, SpannerError>,
 {
     let task_cache = Arc::clone(&cache);
     let task_key = cache_key.clone();
@@ -694,15 +731,12 @@ where
     // first poll, dropping the unpolled future still removes this generation,
     // closes its receiver, and releases its admission permit.
     let guard = FlightCleanupGuard::new(task_cache, task_key, generation, sender, permit);
-    let task = tokio::spawn(async move {
+    spawn(Box::pin(async move {
         let result = initialize()
             .await
             .map_err(|error| Arc::<str>::from(error.to_string()));
         guard.finish(result);
-    });
-    let abort_handle = task.abort_handle();
-    drop(task);
-    abort_handle
+    }))
 }
 
 async fn wait_for_cached_client<T>(
@@ -751,14 +785,14 @@ where
             generation,
             permit,
         } => {
-            drop(spawn_client_initialization(
+            spawn_client_initialization(
                 Arc::clone(&cache),
                 cache_key.clone(),
                 generation,
                 permit,
                 sender,
                 initialize,
-            ));
+            )?;
             receiver
         }
     };
@@ -1447,7 +1481,7 @@ impl VTab for SpannerDdlVTab {
             let effective_admin_endpoint =
                 emulator_admin_endpoint(endpoint.as_deref(), admin_endpoint.as_deref());
 
-            runtime::block_on(async {
+            runtime::run(async move {
                 let overall_start = Instant::now();
                 let admin = get_or_create_admin_client(effective_admin_endpoint.as_deref()).await?;
 
@@ -1605,7 +1639,7 @@ impl VTab for SpannerDdlAsyncVTab {
             let effective_admin_endpoint =
                 emulator_admin_endpoint(endpoint.as_deref(), admin_endpoint.as_deref());
 
-            runtime::block_on(async {
+            runtime::run(async move {
                 let admin = get_or_create_admin_client(effective_admin_endpoint.as_deref()).await?;
 
                 let op = update_database_ddl(
@@ -1747,7 +1781,7 @@ impl VTab for SpannerOperationsVTab {
         let admin_endpoint = bind_data.admin_endpoint.clone();
         let filter = bind_data.filter.clone();
 
-        let ops = runtime::block_on(async {
+        let ops = runtime::run(async move {
             list_database_operations(
                 &database_path,
                 endpoint.as_deref(),
@@ -2128,6 +2162,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::ffi::CString;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{sync_channel, SyncSender};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -2142,6 +2177,7 @@ mod tests {
     use reqwest::{Method, StatusCode};
 
     use crate::error::SpannerError;
+    use crate::runtime::test_support::TestRuntimeOwner;
 
     use super::{
         admin_endpoint_url, admin_request_is_ambiguous, cached_init_result,
@@ -2151,11 +2187,22 @@ mod tests {
         instance_path_from_database_path, is_emulator_replay_conflict,
         is_emulator_schema_change_rejection, list_emulator_database_operations_with,
         lookup_cached_client, operation_from_json, recover_ambiguous_submission,
-        spawn_client_initialization, update_emulator_database_ddl_with,
-        wait_emulator_operation_with, wait_with_operation_deadline, AdminRequestError, ClientCache,
-        ClientCacheLookup, ClientFlight, DdlTimeouts, EmulatorResponse, EmulatorTransport,
-        FlightCleanupGuard, HttpFuture,
+        spawn_client_initialization, spawn_client_initialization_with,
+        update_emulator_database_ddl_with, wait_emulator_operation_with,
+        wait_with_operation_deadline, AdminRequestError, ClientCache, ClientCacheLookup,
+        ClientFlight, DdlTimeouts, EmulatorResponse, EmulatorTransport, FlightCleanupGuard,
+        HttpFuture,
     };
+
+    struct DropSignal(Option<SyncSender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
 
     #[test]
     fn test_ddl_statements_single_text_preserves_semicolons() {
@@ -2440,7 +2487,7 @@ mod tests {
                 _ => panic!("first lookup must start a flight"),
             };
         let task_starts = Arc::clone(&starts);
-        let abort_handle = spawn_client_initialization(
+        let abort_handle = spawn_client_initialization_with(
             Arc::clone(&cache),
             "aborted-admin".to_string(),
             generation,
@@ -2450,7 +2497,14 @@ mod tests {
                 task_starts.fetch_add(1, Ordering::SeqCst);
                 std::future::pending::<Result<Arc<usize>, SpannerError>>().await
             },
-        );
+            |future| {
+                let task = tokio::spawn(future);
+                let abort_handle = task.abort_handle();
+                drop(task);
+                Ok(abort_handle)
+            },
+        )
+        .unwrap();
         // The current-thread runtime cannot poll the spawned task before this
         // synchronous abort, exercising the pre-first-poll cancellation path.
         abort_handle.abort();
@@ -2488,6 +2542,53 @@ mod tests {
             .is_empty());
     }
 
+    #[test]
+    fn test_admin_initialization_is_tracked_by_runtime_owner_shutdown() {
+        let cache = Arc::new(Mutex::new(ClientCache::new(1, 1)));
+        let cache_key = "tracked-admin".to_string();
+        let (receiver, sender, generation, permit) =
+            match lookup_cached_client(&cache, &cache_key).unwrap() {
+                ClientCacheLookup::Start {
+                    receiver,
+                    sender,
+                    generation,
+                    permit,
+                } => (receiver, sender, generation, permit),
+                _ => panic!("first lookup must start a flight"),
+            };
+        let owner = Arc::new(TestRuntimeOwner::start(1).unwrap());
+        let spawn_owner = Arc::clone(&owner);
+        let (started_tx, started_rx) = sync_channel(1);
+        let (dropped_tx, dropped_rx) = sync_channel(1);
+        let _abort_handle = spawn_client_initialization_with(
+            Arc::clone(&cache),
+            cache_key.clone(),
+            generation,
+            permit,
+            sender,
+            move || async move {
+                let _drop_signal = DropSignal(Some(dropped_tx));
+                started_tx.send(()).unwrap();
+                std::future::pending::<Result<Arc<usize>, SpannerError>>().await
+            },
+            move |future| spawn_owner.spawn_detached(future),
+        )
+        .unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("admin initialization did not start");
+
+        owner.shutdown(Duration::from_millis(500)).unwrap();
+
+        dropped_rx
+            .try_recv()
+            .expect("owner shutdown returned before admin initialization was dropped");
+        assert!(receiver.has_changed().is_err());
+        let cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+        assert!(!cache.in_flight.contains_key(&cache_key));
+        assert_eq!(cache.admission.available_permits(), 1);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_admin_cache_rejects_fifth_unique_flight_before_spawning() {
         let cache = Arc::new(Mutex::new(ClientCache::new(8, 4)));
@@ -2504,14 +2605,17 @@ mod tests {
                     } => (sender, generation, permit),
                     _ => panic!("unique lookup must start a flight"),
                 };
-            abort_handles.push(spawn_client_initialization(
-                Arc::clone(&cache),
-                cache_key,
-                generation,
-                permit,
-                sender,
-                move || std::future::pending::<Result<Arc<usize>, SpannerError>>(),
-            ));
+            abort_handles.push(
+                spawn_client_initialization(
+                    Arc::clone(&cache),
+                    cache_key,
+                    generation,
+                    permit,
+                    sender,
+                    std::future::pending::<Result<Arc<usize>, SpannerError>>,
+                )
+                .unwrap(),
+            );
         }
 
         let fifth_starts = Arc::new(AtomicUsize::new(0));

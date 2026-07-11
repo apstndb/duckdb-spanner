@@ -78,14 +78,18 @@ impl VTab for SpannerScanVTab {
         // Discover table schema from INFORMATION_SCHEMA
         // If dialect is specified, uses correct param syntax directly.
         // If not, auto-detects via INFORMATION_SCHEMA.DATABASE_OPTIONS.
-        let columns = runtime::block_on(async {
-            let client = client::get_or_create_client(&database, endpoint.as_deref()).await?;
+        let schema_database = database.clone();
+        let schema_endpoint = endpoint.clone();
+        let schema_table = table.clone();
+        let columns = runtime::run(async move {
+            let client =
+                client::get_or_create_client(&schema_database, schema_endpoint.as_deref()).await?;
             schema::discover_table_schema(
                 &client,
-                &table,
-                dialect.clone(),
-                &database,
-                endpoint.as_deref(),
+                &schema_table,
+                dialect,
+                &schema_database,
+                schema_endpoint.as_deref(),
             )
             .await
         })??;
