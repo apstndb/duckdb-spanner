@@ -138,7 +138,7 @@ impl ConnectionProfile {
                 if emulator_host.is_some() =>
             {
                 return Err(ConnectionProfileError::new(format!(
-                    "endpoint_mode '{}' cannot be used while SPANNER_EMULATOR_HOST is set; \\
+                    "endpoint_mode '{}' cannot be used while SPANNER_EMULATOR_HOST is set; \
                      the official client would force anonymous emulator credentials",
                     endpoint_mode_name(mode)
                 )));
@@ -433,14 +433,17 @@ mod tests {
         assert!(resolve(None, Some("custom"), None, None)
             .unwrap_err()
             .contains("requires endpoint"));
-        assert!(resolve(
+        let environment_error = resolve(
             Some("localhost:443"),
             Some("omni"),
             None,
-            Some("localhost:9010")
+            Some("localhost:9010"),
         )
-        .unwrap_err()
-        .contains("cannot be used while SPANNER_EMULATOR_HOST"));
+        .unwrap_err();
+        assert_eq!(
+            environment_error,
+            "endpoint_mode 'omni' cannot be used while SPANNER_EMULATOR_HOST is set; the official client would force anonymous emulator credentials"
+        );
         assert!(resolve(None, Some("default"), None, Some("localhost:9010"))
             .unwrap_err()
             .contains("cannot be used while SPANNER_EMULATOR_HOST"));
