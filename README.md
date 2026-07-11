@@ -386,6 +386,20 @@ SELECT * FROM spanner_operations(filter := 'done=true');
 
 All DDL functions accept the same database identification parameters as `spanner_query` (`database_path`, `project`, `instance`, `database`, `endpoint`). They also accept `admin_endpoint` for emulator setups where the REST admin endpoint cannot be derived from `endpoint`.
 
+#### DDL and operation timeout contract
+
+DDL/admin waits use fixed, finite defaults:
+
+- Admin client and connection setup is bounded to 15 seconds. Completed clients retain the eight most recently used endpoint identities. At most four distinct endpoint identities may initialize concurrently; another unique endpoint fails fast at admission, while callers for an endpoint already in flight join its single shared initialization.
+- Each admin HTTP/RPC attempt, including response-body reads, is bounded to 30 seconds. Retryable read-only requests and real Spanner RPCs are limited to 10 attempts and 60 seconds total, with bounded exponential backoff and jitter. For real DDL submission, HTTP 408, HTTP 429, every HTTP 5xx response, and no-status timeout/I/O/transport failures are ambiguous; other HTTP 4xx responses fail immediately with their status/body context.
+- `spanner_ddl` has a 30-minute overall deadline covering client setup, submission, and operation polling. This matches the [Google Cloud Workflows Spanner `updateDdl` default](https://docs.cloud.google.com/workflows/docs/reference/googleapis/spanner/v1/projects.instances.databases/updateDdl). Some [schema updates can take hours](https://docs.cloud.google.com/spanner/docs/schema-updates#schema-update-performance); use `spanner_ddl_async` and inspect `spanner_operations` when a longer server-side operation is expected.
+- `spanner_ddl_async` is bounded only through submission; the returned server-side operation continues independently.
+- `spanner_operations` has a 2-minute whole-list deadline, a 1,000-page limit, and rejects repeated/cyclic page tokens.
+
+DDL submissions carry a unique operation ID and report its deterministic operation name in correlated errors. For real Spanner, an ambiguous final submission error triggers one operation lookup; a found operation is returned, while a failed lookup reports an explicit ambiguous outcome instead of hiding the uncertainty. The emulator can mutate schema before registering `operationId`, so its PATCH is retried only after a definitive pre-acceptance schema-contention rejection. Emulator timeouts, transport failures, HTTP 429, and every HTTP 5xx response trigger one deterministic operation lookup and are never followed by another PATCH; if the lookup fails, the error identifies the ambiguous operation and preserves both failure details. A polling deadline error names the elapsed bound; reaching it does not cancel an already-submitted Spanner operation.
+
+The pinned `duckdb-rs` table-function init API does not expose the current query's interruption state. These waits therefore cannot react immediately to `duckdb_interrupt`; the extension does not use unsafe private DuckDB access, and every wait remains bounded by the limits above.
+
 ### `COPY TO` (Write to Spanner)
 
 Write data to Spanner tables using the `COPY` statement with `FORMAT spanner`.
