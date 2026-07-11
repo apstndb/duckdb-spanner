@@ -50,6 +50,18 @@ const WRITE_BEGIN_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_COMMIT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_RPC_RETRY_MAX_ATTEMPTS: u32 = 3;
 const WRITE_RPC_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
+const COPY_OPTION_NAMES: &[&str] = &[
+    "database_path",
+    "project",
+    "instance",
+    "database",
+    "endpoint",
+    "endpoint_mode",
+    "dialect",
+    "mode",
+    "batch_size",
+    "columns",
+];
 
 // These guards mirror the caller-owned handles documented by DuckDB's C API.
 macro_rules! owned_duckdb_handle {
@@ -345,6 +357,7 @@ unsafe fn copy_bind_inner(info: ffi::duckdb_copy_function_bind_info) -> Result<(
     // Parse COPY options
     let options_val = OwnedDuckDbValue::from_raw(ffi::duckdb_copy_function_bind_get_options(info));
     let opts = extract_options(options_val.as_raw());
+    validate_copy_option_names(&opts)?;
 
     // Get client context for config fallback
     let ctx =
@@ -884,6 +897,11 @@ unsafe fn extract_options(
                 continue;
             }
 
+            // Preserve the option name even when DuckDB represents its value
+            // as NULL or an empty scalar. Validation must not let an unknown
+            // name disappear merely because its value was not extractable.
+            opts.entry(name.clone()).or_default();
+
             let child_val =
                 OwnedDuckDbValue::from_raw(ffi::duckdb_get_struct_child(options_val, i));
             if !child_val.as_raw().is_null() && !ffi::duckdb_is_null_value(child_val.as_raw()) {
@@ -915,12 +933,13 @@ unsafe fn extract_options(
         for i in 0..map_size {
             let key = OwnedDuckDbValue::from_raw(ffi::duckdb_get_map_key(options_val, i));
             let val = OwnedDuckDbValue::from_raw(ffi::duckdb_get_map_value(options_val, i));
-            if let (Some(k), Some(v)) =
-                (value_to_string(key.as_raw()), value_to_string(val.as_raw()))
-            {
+            if let Some(k) = value_to_string(key.as_raw()) {
                 let key = k.to_ascii_lowercase();
                 if key != "format" {
-                    opts.insert(key, vec![v]);
+                    let values = value_to_string(val.as_raw())
+                        .map(|value| vec![value])
+                        .unwrap_or_default();
+                    opts.insert(key, values);
                 }
             }
         }
@@ -935,6 +954,26 @@ fn option_value<'a>(
     name: &str,
 ) -> Option<&'a str> {
     opts.get(name)?.first().map(String::as_str)
+}
+
+fn validate_copy_option_names(
+    opts: &std::collections::HashMap<String, Vec<String>>,
+) -> Result<(), String> {
+    let mut unknown: Vec<&str> = opts
+        .keys()
+        .filter_map(|name| (!COPY_OPTION_NAMES.contains(&name.as_str())).then_some(name.as_str()))
+        .collect();
+    unknown.sort_unstable();
+
+    if unknown.is_empty() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "Unknown COPY FORMAT spanner option(s): {}. Recognized options: {}",
+        unknown.join(", "),
+        COPY_OPTION_NAMES.join(", ")
+    ))
 }
 
 fn parse_batch_size(value: Option<&str>) -> Result<usize, String> {
@@ -1305,25 +1344,39 @@ unsafe fn read_duckdb_value(
         }
         ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP | ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ => {
             let micros = *data.cast::<i64>().add(row_idx);
-            Kind::StringValue(epoch_micros_to_rfc3339(micros)?)
+            Kind::StringValue(epoch_timestamp_to_rfc3339(
+                micros,
+                col.type_id,
+                "microseconds",
+                1_000,
+            )?)
         }
         ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_S => {
             let secs = *data.cast::<i64>().add(row_idx);
-            Kind::StringValue(epoch_micros_to_rfc3339(secs * 1_000_000)?)
+            Kind::StringValue(epoch_timestamp_to_rfc3339(
+                secs,
+                col.type_id,
+                "seconds",
+                1_000_000_000,
+            )?)
         }
         ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_MS => {
             let millis = *data.cast::<i64>().add(row_idx);
-            Kind::StringValue(epoch_micros_to_rfc3339(millis * 1_000)?)
+            Kind::StringValue(epoch_timestamp_to_rfc3339(
+                millis,
+                col.type_id,
+                "milliseconds",
+                1_000_000,
+            )?)
         }
         ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_NS => {
             let nanos = *data.cast::<i64>().add(row_idx);
-            let nanos_i128 = nanos as i128;
-            let ts = time::OffsetDateTime::from_unix_timestamp_nanos(nanos_i128)
-                .map_err(|e| format!("Timestamp overflow: {e}"))?;
-            let s = ts
-                .format(&time::format_description::well_known::Rfc3339)
-                .map_err(|e| format!("Timestamp format error: {e}"))?;
-            Kind::StringValue(s)
+            Kind::StringValue(epoch_timestamp_to_rfc3339(
+                nanos,
+                col.type_id,
+                "nanoseconds",
+                1,
+            )?)
         }
         ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL => {
             let raw_i128 = read_decimal_raw(data, row_idx, col.decimal_internal_type);
@@ -1474,28 +1527,39 @@ unsafe fn read_duckdb_json_value(
         }
         ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP | ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ => {
             let micros = *data.cast::<i64>().add(row_idx);
-            Ok(serde_json::Value::String(epoch_micros_to_rfc3339(micros)?))
+            Ok(serde_json::Value::String(epoch_timestamp_to_rfc3339(
+                micros,
+                col.type_id,
+                "microseconds",
+                1_000,
+            )?))
         }
         ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_S => {
             let secs = *data.cast::<i64>().add(row_idx);
-            Ok(serde_json::Value::String(epoch_micros_to_rfc3339(
-                secs * 1_000_000,
+            Ok(serde_json::Value::String(epoch_timestamp_to_rfc3339(
+                secs,
+                col.type_id,
+                "seconds",
+                1_000_000_000,
             )?))
         }
         ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_MS => {
             let millis = *data.cast::<i64>().add(row_idx);
-            Ok(serde_json::Value::String(epoch_micros_to_rfc3339(
-                millis * 1_000,
+            Ok(serde_json::Value::String(epoch_timestamp_to_rfc3339(
+                millis,
+                col.type_id,
+                "milliseconds",
+                1_000_000,
             )?))
         }
         ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_NS => {
             let nanos = *data.cast::<i64>().add(row_idx);
-            let ts = time::OffsetDateTime::from_unix_timestamp_nanos(nanos as i128)
-                .map_err(|e| format!("Timestamp overflow: {e}"))?;
-            let s = ts
-                .format(&time::format_description::well_known::Rfc3339)
-                .map_err(|e| format!("Timestamp format error: {e}"))?;
-            Ok(serde_json::Value::String(s))
+            Ok(serde_json::Value::String(epoch_timestamp_to_rfc3339(
+                nanos,
+                col.type_id,
+                "nanoseconds",
+                1,
+            )?))
         }
         ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL => {
             let raw_i128 = read_decimal_raw(data, row_idx, col.decimal_internal_type);
@@ -1609,10 +1673,44 @@ fn epoch_days_to_date_string(days: i32) -> Result<String, String> {
     Ok(format!("{:04}-{:02}-{:02}", year, month as u8, day))
 }
 
-fn epoch_micros_to_rfc3339(micros: i64) -> Result<String, String> {
-    let nanos = (micros as i128) * 1_000;
+fn epoch_timestamp_to_rfc3339(
+    value: i64,
+    logical_type: ffi::duckdb_type,
+    unit: &str,
+    nanos_per_unit: i128,
+) -> Result<String, String> {
+    let finite = unsafe {
+        match logical_type {
+            ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP | ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ => {
+                ffi::duckdb_is_finite_timestamp(ffi::duckdb_timestamp { micros: value })
+            }
+            ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_S => {
+                ffi::duckdb_is_finite_timestamp_s(ffi::duckdb_timestamp_s { seconds: value })
+            }
+            ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_MS => {
+                ffi::duckdb_is_finite_timestamp_ms(ffi::duckdb_timestamp_ms { millis: value })
+            }
+            ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_NS => {
+                ffi::duckdb_is_finite_timestamp_ns(ffi::duckdb_timestamp_ns { nanos: value })
+            }
+            _ => {
+                return Err(format!(
+                    "Unsupported timestamp logical type: {logical_type:?}"
+                ))
+            }
+        }
+    };
+    if !finite {
+        return Err(format!(
+            "COPY does not support infinite DuckDB timestamps ({unit}={value})"
+        ));
+    }
+
+    let nanos = (value as i128)
+        .checked_mul(nanos_per_unit)
+        .ok_or_else(|| format!("Timestamp overflow for {unit} {value}"))?;
     let ts = time::OffsetDateTime::from_unix_timestamp_nanos(nanos)
-        .map_err(|e| format!("Timestamp overflow for micros {micros}: {e}"))?;
+        .map_err(|e| format!("Timestamp overflow for {unit} {value}: {e}"))?;
     ts.format(&time::format_description::well_known::Rfc3339)
         .map_err(|e| format!("Timestamp format error: {e}"))
 }
@@ -1878,6 +1976,32 @@ mod tests {
     }
 
     #[test]
+    fn copy_option_names_reject_unknown_names_deterministically() {
+        let opts = options(&[
+            ("columns", "Id"),
+            ("database_path", "projects/p/instances/i/databases/d"),
+            ("z_typo", "z"),
+            ("a_typo", "a"),
+        ]);
+        let err = validate_copy_option_names(&opts).unwrap_err();
+        assert_eq!(
+            err,
+            "Unknown COPY FORMAT spanner option(s): a_typo, z_typo. Recognized options: \
+             database_path, project, instance, database, endpoint, endpoint_mode, dialect, mode, \
+             batch_size, columns"
+        );
+    }
+
+    #[test]
+    fn copy_option_names_accept_columns_list_values() {
+        let mut opts = options(&[("database_path", "projects/p/instances/i/databases/d")]);
+        opts.insert("columns".to_string(), names(&["Value", "Id", "Name"]));
+
+        validate_copy_option_names(&opts).unwrap();
+        assert_eq!(opts["columns"], ["Value", "Id", "Name"]);
+    }
+
+    #[test]
     fn batch_size_must_be_positive() {
         assert_eq!(parse_batch_size(None).unwrap(), DEFAULT_BATCH_SIZE);
         assert_eq!(parse_batch_size(Some("1")).unwrap(), 1);
@@ -1896,6 +2020,101 @@ mod tests {
         let value = (MAX_BATCH_SIZE + 1).to_string();
         let error = parse_batch_size(Some(&value)).unwrap_err();
         assert!(error.contains("must not exceed 80000 rows"), "{error}");
+    }
+
+    #[test]
+    fn timestamp_formatter_preserves_ordinary_pre_and_post_epoch_values() {
+        assert_eq!(
+            epoch_timestamp_to_rfc3339(
+                -1,
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_S,
+                "seconds",
+                1_000_000_000,
+            )
+            .unwrap(),
+            "1969-12-31T23:59:59Z"
+        );
+        assert_eq!(
+            epoch_timestamp_to_rfc3339(
+                1_234,
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_MS,
+                "milliseconds",
+                1_000_000,
+            )
+            .unwrap(),
+            "1970-01-01T00:00:01.234Z"
+        );
+        assert_eq!(
+            epoch_timestamp_to_rfc3339(
+                -1,
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP,
+                "microseconds",
+                1_000,
+            )
+            .unwrap(),
+            "1969-12-31T23:59:59.999999Z"
+        );
+        assert_eq!(
+            epoch_timestamp_to_rfc3339(
+                1,
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_NS,
+                "nanoseconds",
+                1,
+            )
+            .unwrap(),
+            "1970-01-01T00:00:00.000000001Z"
+        );
+    }
+
+    #[test]
+    fn timestamp_formatter_rejects_i64_extremes_without_wrapping() {
+        for (value, logical_type, unit, nanos_per_unit) in [
+            (
+                i64::MIN,
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_S,
+                "seconds",
+                1_000_000_000,
+            ),
+            (
+                i64::MAX,
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_S,
+                "seconds",
+                1_000_000_000,
+            ),
+            (
+                i64::MIN,
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_MS,
+                "milliseconds",
+                1_000_000,
+            ),
+            (
+                i64::MAX,
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_MS,
+                "milliseconds",
+                1_000_000,
+            ),
+            (
+                -i64::MAX,
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_NS,
+                "nanoseconds",
+                1,
+            ),
+            (
+                i64::MAX,
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_NS,
+                "nanoseconds",
+                1,
+            ),
+        ] {
+            let err =
+                epoch_timestamp_to_rfc3339(value, logical_type, unit, nanos_per_unit).unwrap_err();
+            assert!(
+                err.starts_with("COPY does not support infinite DuckDB timestamps")
+                    || err.starts_with("Timestamp overflow"),
+                "{err}"
+            );
+            assert!(err.contains(unit), "{err}");
+        }
     }
 
     #[test]

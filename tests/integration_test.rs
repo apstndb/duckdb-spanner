@@ -2050,6 +2050,39 @@ fn test_copy_rejects_mixed_database_options_during_bind() {
 }
 
 #[test]
+fn test_copy_rejects_unknown_option_during_bind() {
+    let conn = open_extension_connection();
+    for value in ["'typo'", "''"] {
+        let sql = format!(
+            "COPY (SELECT CAST(1 AS BIGINT) AS Id) TO 'T' (\
+                FORMAT spanner, \
+                database_path 'projects/p/instances/i/databases/d', \
+                databse {value}\
+            )"
+        );
+        let err = conn.execute_batch(&sql).unwrap_err().to_string();
+        assert!(
+            err.contains("Unknown COPY FORMAT spanner option(s): databse")
+                && err.contains("Recognized options: database_path, project, instance, database"),
+            "unexpected COPY bind error for {value}: {err}"
+        );
+    }
+
+    // Current DuckDB rejects NULL COPY options before invoking the format
+    // binder, so the extension cannot observe that representation.
+    let null_error = conn
+        .execute_batch(
+            "COPY (SELECT CAST(1 AS BIGINT) AS Id) TO 'T' (FORMAT spanner, databse NULL)",
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        null_error.contains("NULL is not supported as a valid option"),
+        "unexpected NULL COPY option error: {null_error}"
+    );
+}
+
+#[test]
 fn test_copy_to_basic() {
     let conn = create_duckdb_connection_with_copy();
     let db = get_gsql_db();
@@ -2225,6 +2258,57 @@ fn test_copy_to_arrays() {
     let row = exec_spanner_one("SELECT IntArray, StrArray FROM ArrayTypes WHERE Id = 902");
     assert!(row.column::<Option<Vec<i64>>>(0).unwrap().is_none());
     assert!(row.column::<Option<Vec<String>>>(1).unwrap().is_none());
+}
+
+#[test]
+fn test_copy_to_columns_option_list() {
+    let conn = create_duckdb_connection_with_copy();
+    let db = get_gsql_db();
+
+    let sql = format!(
+        "COPY (SELECT CAST(42.5 AS DOUBLE) AS source_value, CAST(930 AS BIGINT) AS source_id, \
+            'columns list' AS source_name) \
+         TO 'CopyTarget' (FORMAT spanner, database_path '{}', endpoint '{}', \
+         columns ['Value', 'Id', 'Name'])",
+        db.database_path(),
+        db.emulator_host()
+    );
+    conn.execute_batch(&sql).unwrap();
+
+    let row = exec_spanner_one("SELECT Name, Value FROM CopyTarget WHERE Id = 930");
+    assert_eq!(row.column::<String>(0).unwrap(), "columns list");
+    assert_eq!(row.column::<f64>(1).unwrap(), 42.5);
+}
+
+#[test]
+fn test_copy_rejects_infinite_timestamps_in_scalar_and_nested_json_paths() {
+    let conn = create_duckdb_connection_with_copy();
+    let db = get_gsql_db();
+
+    let cases = [
+        format!(
+            "COPY (SELECT 931::BIGINT AS Id, 'infinity'::TIMESTAMP_NS AS TimestampCol) \
+             TO 'CopyTypes' (FORMAT spanner, database_path '{}', endpoint '{}', \
+             columns ['Id', 'TimestampCol'])",
+            db.database_path(),
+            db.emulator_host()
+        ),
+        format!(
+            "COPY (SELECT 932::BIGINT AS Id, {{ts: 'infinity'::TIMESTAMP_NS}} AS JsonCol) \
+             TO 'NumericTypes' (FORMAT spanner, database_path '{}', endpoint '{}', \
+             columns ['Id', 'JsonCol'])",
+            db.database_path(),
+            db.emulator_host()
+        ),
+    ];
+
+    for sql in cases {
+        let err = conn.execute_batch(&sql).unwrap_err().to_string();
+        assert!(
+            err.contains("COPY does not support infinite DuckDB timestamps"),
+            "unexpected infinite timestamp error: {err}"
+        );
+    }
 }
 
 #[test]
