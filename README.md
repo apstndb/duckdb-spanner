@@ -25,7 +25,7 @@ brew install cargo-sweep
 - The DuckDB Rust binding is pinned to `duckdb = "=1.10504.0"`, which matches DuckDB `v1.5.4`.
   The upstream Rust extension template still requires the unstable C API (`USE_UNSTABLE_C_API=1` / `C_STRUCT_UNSTABLE`), so loadable extension binaries remain tied to the DuckDB version encoded in the extension metadata.
   The extension requests at least the DuckDB `v1.5.0` C API at load time because it uses C API functions added in the 1.5 line.
-  Keep `DUCKDB_VERSION` aligned with the DuckDB CLI or runtime you plan to load the extension into.
+  The Makefile has one canonical ABI target, DuckDB `v1.5.4`, for both local and distribution builds. Local metadata generation checks the detected CLI version before compiling and rejects a mismatched `DUCKDB_VERSION` override; an override cannot relabel a binary built for another DuckDB version.
 
 - This project depends on the official [googleapis/google-cloud-rust](https://github.com/googleapis/google-cloud-rust) Spanner crates.
   Partitioned reads and queries use the official partition APIs; no local client fork is required.
@@ -113,7 +113,7 @@ For a quick build-and-launch workflow:
 make duckdb
 ```
 
-`make duckdb` defaults the extension metadata version to your installed DuckDB CLI version. Override `DUCKDB_VERSION` explicitly if you need to target a different DuckDB release.
+`make duckdb` requires `DUCKDB_BIN` to report DuckDB `v1.5.4` and loads the extension into that CLI. Use `DUCKDB_BIN=/path/to/duckdb make duckdb` to select a specific CLI. `DUCKDB_VERSION=v1.5.4` is accepted as an explicit metadata value; other versions fail before the extension is built.
 
 ### Authentication
 
