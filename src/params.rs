@@ -14,6 +14,9 @@ pub(crate) const JSON_TRANSPORT_FORMAT_V1: &str = "json-text-v1";
 /// - A plain value (type inferred from JSON)
 /// - A typed value with explicit Spanner type, e.g.
 ///   `{"id": {"value": null, "type": "INT64"}}`
+///
+/// Explicit type strings are parsed before the statement is built. Unknown or
+/// malformed names are rejected instead of being silently sent as STRING.
 pub fn create_statement(sql: &str, params_json: Option<&str>) -> Result<Statement, SpannerError> {
     create_statement_inner(sql, params_json, None)
 }
@@ -113,7 +116,11 @@ fn add_typed_param(
         ))
     })?;
 
-    let spanner_type = types::parse_spanner_type(type_str);
+    let spanner_type = types::parse_spanner_type(type_str).map_err(|error| {
+        SpannerError::Other(format!(
+            "Invalid Spanner type for parameter '{key}': {error}"
+        ))
+    })?;
     let value = obj.get("value").unwrap_or(&serde_json::Value::Null);
     let json_text_transport = match obj.get(JSON_TRANSPORT_FORMAT) {
         None => false,
@@ -605,5 +612,17 @@ mod tests {
             .to_string()
             .contains("Invalid tagged JSON text")
         );
+    }
+
+    #[test]
+    fn rejects_unknown_and_malformed_explicit_type_before_statement_build() {
+        for type_name in ["NOT_A_TYPE", "ARRAY<INT64"] {
+            let params = format!(r#"{{"v":{{"value":null,"type":"{type_name}"}}}}"#);
+            let error = create_statement("SELECT @v", Some(&params)).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("parameter 'v'"));
+            assert!(message.contains(type_name));
+            assert!(!message.contains("falling back to STRING"));
+        }
     }
 }

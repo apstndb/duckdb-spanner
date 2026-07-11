@@ -404,8 +404,9 @@ unsafe fn copy_global_init_inner(
     .map_err(|e| format!("Failed to connect to Spanner: {e}"))?;
 
     // An explicit dialect avoids metadata discovery for endpoints that do not
-    // expose INFORMATION_SCHEMA.DATABASE_OPTIONS.
-    let schema_columns = runtime::block_on(schema::discover_table_schema(
+    // expose INFORMATION_SCHEMA.DATABASE_OPTIONS. COPY discovery retains
+    // unsupported generated columns so they can be excluded before conversion.
+    let schema_columns = runtime::block_on(schema::discover_table_schema_for_copy(
         &client,
         &table_name,
         bind_data.dialect.clone(),
@@ -704,6 +705,16 @@ fn resolve_copy_columns(
     let writable: Vec<&schema::ColumnInfo> =
         schema_columns.iter().filter(|c| !c.is_generated).collect();
     let generated_count = schema_columns.len() - writable.len();
+
+    if let Some(column) = writable
+        .iter()
+        .find(|column| column.spanner_type.code() == TypeCode::Unspecified)
+    {
+        return Err(format!(
+            "Writable column '{}' in Spanner table '{table}' has an unsupported type",
+            column.name
+        ));
+    }
 
     // By-name mapping requires a name for every source column.
     if let Some(names) = source_names {
@@ -1639,6 +1650,14 @@ mod tests {
         }
     }
 
+    fn unspecified_col(name: &str, is_generated: bool) -> schema::ColumnInfo {
+        schema::ColumnInfo {
+            name: name.to_string(),
+            spanner_type: Type::default(),
+            is_generated,
+        }
+    }
+
     fn names(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
     }
@@ -1657,6 +1676,39 @@ mod tests {
         let resolved = resolve_copy_columns(&schema, None, 2, "T").unwrap();
         let got: Vec<&str> = resolved.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(got, vec!["Id", "Name"]);
+        assert!(resolved
+            .iter()
+            .all(|column| column.spanner_type.code() != TypeCode::Unspecified));
+    }
+
+    #[test]
+    fn positional_excludes_generated_unspecified_placeholder() {
+        let schema = vec![
+            col("Id", false),
+            unspecified_col("SearchTokens", true),
+            col("Name", false),
+        ];
+        let resolved = resolve_copy_columns(&schema, None, 2, "T").unwrap();
+
+        assert_eq!(
+            resolved
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Id", "Name"]
+        );
+        assert!(resolved
+            .iter()
+            .all(|column| column.spanner_type.code() != TypeCode::Unspecified));
+    }
+
+    #[test]
+    fn rejects_writable_unspecified_placeholder() {
+        let schema = vec![col("Id", false), unspecified_col("SearchTokens", false)];
+        let err = resolve_copy_columns(&schema, None, 2, "T").unwrap_err();
+
+        assert!(err.contains("Writable column 'SearchTokens'"), "{err}");
+        assert!(err.contains("unsupported type"), "{err}");
     }
 
     #[test]
@@ -1726,7 +1778,7 @@ mod tests {
 
     #[test]
     fn by_name_source_to_generated_column_errors() {
-        let schema = vec![col("Id", false), col("Gen", true)];
+        let schema = vec![col("Id", false), unspecified_col("Gen", true)];
         let src = names(&["Id", "gen"]);
         let err = resolve_copy_columns(&schema, Some(&src), 2, "T").unwrap_err();
         assert!(err.contains("maps to generated column 'Gen'"), "{err}");
