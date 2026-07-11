@@ -477,23 +477,28 @@ fn build_read_request(
 ///
 /// Spanner Read API returns columns in the order we requested (matching projected_columns order).
 /// DuckDB output vectors are indexed by the projected column index.
-fn write_projected_rows(
+fn write_projected_rows<R: convert::ConversionRow>(
     output: &mut DataChunkHandle,
-    rows: &[Row],
+    rows: &[R],
     all_columns: &[ColumnInfo],
     projected_columns: &[usize],
 ) -> Result<(), SpannerError> {
-    if rows.is_empty() {
-        output.set_len(0);
-        return Ok(());
-    }
-
     // projected_columns[i] = original column index in bind_data.columns
     // Spanner row column index = i (columns requested in projected order)
     // DuckDB output vector index = i (output only contains projected columns)
     for (i, &orig_col_idx) in projected_columns.iter().enumerate() {
         let col_info = &all_columns[orig_col_idx];
-        convert::write_column_from_rows(
+        convert::preflight_column_from_rows(rows, i, &col_info.spanner_type, &col_info.name)?;
+    }
+
+    if rows.is_empty() {
+        output.set_len(0);
+        return Ok(());
+    }
+
+    for (i, &orig_col_idx) in projected_columns.iter().enumerate() {
+        let col_info = &all_columns[orig_col_idx];
+        convert::write_preflighted_column_from_rows(
             output,
             i,
             rows,
@@ -510,6 +515,39 @@ fn write_projected_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use google_cloud_spanner::model;
+    use google_cloud_spanner::types::{Type, TypeCode};
+    use google_cloud_spanner::value::{ToValue, Value as SpannerValue};
+    use prost_types::value::Kind as ProtoKind;
+
+    struct TestRow(Vec<SpannerValue>);
+
+    impl convert::ConversionRow for TestRow {
+        fn conversion_values(&self) -> &[SpannerValue] {
+            &self.0
+        }
+    }
+
+    fn scalar_type(code: TypeCode) -> Type {
+        model::Type::new()
+            .set_code(model::TypeCode::from(i32::from(code)))
+            .into()
+    }
+
+    fn array_type(element_type: Type) -> Type {
+        let element_type: model::Type = element_type.into();
+        model::Type::new()
+            .set_code(model::TypeCode::Array)
+            .set_array_element_type(element_type)
+            .into()
+    }
+
+    fn list_value(values: Vec<prost_types::Value>) -> SpannerValue {
+        prost_types::Value {
+            kind: Some(ProtoKind::ListValue(prost_types::ListValue { values })),
+        }
+        .to_value()
+    }
 
     #[test]
     fn cancellation_prevents_auto_read_fallback() {
@@ -526,5 +564,63 @@ mod tests {
             false,
             &cancellation,
         ));
+    }
+
+    #[test]
+    fn projected_columns_preflight_before_mutating_any_vector() {
+        let columns = vec![
+            ColumnInfo {
+                name: "ids".to_string(),
+                spanner_type: array_type(scalar_type(TypeCode::Int64)),
+                is_generated: false,
+            },
+            ColumnInfo {
+                name: "flags".to_string(),
+                spanner_type: array_type(scalar_type(TypeCode::Bool)),
+                is_generated: false,
+            },
+        ];
+        let rows = vec![TestRow(vec![
+            list_value(vec![prost_types::Value {
+                kind: Some(ProtoKind::StringValue("1".to_string())),
+            }]),
+            list_value(vec![prost_types::Value {
+                kind: Some(ProtoKind::StringValue("not-a-bool".to_string())),
+            }]),
+        ])];
+        let mut output = DataChunkHandle::new(&[
+            LogicalTypeHandle::list(&LogicalTypeId::Bigint.into()),
+            LogicalTypeHandle::list(&LogicalTypeId::Boolean.into()),
+        ]);
+        output.set_len(1);
+
+        let sentinels = [(1, 1), (0, 2)];
+        for (column_idx, &(offset, length)) in sentinels.iter().enumerate() {
+            let mut list = output.list_vector(column_idx);
+            let _child = list.child(2);
+            list.set_len(2);
+            list.set_entry(0, offset, length);
+        }
+
+        let result = write_projected_rows(&mut output, &rows, &columns, &[0, 1]);
+        match result {
+            Err(SpannerError::Conversion(message)) => {
+                assert!(message.contains("BOOL"), "message: {message}");
+                assert!(message.contains("String"), "message: {message}");
+                assert!(message.contains("column 'flags'"), "message: {message}");
+            }
+            other => panic!("expected Conversion error, got {other:?}"),
+        }
+
+        assert_eq!(output.len(), 1, "failed projection changed chunk length");
+        for (column_idx, &entry) in sentinels.iter().enumerate() {
+            let list = output.list_vector(column_idx);
+            assert_eq!(list.len(), 2, "column {column_idx} length changed");
+            assert_eq!(
+                list.get_entry(0),
+                entry,
+                "column {column_idx} entry was overwritten"
+            );
+        }
     }
 }

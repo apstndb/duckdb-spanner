@@ -12,14 +12,12 @@ use crate::types::is_pg_numeric;
 
 const EPOCH_DATE: time::Date = time::macros::date!(1970 - 01 - 01);
 
-// DuckDB 1.5.0 caps a single vector allocation at 128 GiB. Result conversion
-// can write any supported physical type, whose widest inline representation is
-// 16 bytes (including LIST entries, VARCHAR, INTERVAL, and HUGEINT). Keeping the
-// element count within this conservative bound prevents the C++ reserve path
-// from throwing across the C API boundary.
-const DUCKDB_MAX_VECTOR_BYTES: u64 = 1 << 37;
-const DUCKDB_MAX_RESULT_CHILDREN: u64 =
-    DUCKDB_MAX_VECTOR_BYTES / std::mem::size_of::<ffi::duckdb_list_entry>() as u64;
+// Bound flattened result children to 64 MiB of DuckDB LIST entries. This is a
+// practical per-result budget (4,194,304 entries on current DuckDB) rather than
+// a theoretical engine allocation limit, and keeps oversized result materialization
+// from reaching an unchecked C API allocation path.
+const MAX_FLATTENED_CHILDREN: usize =
+    64 * 1024 * 1024 / std::mem::size_of::<ffi::duckdb_list_entry>();
 
 /// Extract the raw `duckdb_vector` handle from a FlatVector.
 ///
@@ -34,22 +32,6 @@ unsafe fn flat_vector_raw(vector: &FlatVector<'_>) -> ffi::duckdb_vector {
         ffi::duckdb_vector_get_data(candidate) as usize,
         vector.as_mut_ptr::<u8>() as usize,
         "FlatVector field layout assumption violated — ptr is not at offset 0"
-    );
-    candidate
-}
-
-/// Extract the raw `duckdb_vector` handle from a ListVector.
-///
-/// duckdb-rs 1.10504.0 does not expose a capacity-aware nested-list accessor.
-/// `ListVector<'_>` stores its entries `FlatVector` first, whose raw pointer is
-/// also its first field. This is the same pinned layout dependency used by
-/// [`flat_vector_raw`].
-unsafe fn list_vector_raw(vector: &ListVector<'_>) -> ffi::duckdb_vector {
-    let candidate = *(vector as *const _ as *const ffi::duckdb_vector);
-    debug_assert_eq!(
-        ffi::duckdb_list_vector_get_size(candidate) as usize,
-        vector.len(),
-        "ListVector field layout assumption violated - entries are not at offset 0"
     );
     candidate
 }
@@ -95,10 +77,10 @@ fn checked_child_count(
     let total = current.checked_add(additional).ok_or_else(|| {
         SpannerError::Conversion(format!("nested child count overflow ({})", context()))
     })?;
-    let total_idx = checked_duckdb_index(total, "nested child count", context)?;
-    if total_idx > DUCKDB_MAX_RESULT_CHILDREN {
+    checked_duckdb_index(total, "nested child count", context)?;
+    if total > MAX_FLATTENED_CHILDREN {
         return Err(SpannerError::Conversion(format!(
-            "nested child count {total} exceeds DuckDB's safe result-vector capacity of {DUCKDB_MAX_RESULT_CHILDREN} ({})",
+            "nested child count {total} exceeds the 64 MiB flattened result budget of {MAX_FLATTENED_CHILDREN} entries ({})",
             context()
         )));
     }
@@ -132,6 +114,70 @@ fn ensure_row_count(row_count: usize, context: &dyn Fn() -> String) -> Result<()
     Ok(())
 }
 
+fn ensure_nested_list_entry_capacity(
+    entry_count: usize,
+    context: &dyn Fn() -> String,
+) -> Result<(), SpannerError> {
+    let capacity = rows_capacity_hint();
+    if entry_count > capacity {
+        return Err(SpannerError::Conversion(format!(
+            "nested ARRAY flattened list-entry count {entry_count} exceeds duckdb-rs ListVector capacity {capacity} ({})",
+            context()
+        )));
+    }
+    Ok(())
+}
+
+fn first_struct_array_field_path(
+    struct_type: &model::StructType,
+) -> Result<Option<String>, SpannerError> {
+    for (field_idx, field) in struct_type.fields.iter().enumerate() {
+        let field_name = if field.name.is_empty() {
+            format!("field {field_idx}")
+        } else {
+            field.name.clone()
+        };
+        let field_type = field.r#type.as_ref().ok_or_else(|| {
+            SpannerError::Conversion(format!("STRUCT field '{field_name}' without type"))
+        })?;
+
+        match TypeCode::from(field_type.code.clone()) {
+            TypeCode::Array => return Ok(Some(field_name)),
+            TypeCode::Struct => {
+                let nested_type = field_type.struct_type.as_deref().ok_or_else(|| {
+                    SpannerError::Conversion(format!(
+                        "nested STRUCT field '{field_name}' without struct_type"
+                    ))
+                })?;
+                if let Some(nested_path) = first_struct_array_field_path(nested_type)? {
+                    return Ok(Some(format!("{field_name}.{nested_path}")));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+fn ensure_array_struct_list_entry_capacity(
+    child_count: usize,
+    struct_type: &model::StructType,
+    context: &dyn Fn() -> String,
+) -> Result<(), SpannerError> {
+    let capacity = rows_capacity_hint();
+    if child_count <= capacity {
+        return Ok(());
+    }
+    let Some(field_path) = first_struct_array_field_path(struct_type)? else {
+        return Ok(());
+    };
+
+    Err(SpannerError::Conversion(format!(
+        "ARRAY<STRUCT> child count {child_count} exceeds duckdb-rs nested ListVector capacity {capacity}: ARRAY field '{field_path}' requires one list entry per struct child ({})",
+        context()
+    )))
+}
+
 fn set_list_entry_checked(
     list_vector: &mut ListVector<'_>,
     row_capacity: usize,
@@ -141,62 +187,11 @@ fn set_list_entry_checked(
     context: &dyn Fn() -> String,
 ) -> Result<(), SpannerError> {
     ensure_vector_index(row_idx, row_capacity, context)?;
-    let offset_idx = checked_duckdb_index(offset, "list child offset", context)?;
-    let length_idx = checked_duckdb_index(length, "list entry length", context)?;
+    checked_duckdb_index(offset, "list child offset", context)?;
+    checked_duckdb_index(length, "list entry length", context)?;
     checked_child_count(offset, length, context)?;
 
-    let raw_vector = unsafe { list_vector_raw(list_vector) };
-    let data = unsafe { ffi::duckdb_vector_get_data(raw_vector) };
-    if data.is_null() {
-        return Err(SpannerError::Conversion(format!(
-            "DuckDB returned a null LIST entry buffer ({})",
-            context()
-        )));
-    }
-    let entries = unsafe {
-        std::slice::from_raw_parts_mut(data.cast::<ffi::duckdb_list_entry>(), row_capacity)
-    };
-    entries[row_idx] = ffi::duckdb_list_entry {
-        offset: offset_idx,
-        length: length_idx,
-    };
-    Ok(())
-}
-
-fn reserve_list_child(
-    list_vector: &ListVector<'_>,
-    required_capacity: usize,
-    context: &dyn Fn() -> String,
-) -> Result<(), SpannerError> {
-    checked_child_count(0, required_capacity, context)?;
-    let required_capacity =
-        checked_duckdb_index(required_capacity, "required list child capacity", context)?;
-
-    let state =
-        unsafe { ffi::duckdb_list_vector_reserve(list_vector_raw(list_vector), required_capacity) };
-    if state != ffi::DuckDBSuccess {
-        return Err(SpannerError::Conversion(format!(
-            "DuckDB failed to reserve {required_capacity} list child values ({})",
-            context()
-        )));
-    }
-    Ok(())
-}
-
-fn set_list_len_after_reserve(
-    list_vector: &ListVector<'_>,
-    new_len: usize,
-    context: &dyn Fn() -> String,
-) -> Result<(), SpannerError> {
-    reserve_list_child(list_vector, new_len, context)?;
-    let new_len = checked_duckdb_index(new_len, "list child length", context)?;
-    let state = unsafe { ffi::duckdb_list_vector_set_size(list_vector_raw(list_vector), new_len) };
-    if state != ffi::DuckDBSuccess {
-        return Err(SpannerError::Conversion(format!(
-            "DuckDB failed to set list child length to {new_len} ({})",
-            context()
-        )));
-    }
+    list_vector.set_entry(row_idx, offset, length);
     Ok(())
 }
 
@@ -224,13 +219,227 @@ fn type_mismatch_error(expected: &str, kind: Kind, context: &str) -> SpannerErro
     ))
 }
 
-fn row_value<'a>(
-    row: &'a Row,
+enum PreflightState {
+    Scalar,
+    Array {
+        child_count: usize,
+        element: Box<PreflightState>,
+    },
+    Struct {
+        fields: Vec<PreflightState>,
+    },
+}
+
+impl PreflightState {
+    fn for_type(spanner_type: &Type, context: &dyn Fn() -> String) -> Result<Self, SpannerError> {
+        match spanner_type.code() {
+            TypeCode::Array => {
+                let element_type = spanner_type.array_element_type().ok_or_else(|| {
+                    SpannerError::Conversion(format!("ARRAY without element type ({})", context()))
+                })?;
+                let element_context = || format!("{}, array element type", context());
+                Ok(Self::Array {
+                    child_count: 0,
+                    element: Box::new(Self::for_type(&element_type, &element_context)?),
+                })
+            }
+            TypeCode::Struct => {
+                let struct_type = spanner_type.struct_type().ok_or_else(|| {
+                    SpannerError::Conversion(format!("STRUCT without struct_type ({})", context()))
+                })?;
+                Ok(Self::Struct {
+                    fields: Self::for_struct_type(struct_type, context)?,
+                })
+            }
+            _ => Ok(Self::Scalar),
+        }
+    }
+
+    fn for_struct_type(
+        struct_type: &model::StructType,
+        context: &dyn Fn() -> String,
+    ) -> Result<Vec<Self>, SpannerError> {
+        struct_type
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(field_idx, field)| {
+                let field_name = if field.name.is_empty() {
+                    format!("field {field_idx}")
+                } else {
+                    field.name.clone()
+                };
+                let field_context = || format!("{}, field '{field_name}'", context());
+                let field_type = field.r#type.as_ref().ok_or_else(|| {
+                    SpannerError::Conversion(format!(
+                        "STRUCT field '{field_name}' without type ({})",
+                        context()
+                    ))
+                })?;
+                Self::for_type(&Type::from((**field_type).clone()), &field_context)
+            })
+            .collect()
+    }
+}
+
+fn preflight_value(
+    value: &SpannerValue,
+    spanner_type: &Type,
+    state: &mut PreflightState,
+    context: &dyn Fn() -> String,
+) -> Result<(), SpannerError> {
+    if value.kind() == Kind::Null {
+        return Ok(());
+    }
+
+    match spanner_type.code() {
+        TypeCode::Array => {
+            let element_type = spanner_type.array_element_type().ok_or_else(|| {
+                SpannerError::Conversion(format!("ARRAY without element type ({})", context()))
+            })?;
+            let PreflightState::Array {
+                child_count,
+                element,
+            } = state
+            else {
+                return Err(SpannerError::Conversion(format!(
+                    "internal ARRAY preflight state mismatch ({})",
+                    context()
+                )));
+            };
+            preflight_list_value(value, &element_type, child_count, element, context)
+        }
+        TypeCode::Struct => {
+            let struct_type = spanner_type.struct_type().ok_or_else(|| {
+                SpannerError::Conversion(format!("STRUCT without struct_type ({})", context()))
+            })?;
+            let PreflightState::Struct { fields } = state else {
+                return Err(SpannerError::Conversion(format!(
+                    "internal STRUCT preflight state mismatch ({})",
+                    context()
+                )));
+            };
+            preflight_struct_value(value, struct_type, fields, context)
+        }
+        _ => {
+            if !matches!(state, PreflightState::Scalar) {
+                return Err(SpannerError::Conversion(format!(
+                    "internal scalar preflight state mismatch ({})",
+                    context()
+                )));
+            }
+            prepare_scalar_value(value, spanner_type, context).map(|_| ())
+        }
+    }
+}
+
+fn preflight_list_value(
+    value: &SpannerValue,
+    element_type: &Type,
+    child_count: &mut usize,
+    element_state: &mut PreflightState,
+    context: &dyn Fn() -> String,
+) -> Result<(), SpannerError> {
+    if value.kind() == Kind::Null {
+        return Ok(());
+    }
+    let values = value
+        .try_as_list()
+        .ok_or_else(|| type_mismatch_error("ARRAY (List)", value.kind(), &context()))?;
+    let new_child_count = checked_child_count(*child_count, values.len(), context)?;
+
+    match element_type.code() {
+        TypeCode::Array => ensure_nested_list_entry_capacity(new_child_count, context)?,
+        TypeCode::Struct => {
+            let struct_type = element_type.struct_type().ok_or_else(|| {
+                SpannerError::Conversion(format!("STRUCT without struct_type ({})", context()))
+            })?;
+            ensure_array_struct_list_entry_capacity(new_child_count, struct_type, context)?;
+        }
+        _ => {}
+    }
+
+    for (element_idx, element_value) in values.iter().enumerate() {
+        let element_context = || format!("{}, array element {element_idx}", context());
+        preflight_value(element_value, element_type, element_state, &element_context)?;
+    }
+    *child_count = new_child_count;
+    Ok(())
+}
+
+fn preflight_struct_value(
+    value: &SpannerValue,
+    struct_type: &model::StructType,
+    field_states: &mut [PreflightState],
+    context: &dyn Fn() -> String,
+) -> Result<(), SpannerError> {
+    if value.kind() == Kind::Null {
+        return Ok(());
+    }
+    let values = value
+        .try_as_list()
+        .ok_or_else(|| type_mismatch_error("STRUCT (List)", value.kind(), &context()))?;
+
+    debug_assert_eq!(field_states.len(), struct_type.fields.len());
+    for (field_idx, (field, field_state)) in struct_type
+        .fields
+        .iter()
+        .zip(field_states.iter_mut())
+        .enumerate()
+    {
+        let field_type = field.r#type.as_ref().ok_or_else(|| {
+            SpannerError::Conversion(format!(
+                "STRUCT field '{}' without type ({})",
+                field.name,
+                context()
+            ))
+        })?;
+        let field_type = Type::from((**field_type).clone());
+        let field_context = || format!("{}, field '{}'", context(), field.name);
+
+        // Positional STRUCT decoding historically treats missing fields as NULL
+        // and ignores trailing values, so only declared, present fields recurse.
+        if let Some(field_value) = values.get(field_idx) {
+            preflight_value(field_value, &field_type, field_state, &field_context)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) trait ConversionRow {
+    fn conversion_values(&self) -> &[SpannerValue];
+}
+
+impl ConversionRow for Row {
+    fn conversion_values(&self) -> &[SpannerValue] {
+        self.raw_values()
+    }
+}
+
+pub(crate) fn preflight_column_from_rows<R: ConversionRow>(
+    rows: &[R],
+    spanner_col_idx: usize,
+    spanner_type: &Type,
+    column_name: &str,
+) -> Result<(), SpannerError> {
+    ensure_row_count(rows.len(), &|| format!("column '{column_name}'"))?;
+    let mut state = PreflightState::for_type(spanner_type, &|| format!("column '{column_name}'"))?;
+    for (row_idx, row) in rows.iter().enumerate() {
+        let value = row_value(row, spanner_col_idx, column_name, row_idx)?;
+        preflight_value(value, spanner_type, &mut state, &|| {
+            format!("column '{column_name}', row {row_idx}")
+        })?;
+    }
+    Ok(())
+}
+
+fn row_value<'a, R: ConversionRow>(
+    row: &'a R,
     spanner_col_idx: usize,
     column_name: &str,
     row_idx: usize,
 ) -> Result<&'a SpannerValue, SpannerError> {
-    row.raw_values().get(spanner_col_idx).ok_or_else(|| {
+    row.conversion_values().get(spanner_col_idx).ok_or_else(|| {
         SpannerError::Conversion(format!(
             "column '{column_name}', row {row_idx}: Spanner column index {spanner_col_idx} out of range"
         ))
@@ -244,39 +453,43 @@ pub fn write_rows_to_chunk(
     rows: &[Row],
     columns: &[ColumnInfo],
 ) -> Result<(), SpannerError> {
+    ensure_row_count(rows.len(), &|| "result batch".to_string())?;
+
+    // Validate every column before publishing any part of the batch. Calling
+    // the public single-column entry point here would validate too late, after
+    // earlier columns had already been written.
+    for (col_idx, col) in columns.iter().enumerate() {
+        preflight_column_from_rows(rows, col_idx, &col.spanner_type, &col.name)?;
+    }
+
     if rows.is_empty() {
         output.set_len(0);
         return Ok(());
     }
-    ensure_row_count(rows.len(), &|| "result batch".to_string())?;
 
     for (col_idx, col) in columns.iter().enumerate() {
-        write_column_from_rows(output, col_idx, rows, col_idx, &col.spanner_type, &col.name)?;
+        write_preflighted_column_from_rows(
+            output,
+            col_idx,
+            rows,
+            col_idx,
+            &col.spanner_type,
+            &col.name,
+        )?;
     }
 
     output.set_len(rows.len());
     Ok(())
 }
 
-/// Write a single column from rows into the output DataChunkHandle.
-///
-/// - `output_col_idx`: index in the DuckDB output (may differ from spanner index when projected)
-/// - `spanner_col_idx`: index in the Spanner Row
-/// - `spanner_type`: the Spanner Type proto for this column
-///
-/// This is the unified entry point used by both spanner_query and spanner_scan.
-///
-/// `column_name` is used only to enrich Conversion error messages on type mismatch.
-pub fn write_column_from_rows(
+pub(crate) fn write_preflighted_column_from_rows<R: ConversionRow>(
     output: &mut DataChunkHandle,
     output_col_idx: usize,
-    rows: &[Row],
+    rows: &[R],
     spanner_col_idx: usize,
     spanner_type: &Type,
     column_name: &str,
 ) -> Result<(), SpannerError> {
-    ensure_row_count(rows.len(), &|| format!("column '{column_name}'"))?;
-
     let type_code = spanner_type.code();
 
     match type_code {
@@ -308,10 +521,10 @@ pub fn write_column_from_rows(
 }
 
 /// Write a column of scalar values by extracting raw proto values from each Row.
-fn write_scalar_column(
+fn write_scalar_column<R: ConversionRow>(
     output: &mut DataChunkHandle,
     output_col_idx: usize,
-    rows: &[Row],
+    rows: &[R],
     spanner_col_idx: usize,
     spanner_type: &Type,
     column_name: &str,
@@ -332,10 +545,10 @@ fn write_scalar_column(
 
 // ─── ARRAY / STRUCT support ─────────────────────────────────────────────────
 
-fn write_array_column(
+fn write_array_column<R: ConversionRow>(
     output: &mut DataChunkHandle,
     output_col_idx: usize,
-    rows: &[Row],
+    rows: &[R],
     spanner_col_idx: usize,
     spanner_type: &Type,
     column_name: &str,
@@ -368,9 +581,26 @@ fn write_array_column(
         }
     }
 
-    // Set list entries before obtaining the child. Parent entries use the
-    // regular DuckDB row-vector capacity; flattened children are reserved
-    // separately below.
+    let elem_type_code = element_type.code();
+    let element_struct_type = if elem_type_code == TypeCode::Struct {
+        let struct_type = element_type
+            .struct_type()
+            .ok_or_else(|| SpannerError::Conversion("STRUCT without struct_type".to_string()))?;
+        ensure_array_struct_list_entry_capacity(total_children, struct_type, &|| {
+            format!("column '{column_name}' ARRAY<STRUCT> child")
+        })?;
+        Some(struct_type)
+    } else {
+        None
+    };
+    if elem_type_code == TypeCode::Array {
+        ensure_nested_list_entry_capacity(total_children, &|| {
+            format!("column '{column_name}' nested ARRAY child")
+        })?;
+    }
+
+    // Parent entries use DuckDB's regular row-vector capacity. Scalar and
+    // struct children obtain their requested capacity through public APIs below.
     let mut offset = 0usize;
     let row_capacity = rows_capacity_hint();
     for (i, opt_values) in raw_values.iter().enumerate() {
@@ -387,23 +617,19 @@ fn write_array_column(
     }
 
     debug_assert_eq!(offset, total_children);
-    let elem_type_code = element_type.code();
 
     match elem_type_code {
         TypeCode::Struct => {
-            let struct_type = element_type.struct_type().ok_or_else(|| {
-                SpannerError::Conversion("STRUCT without struct_type".to_string())
-            })?;
-            set_list_len_after_reserve(&list_vector, total_children, &|| {
-                format!("column '{column_name}' ARRAY<STRUCT> child")
-            })?;
+            let struct_type = element_struct_type
+                .expect("STRUCT metadata was validated before writing list entries");
             let mut child_struct = list_vector.struct_child(total_children);
             reset_struct_list_sizes(&child_struct, struct_type)?;
+            list_vector.set_len(total_children);
             let mut flat_idx = 0usize;
             for (row_idx, values) in raw_values.iter().enumerate() {
                 let Some(values) = values else { continue };
                 for (elem_idx, val) in values.iter().enumerate() {
-                    write_raw_struct_value(
+                    write_raw_struct_value_prevalidated(
                         &mut child_struct,
                         total_children,
                         flat_idx,
@@ -423,16 +649,14 @@ fn write_array_column(
             let inner_elem_type = element_type.array_element_type().ok_or_else(|| {
                 SpannerError::Conversion("Nested ARRAY without element type".to_string())
             })?;
-            set_list_len_after_reserve(&list_vector, total_children, &|| {
-                format!("column '{column_name}' nested ARRAY child")
-            })?;
             let mut child_list = list_vector.list_child();
             child_list.set_len(0);
+            list_vector.set_len(total_children);
             let mut flat_idx = 0usize;
             for (row_idx, values) in raw_values.iter().enumerate() {
                 let Some(values) = values else { continue };
                 for (elem_idx, val) in values.iter().enumerate() {
-                    write_raw_list_value(
+                    write_raw_list_value_prevalidated(
                         &mut child_list,
                         total_children,
                         flat_idx,
@@ -449,10 +673,8 @@ fn write_array_column(
             }
         }
         _ => {
-            set_list_len_after_reserve(&list_vector, total_children, &|| {
-                format!("column '{column_name}' ARRAY child")
-            })?;
             let mut child = list_vector.child(total_children);
+            list_vector.set_len(total_children);
             let mut flat_idx = 0usize;
             for (row_idx, values) in raw_values.iter().enumerate() {
                 let Some(values) = values else { continue };
@@ -469,10 +691,10 @@ fn write_array_column(
     Ok(())
 }
 
-fn write_struct_column(
+fn write_struct_column<R: ConversionRow>(
     output: &mut DataChunkHandle,
     output_col_idx: usize,
-    rows: &[Row],
+    rows: &[R],
     spanner_col_idx: usize,
     spanner_type: &Type,
     column_name: &str,
@@ -493,7 +715,7 @@ fn write_struct_column(
             })?;
             struct_vector.set_null(i);
         } else {
-            write_raw_struct_value(
+            write_raw_struct_value_prevalidated(
                 &mut struct_vector,
                 row_capacity,
                 i,
@@ -541,7 +763,29 @@ fn reset_struct_list_sizes(
 /// `context` lazily describes the enclosing location (column/row/array element) for
 /// error messages; it is only invoked on a type mismatch, keeping the hot path free
 /// of per-row string allocation.
+#[cfg(test)]
 fn write_raw_struct_value(
+    struct_vector: &mut StructVector<'_>,
+    row_capacity: usize,
+    row_idx: usize,
+    value: &SpannerValue,
+    struct_type: &model::StructType,
+    context: &dyn Fn() -> String,
+) -> Result<(), SpannerError> {
+    ensure_vector_index(row_idx, row_capacity, context)?;
+    let mut field_states = PreflightState::for_struct_type(struct_type, context)?;
+    preflight_struct_value(value, struct_type, &mut field_states, context)?;
+    write_raw_struct_value_prevalidated(
+        struct_vector,
+        row_capacity,
+        row_idx,
+        value,
+        struct_type,
+        context,
+    )
+}
+
+fn write_raw_struct_value_prevalidated(
     struct_vector: &mut StructVector<'_>,
     row_capacity: usize,
     row_idx: usize,
@@ -578,7 +822,7 @@ fn write_raw_struct_value(
                     let inner_struct_type = field_type.struct_type().ok_or_else(|| {
                         SpannerError::Conversion("Nested STRUCT without struct_type".to_string())
                     })?;
-                    write_raw_struct_value(
+                    write_raw_struct_value_prevalidated(
                         &mut child,
                         row_capacity,
                         row_idx,
@@ -596,7 +840,7 @@ fn write_raw_struct_value(
                     let elem_type = field_type.array_element_type().ok_or_else(|| {
                         SpannerError::Conversion("ARRAY without element type".to_string())
                     })?;
-                    write_raw_list_value(
+                    write_raw_list_value_prevalidated(
                         &mut child,
                         row_capacity,
                         row_idx,
@@ -631,7 +875,37 @@ fn write_raw_struct_value(
 ///
 /// `context` lazily describes the enclosing location (column/row/field) for error
 /// messages; it is only invoked on a type mismatch.
+#[cfg(test)]
 fn write_raw_list_value(
+    list_vector: &mut ListVector<'_>,
+    row_capacity: usize,
+    row_idx: usize,
+    value: &SpannerValue,
+    element_type: &Type,
+    context: &dyn Fn() -> String,
+) -> Result<(), SpannerError> {
+    ensure_vector_index(row_idx, row_capacity, context)?;
+    let element_context = || format!("{}, array element type", context());
+    let mut element_state = PreflightState::for_type(element_type, &element_context)?;
+    let mut child_count = list_vector.len();
+    preflight_list_value(
+        value,
+        element_type,
+        &mut child_count,
+        &mut element_state,
+        context,
+    )?;
+    write_raw_list_value_prevalidated(
+        list_vector,
+        row_capacity,
+        row_idx,
+        value,
+        element_type,
+        context,
+    )
+}
+
+fn write_raw_list_value_prevalidated(
     list_vector: &mut ListVector<'_>,
     row_capacity: usize,
     row_idx: usize,
@@ -654,6 +928,19 @@ fn write_raw_list_value(
 
     let current_len = list_vector.len();
     let new_len = checked_child_count(current_len, values.len(), context)?;
+    let elem_type_code = element_type.code();
+    let element_struct_type = if elem_type_code == TypeCode::Struct {
+        let struct_type = element_type
+            .struct_type()
+            .ok_or_else(|| SpannerError::Conversion("STRUCT without struct_type".to_string()))?;
+        ensure_array_struct_list_entry_capacity(new_len, struct_type, context)?;
+        Some(struct_type)
+    } else {
+        None
+    };
+    if elem_type_code == TypeCode::Array {
+        ensure_nested_list_entry_capacity(new_len, context)?;
+    }
     set_list_entry_checked(
         list_vector,
         row_capacity,
@@ -663,19 +950,18 @@ fn write_raw_list_value(
         context,
     )?;
 
-    match element_type.code() {
+    match elem_type_code {
         TypeCode::Struct => {
-            let struct_type = element_type.struct_type().ok_or_else(|| {
-                SpannerError::Conversion("STRUCT without struct_type".to_string())
-            })?;
-            set_list_len_after_reserve(list_vector, new_len, context)?;
+            let struct_type = element_struct_type
+                .expect("STRUCT metadata was validated before writing the list entry");
             let mut child_struct = list_vector.struct_child(new_len);
             if current_len == 0 {
                 reset_struct_list_sizes(&child_struct, struct_type)?;
             }
+            list_vector.set_len(new_len);
             for (j, val) in values.iter().enumerate() {
                 let elem_context = || format!("{}, array element {j}", context());
-                write_raw_struct_value(
+                write_raw_struct_value_prevalidated(
                     &mut child_struct,
                     new_len,
                     current_len + j,
@@ -689,14 +975,14 @@ fn write_raw_list_value(
             let inner_element_type = element_type.array_element_type().ok_or_else(|| {
                 SpannerError::Conversion("Nested ARRAY without element type".to_string())
             })?;
-            set_list_len_after_reserve(list_vector, new_len, context)?;
             let mut child_list = list_vector.list_child();
             if current_len == 0 {
                 child_list.set_len(0);
             }
+            list_vector.set_len(new_len);
             for (j, val) in values.iter().enumerate() {
                 let elem_context = || format!("{}, array element {j}", context());
-                write_raw_list_value(
+                write_raw_list_value_prevalidated(
                     &mut child_list,
                     new_len,
                     current_len + j,
@@ -707,8 +993,8 @@ fn write_raw_list_value(
             }
         }
         _ => {
-            set_list_len_after_reserve(list_vector, new_len, context)?;
             let mut child = list_vector.child(new_len);
+            list_vector.set_len(new_len);
             for (j, val) in values.iter().enumerate() {
                 let elem_context = || format!("{}, array element {j}", context());
                 write_raw_scalar_to_flat(
@@ -725,6 +1011,163 @@ fn write_raw_list_value(
 }
 
 // ─── Raw scalar conversion (proto Value → DuckDB FlatVector) ────────────────
+
+enum PreparedScalar<'a> {
+    Null,
+    Bool(bool),
+    I32(i32),
+    I64(i64),
+    I128(i128),
+    U128(u128),
+    F32(f32),
+    F64(f64),
+    String(&'a str),
+    Bytes(Vec<u8>),
+    Interval(DuckDBInterval),
+}
+
+fn prepare_scalar_value<'a>(
+    value: &'a SpannerValue,
+    spanner_type: &Type,
+    context: &dyn Fn() -> String,
+) -> Result<PreparedScalar<'a>, SpannerError> {
+    if value.kind() == Kind::Null {
+        return Ok(PreparedScalar::Null);
+    }
+
+    match spanner_type.code() {
+        TypeCode::Bool => value
+            .try_as_bool()
+            .map(PreparedScalar::Bool)
+            .ok_or_else(|| type_mismatch_error("BOOL (Bool)", value.kind(), &context())),
+        TypeCode::Int64 | TypeCode::Enum => {
+            let expected = if spanner_type.code() == TypeCode::Enum {
+                "ENUM (String)"
+            } else {
+                "INT64 (String)"
+            };
+            let value = value
+                .try_as_string()
+                .ok_or_else(|| type_mismatch_error(expected, value.kind(), &context()))?
+                .parse::<i64>()
+                .map_err(|e| SpannerError::Conversion(format!("INT64 parse error: {e}")))?;
+            Ok(PreparedScalar::I64(value))
+        }
+        TypeCode::Float32 => {
+            let value = if let Some(value) = value.try_as_f64() {
+                value as f32
+            } else if let Some(value) = value.try_as_string() {
+                value
+                    .parse::<f32>()
+                    .map_err(|e| SpannerError::Conversion(format!("FLOAT32 parse error: {e}")))?
+            } else {
+                return Err(type_mismatch_error(
+                    "FLOAT32 (Number or String)",
+                    value.kind(),
+                    &context(),
+                ));
+            };
+            Ok(PreparedScalar::F32(value))
+        }
+        TypeCode::Float64 => {
+            let value = if let Some(value) = value.try_as_f64() {
+                value
+            } else if let Some(value) = value.try_as_string() {
+                value
+                    .parse::<f64>()
+                    .map_err(|e| SpannerError::Conversion(format!("FLOAT64 parse error: {e}")))?
+            } else {
+                return Err(type_mismatch_error(
+                    "FLOAT64 (Number or String)",
+                    value.kind(),
+                    &context(),
+                ));
+            };
+            Ok(PreparedScalar::F64(value))
+        }
+        TypeCode::Numeric => {
+            let value = value
+                .try_as_string()
+                .ok_or_else(|| type_mismatch_error("NUMERIC (String)", value.kind(), &context()))?;
+            if is_pg_numeric(spanner_type) {
+                checked_duckdb_index(value.len(), "string length", context)?;
+                return Ok(PreparedScalar::String(value));
+            }
+
+            use bigdecimal::{BigDecimal, ToPrimitive};
+            use std::str::FromStr;
+            let decimal = BigDecimal::from_str(value)
+                .map_err(|e| SpannerError::Conversion(format!("NUMERIC parse error: {e}")))?;
+            let (unscaled, _scale) = decimal.with_scale(9).into_bigint_and_scale();
+            let value = unscaled.to_i128().ok_or_else(|| {
+                SpannerError::Conversion(format!("NUMERIC value out of i128 range: {value}"))
+            })?;
+            Ok(PreparedScalar::I128(value))
+        }
+        TypeCode::String | TypeCode::Json => {
+            let value = value.try_as_string().ok_or_else(|| {
+                type_mismatch_error("STRING/JSON (String)", value.kind(), &context())
+            })?;
+            checked_duckdb_index(value.len(), "string length", context)?;
+            Ok(PreparedScalar::String(value))
+        }
+        TypeCode::Bytes | TypeCode::Proto => {
+            let value = value.try_as_string().ok_or_else(|| {
+                type_mismatch_error("BYTES/PROTO (String, base64)", value.kind(), &context())
+            })?;
+            let value = base64_decode(value)?;
+            checked_duckdb_index(value.len(), "binary length", context)?;
+            Ok(PreparedScalar::Bytes(value))
+        }
+        TypeCode::Date => {
+            let value = value
+                .try_as_string()
+                .ok_or_else(|| type_mismatch_error("DATE (String)", value.kind(), &context()))?;
+            let format = time::format_description::well_known::Iso8601::DATE;
+            let date = time::Date::parse(value, &format)
+                .map_err(|e| SpannerError::Conversion(format!("DATE parse error: {e}")))?;
+            Ok(PreparedScalar::I32((date - EPOCH_DATE).whole_days() as i32))
+        }
+        TypeCode::Timestamp => {
+            let value = value.try_as_string().ok_or_else(|| {
+                type_mismatch_error("TIMESTAMP (String)", value.kind(), &context())
+            })?;
+            let timestamp =
+                OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339)
+                    .map_err(|e| SpannerError::Conversion(format!("TIMESTAMP parse error: {e}")))?;
+            Ok(PreparedScalar::I64(
+                (timestamp.unix_timestamp_nanos() / 1_000) as i64,
+            ))
+        }
+        TypeCode::Uuid => {
+            let value = value
+                .try_as_string()
+                .ok_or_else(|| type_mismatch_error("UUID (String)", value.kind(), &context()))?;
+            let value = uuid::Uuid::parse_str(value)
+                .map_err(|e| SpannerError::Conversion(format!("UUID parse error: {e}")))?
+                .as_u128()
+                ^ (1u128 << 127);
+            Ok(PreparedScalar::U128(value))
+        }
+        TypeCode::Interval => {
+            let value = value.try_as_string().ok_or_else(|| {
+                type_mismatch_error("INTERVAL (String)", value.kind(), &context())
+            })?;
+            Ok(PreparedScalar::Interval(parse_iso8601_interval(value)?))
+        }
+        _ => {
+            let value = value.try_as_string().ok_or_else(|| {
+                type_mismatch_error(
+                    "STRING (String, fallback for unrecognized type code)",
+                    value.kind(),
+                    &context(),
+                )
+            })?;
+            checked_duckdb_index(value.len(), "string length", context)?;
+            Ok(PreparedScalar::String(value))
+        }
+    }
+}
 
 /// Write a single raw proto scalar Value to a FlatVector at the given index.
 ///
@@ -744,201 +1187,23 @@ fn write_raw_scalar_to_flat(
     context: &dyn Fn() -> String,
 ) -> Result<(), SpannerError> {
     ensure_vector_index(idx, vector.capacity(), context)?;
-
-    // Null is legitimate regardless of expected type, never a mismatch.
-    if value.kind() == Kind::Null {
-        vector.set_null(idx);
-        return Ok(());
-    }
-
-    match spanner_type.code() {
-        TypeCode::Bool => {
-            if let Some(v) = value.try_as_bool() {
-                unsafe { vector.as_mut_slice::<bool>()[idx] = v }
-            } else {
-                return Err(type_mismatch_error("BOOL (Bool)", value.kind(), &context()));
-            }
+    match prepare_scalar_value(value, spanner_type, context)? {
+        PreparedScalar::Null => vector.set_null(idx),
+        PreparedScalar::Bool(value) => unsafe { vector.as_mut_slice::<bool>()[idx] = value },
+        PreparedScalar::I32(value) => unsafe { vector.as_mut_slice::<i32>()[idx] = value },
+        PreparedScalar::I64(value) => unsafe { vector.as_mut_slice::<i64>()[idx] = value },
+        PreparedScalar::I128(value) => unsafe { vector.as_mut_slice::<i128>()[idx] = value },
+        PreparedScalar::U128(value) => unsafe { vector.as_mut_slice::<u128>()[idx] = value },
+        PreparedScalar::F32(value) => unsafe { vector.as_mut_slice::<f32>()[idx] = value },
+        PreparedScalar::F64(value) => unsafe { vector.as_mut_slice::<f64>()[idx] = value },
+        PreparedScalar::String(value) => {
+            // Spanner STRING-like values are guaranteed valid UTF-8.
+            unsafe { unsafe_assign_string(vector, idx, value) }
         }
-        TypeCode::Int64 | TypeCode::Enum => {
-            if let Some(s) = value.try_as_string() {
-                let v: i64 = s
-                    .parse()
-                    .map_err(|e| SpannerError::Conversion(format!("INT64 parse error: {e}")))?;
-                unsafe { vector.as_mut_slice::<i64>()[idx] = v }
-            } else {
-                let expected = if spanner_type.code() == TypeCode::Enum {
-                    "ENUM (String)"
-                } else {
-                    "INT64 (String)"
-                };
-                return Err(type_mismatch_error(expected, value.kind(), &context()));
-            }
-        }
-        TypeCode::Float32 => {
-            if let Some(v) = value.try_as_f64() {
-                unsafe { vector.as_mut_slice::<f32>()[idx] = v as f32 }
-            } else if let Some(s) = value.try_as_string() {
-                // Handle NaN, Infinity, -Infinity
-                let v: f32 = s
-                    .parse()
-                    .map_err(|e| SpannerError::Conversion(format!("FLOAT32 parse error: {e}")))?;
-                unsafe { vector.as_mut_slice::<f32>()[idx] = v }
-            } else {
-                return Err(type_mismatch_error(
-                    "FLOAT32 (Number or String)",
-                    value.kind(),
-                    &context(),
-                ));
-            }
-        }
-        TypeCode::Float64 => {
-            if let Some(v) = value.try_as_f64() {
-                unsafe { vector.as_mut_slice::<f64>()[idx] = v }
-            } else if let Some(s) = value.try_as_string() {
-                let v: f64 = s
-                    .parse()
-                    .map_err(|e| SpannerError::Conversion(format!("FLOAT64 parse error: {e}")))?;
-                unsafe { vector.as_mut_slice::<f64>()[idx] = v }
-            } else {
-                return Err(type_mismatch_error(
-                    "FLOAT64 (Number or String)",
-                    value.kind(),
-                    &context(),
-                ));
-            }
-        }
-        TypeCode::Numeric => {
-            if let Some(s) = value.try_as_string() {
-                if is_pg_numeric(spanner_type) {
-                    // PostgreSQL numeric can be NaN or exceed DuckDB's
-                    // DECIMAL(38,9) precision and scale. The bind path maps
-                    // this annotated type to VARCHAR, preserving the exact
-                    // server representation for callers to cast deliberately.
-                    checked_duckdb_index(s.len(), "string length", context)?;
-                    unsafe { unsafe_assign_string(vector, idx, s) }
-                    return Ok(());
-                }
-                use bigdecimal::{BigDecimal, ToPrimitive};
-                use std::str::FromStr;
-                let bd = BigDecimal::from_str(s)
-                    .map_err(|e| SpannerError::Conversion(format!("NUMERIC parse error: {e}")))?;
-                // DuckDB DECIMAL(38,9): fixed-point i128 with scale=9.
-                // with_scale(9) shifts to 9 decimal places, into_bigint_and_scale
-                // gives the unscaled BigInt directly (no string round-trip).
-                let (unscaled, _scale) = bd.with_scale(9).into_bigint_and_scale();
-                let int_val: i128 = unscaled.to_i128().ok_or_else(|| {
-                    SpannerError::Conversion(format!("NUMERIC value out of i128 range: {s}"))
-                })?;
-                unsafe { vector.as_mut_slice::<i128>()[idx] = int_val }
-            } else {
-                return Err(type_mismatch_error(
-                    "NUMERIC (String)",
-                    value.kind(),
-                    &context(),
-                ));
-            }
-        }
-        TypeCode::String | TypeCode::Json => {
-            if let Some(s) = value.try_as_string() {
-                // SAFETY: Spanner guarantees STRING and JSON values are valid UTF-8.
-                checked_duckdb_index(s.len(), "string length", context)?;
-                unsafe { unsafe_assign_string(vector, idx, s) }
-            } else {
-                return Err(type_mismatch_error(
-                    "STRING/JSON (String)",
-                    value.kind(),
-                    &context(),
-                ));
-            }
-        }
-        TypeCode::Bytes | TypeCode::Proto => {
-            if let Some(s) = value.try_as_string() {
-                let bytes = base64_decode(s)?;
-                checked_duckdb_index(bytes.len(), "binary length", context)?;
-                vector.insert(idx, bytes.as_slice());
-            } else {
-                return Err(type_mismatch_error(
-                    "BYTES/PROTO (String, base64)",
-                    value.kind(),
-                    &context(),
-                ));
-            }
-        }
-        TypeCode::Date => {
-            if let Some(s) = value.try_as_string() {
-                let format = time::format_description::well_known::Iso8601::DATE;
-                let date = time::Date::parse(s, &format)
-                    .map_err(|e| SpannerError::Conversion(format!("DATE parse error: {e}")))?;
-                let days = (date - EPOCH_DATE).whole_days() as i32;
-                unsafe { vector.as_mut_slice::<i32>()[idx] = days }
-            } else {
-                return Err(type_mismatch_error(
-                    "DATE (String)",
-                    value.kind(),
-                    &context(),
-                ));
-            }
-        }
-        TypeCode::Timestamp => {
-            if let Some(s) = value.try_as_string() {
-                let ts = OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
-                    .map_err(|e| {
-                    SpannerError::Conversion(format!("TIMESTAMP parse error: {e}"))
-                })?;
-                let micros = (ts.unix_timestamp_nanos() / 1_000) as i64;
-                unsafe { vector.as_mut_slice::<i64>()[idx] = micros }
-            } else {
-                return Err(type_mismatch_error(
-                    "TIMESTAMP (String)",
-                    value.kind(),
-                    &context(),
-                ));
-            }
-        }
-        TypeCode::Uuid => {
-            if let Some(s) = value.try_as_string() {
-                let parsed = uuid::Uuid::parse_str(s)
-                    .map_err(|e| SpannerError::Conversion(format!("UUID parse error: {e}")))?;
-                // DuckDB stores UUIDs as hugeint with the MSB flipped for sort ordering.
-                // See: duckdb/src/common/types/uuid.cpp — UUIDToUHugeint / UHugeintToUUID.
-                // See also: duckdb/duckdb-rs#519 (UUID value correctness),
-                //           duckdb/duckdb-rs#585 (no duckdb_bind_uuid in C API).
-                let val = parsed.as_u128() ^ (1u128 << 127);
-                unsafe { vector.as_mut_slice::<u128>()[idx] = val }
-            } else {
-                return Err(type_mismatch_error(
-                    "UUID (String)",
-                    value.kind(),
-                    &context(),
-                ));
-            }
-        }
-        TypeCode::Interval => {
-            if let Some(s) = value.try_as_string() {
-                let interval = parse_iso8601_interval(s)?;
-                unsafe { vector.as_mut_slice::<DuckDBInterval>()[idx] = interval }
-            } else {
-                return Err(type_mismatch_error(
-                    "INTERVAL (String)",
-                    value.kind(),
-                    &context(),
-                ));
-            }
-        }
-        _ => {
-            // Unknown/unspecified Spanner type code: best-effort fallback to string.
-            if let Some(s) = value.try_as_string() {
-                // SAFETY: Spanner only returns valid UTF-8 string values.
-                checked_duckdb_index(s.len(), "string length", context)?;
-                unsafe { unsafe_assign_string(vector, idx, s) }
-            } else {
-                return Err(type_mismatch_error(
-                    "STRING (String, fallback for unrecognized type code)",
-                    value.kind(),
-                    &context(),
-                ));
-            }
-        }
+        PreparedScalar::Bytes(value) => vector.insert(idx, value.as_slice()),
+        PreparedScalar::Interval(value) => unsafe {
+            vector.as_mut_slice::<DuckDBInterval>()[idx] = value
+        },
     }
     Ok(())
 }
@@ -1239,6 +1504,41 @@ mod tests {
         (chunk, result)
     }
 
+    const LIST_ENTRY_SENTINEL: (usize, usize) = (7, 11);
+
+    fn write_list_one_with_sentinel_entry(
+        child_logical_type: LogicalTypeHandle,
+        element_type: Type,
+        value: SpannerValue,
+        column_name: &str,
+    ) -> (DataChunkHandle, Result<(), SpannerError>) {
+        let chunk = DataChunkHandle::new(&[LogicalTypeHandle::list(&child_logical_type)]);
+        chunk.set_len(1);
+        let result = {
+            let mut vector = chunk.list_vector(0);
+            vector.set_entry(0, LIST_ENTRY_SENTINEL.0, LIST_ENTRY_SENTINEL.1);
+            write_raw_list_value(
+                &mut vector,
+                rows_capacity_hint(),
+                0,
+                &value,
+                &element_type,
+                &|| format!("column '{column_name}', row 0"),
+            )
+        };
+        (chunk, result)
+    }
+
+    fn assert_sentinel_list_unpublished(chunk: &DataChunkHandle) {
+        let list = chunk.list_vector(0);
+        assert_eq!(list.len(), 0, "failed conversion changed list length");
+        assert_eq!(
+            list.get_entry(0),
+            LIST_ENTRY_SENTINEL,
+            "failed conversion overwrote the parent list entry"
+        );
+    }
+
     fn write_struct_one(
         logical_type: LogicalTypeHandle,
         spanner_type: Type,
@@ -1342,46 +1642,310 @@ mod tests {
     }
 
     #[test]
-    fn nested_array_reserves_oversized_list_entry_children() {
-        let count = rows_capacity_hint() + 17;
-        let values = (0..count)
-            .map(|i| prost_types::Value {
+    fn array_of_struct_array_fields_preserves_offsets_nulls_and_reuse() {
+        fn proto_list(values: Vec<prost_types::Value>) -> prost_types::Value {
+            prost_types::Value {
+                kind: Some(ProtoKind::ListValue(prost_types::ListValue { values })),
+            }
+        }
+
+        fn proto_int(value: i64) -> prost_types::Value {
+            prost_types::Value {
+                kind: Some(ProtoKind::StringValue(value.to_string())),
+            }
+        }
+
+        fn proto_null() -> prost_types::Value {
+            prost_types::Value {
+                kind: Some(ProtoKind::NullValue(0)),
+            }
+        }
+
+        fn struct_value(
+            direct: prost_types::Value,
+            nested: prost_types::Value,
+        ) -> prost_types::Value {
+            proto_list(vec![direct, proto_list(vec![nested])])
+        }
+
+        let nested_type = struct_type_proto(vec![(
+            "values",
+            array_type_proto(scalar_type(TypeCode::Int64)),
+        )]);
+        let element_type = struct_type_proto(vec![
+            ("direct", array_type_proto(scalar_type(TypeCode::Int64))),
+            ("nested", nested_type),
+        ]);
+        let logical_nested = LogicalTypeHandle::struct_type(&[(
+            "values",
+            LogicalTypeHandle::list(&LogicalTypeId::Bigint.into()),
+        )]);
+        let logical_struct = LogicalTypeHandle::struct_type(&[
+            (
+                "direct",
+                LogicalTypeHandle::list(&LogicalTypeId::Bigint.into()),
+            ),
+            ("nested", logical_nested),
+        ]);
+        let chunk = DataChunkHandle::new(&[LogicalTypeHandle::list(&logical_struct)]);
+        chunk.set_len(1);
+
+        let first = value_of(ProtoKind::ListValue(prost_types::ListValue {
+            values: vec![
+                struct_value(
+                    proto_list(vec![proto_int(10), proto_int(11)]),
+                    proto_list(vec![proto_int(100)]),
+                ),
+                struct_value(proto_null(), proto_null()),
+                struct_value(
+                    proto_list(vec![proto_int(20)]),
+                    proto_list(vec![proto_int(200), proto_int(201)]),
+                ),
+            ],
+        }));
+        {
+            let mut list = chunk.list_vector(0);
+            write_raw_list_value(
+                &mut list,
+                rows_capacity_hint(),
+                0,
+                &first,
+                &element_type,
+                &|| "column 'items', row 0".to_string(),
+            )
+            .unwrap();
+        }
+
+        {
+            let outer = chunk.list_vector(0);
+            assert_eq!(outer.get_entry(0), (0, 3));
+            assert_eq!(outer.len(), 3);
+            let structs = outer.struct_child(3);
+
+            let direct_validity = structs.child(0, 3);
+            let direct = structs.list_vector_child(0);
+            assert_eq!(direct.get_entry(0), (0, 2));
+            assert_eq!(direct.get_entry(1), (2, 0));
+            assert_eq!(direct.get_entry(2), (2, 1));
+            assert_eq!(direct.len(), 3);
+            assert!(direct_validity.row_is_null(1));
+            assert_eq!(unsafe { direct.child(3).as_slice::<i64>() }, &[10, 11, 20]);
+
+            let nested_struct = structs.struct_vector_child(1);
+            let nested_validity = nested_struct.child(0, 3);
+            let nested = nested_struct.list_vector_child(0);
+            assert_eq!(nested.get_entry(0), (0, 1));
+            assert_eq!(nested.get_entry(1), (1, 0));
+            assert_eq!(nested.get_entry(2), (1, 2));
+            assert_eq!(nested.len(), 3);
+            assert!(nested_validity.row_is_null(1));
+            assert_eq!(
+                unsafe { nested.child(3).as_slice::<i64>() },
+                &[100, 200, 201]
+            );
+        }
+
+        // Reuse the same output storage for a shorter batch. The write path must
+        // reset both direct and recursively nested list append cursors.
+        chunk.list_vector(0).set_len(0);
+        let second = value_of(ProtoKind::ListValue(prost_types::ListValue {
+            values: vec![
+                struct_value(
+                    proto_list(vec![proto_int(30)]),
+                    proto_list(vec![proto_int(300), proto_int(301)]),
+                ),
+                struct_value(proto_null(), proto_null()),
+            ],
+        }));
+        {
+            let mut list = chunk.list_vector(0);
+            write_raw_list_value(
+                &mut list,
+                rows_capacity_hint(),
+                0,
+                &second,
+                &element_type,
+                &|| "column 'items', row 0".to_string(),
+            )
+            .unwrap();
+        }
+
+        let outer = chunk.list_vector(0);
+        assert_eq!(outer.get_entry(0), (0, 2));
+        assert_eq!(outer.len(), 2);
+        let structs = outer.struct_child(2);
+
+        let direct_validity = structs.child(0, 2);
+        let direct = structs.list_vector_child(0);
+        assert_eq!(direct.get_entry(0), (0, 1));
+        assert_eq!(direct.get_entry(1), (1, 0));
+        assert_eq!(direct.len(), 1);
+        assert!(direct_validity.row_is_null(1));
+        assert_eq!(unsafe { direct.child(1).as_slice::<i64>() }, &[30]);
+
+        let nested_struct = structs.struct_vector_child(1);
+        let nested_validity = nested_struct.child(0, 2);
+        let nested = nested_struct.list_vector_child(0);
+        assert_eq!(nested.get_entry(0), (0, 2));
+        assert_eq!(nested.get_entry(1), (2, 0));
+        assert_eq!(nested.len(), 2);
+        assert!(nested_validity.row_is_null(1));
+        assert_eq!(unsafe { nested.child(2).as_slice::<i64>() }, &[300, 301]);
+    }
+
+    #[test]
+    fn array_of_struct_with_array_field_rejects_oversized_children_before_writing() {
+        let count = rows_capacity_hint() + 1;
+        let struct_type = struct_type_proto(vec![(
+            "values",
+            array_type_proto(scalar_type(TypeCode::Int64)),
+        )]);
+        let logical_struct = LogicalTypeHandle::struct_type(&[(
+            "values",
+            LogicalTypeHandle::list(&LogicalTypeId::Bigint.into()),
+        )]);
+        let struct_value = prost_types::Value {
+            kind: Some(ProtoKind::ListValue(prost_types::ListValue {
+                values: vec![prost_types::Value {
+                    kind: Some(ProtoKind::ListValue(prost_types::ListValue {
+                        values: Vec::new(),
+                    })),
+                }],
+            })),
+        };
+        let value = value_of(ProtoKind::ListValue(prost_types::ListValue {
+            values: vec![struct_value; count],
+        }));
+
+        let (chunk, result) =
+            write_list_one_with_sentinel_entry(logical_struct, struct_type, value, "items");
+        match result {
+            Err(SpannerError::Conversion(message)) => {
+                assert!(
+                    message.contains("ARRAY<STRUCT> child count"),
+                    "message: {message}"
+                );
+                assert!(
+                    message.contains("ARRAY field 'values'"),
+                    "message: {message}"
+                );
+                assert!(
+                    message.contains("column 'items', row 0"),
+                    "message: {message}"
+                );
+            }
+            other => panic!("expected Conversion error, got {other:?}"),
+        }
+
+        let list = chunk.list_vector(0);
+        assert_eq!(list.len(), 0, "failed conversion changed list length");
+        assert_eq!(
+            list.get_entry(0),
+            LIST_ENTRY_SENTINEL,
+            "failed conversion overwrote the parent list entry"
+        );
+    }
+
+    #[test]
+    fn array_of_nested_struct_with_array_field_rejects_before_writing() {
+        let count = rows_capacity_hint() + 1;
+        let nested_struct_type = struct_type_proto(vec![(
+            "values",
+            array_type_proto(scalar_type(TypeCode::Int64)),
+        )]);
+        let struct_type = struct_type_proto(vec![("payload", nested_struct_type)]);
+        let logical_nested_struct = LogicalTypeHandle::struct_type(&[(
+            "values",
+            LogicalTypeHandle::list(&LogicalTypeId::Bigint.into()),
+        )]);
+        let logical_struct = LogicalTypeHandle::struct_type(&[("payload", logical_nested_struct)]);
+        let struct_value = prost_types::Value {
+            kind: Some(ProtoKind::ListValue(prost_types::ListValue {
+                values: vec![prost_types::Value {
+                    kind: Some(ProtoKind::ListValue(prost_types::ListValue {
+                        values: vec![prost_types::Value {
+                            kind: Some(ProtoKind::ListValue(prost_types::ListValue {
+                                values: Vec::new(),
+                            })),
+                        }],
+                    })),
+                }],
+            })),
+        };
+        let value = value_of(ProtoKind::ListValue(prost_types::ListValue {
+            values: vec![struct_value; count],
+        }));
+
+        let (chunk, result) =
+            write_list_one_with_sentinel_entry(logical_struct, struct_type, value, "items");
+        match result {
+            Err(SpannerError::Conversion(message)) => {
+                assert!(
+                    message.contains("ARRAY<STRUCT> child count"),
+                    "message: {message}"
+                );
+                assert!(
+                    message.contains("ARRAY field 'payload.values'"),
+                    "message: {message}"
+                );
+                assert!(
+                    message.contains("column 'items', row 0"),
+                    "message: {message}"
+                );
+            }
+            other => panic!("expected Conversion error, got {other:?}"),
+        }
+
+        let list = chunk.list_vector(0);
+        assert_eq!(list.len(), 0, "failed conversion changed list length");
+        assert_eq!(
+            list.get_entry(0),
+            LIST_ENTRY_SENTINEL,
+            "failed conversion overwrote the parent list entry"
+        );
+    }
+
+    #[test]
+    fn deep_nested_array_cap_error_leaves_parent_list_unpublished() {
+        let count = rows_capacity_hint() + 1;
+        let inner_arrays = (0..count)
+            .map(|_| prost_types::Value {
                 kind: Some(ProtoKind::ListValue(prost_types::ListValue {
-                    values: vec![prost_types::Value {
-                        kind: Some(ProtoKind::StringValue(i.to_string())),
-                    }],
+                    values: Vec::new(),
                 })),
             })
             .collect();
-        let value = value_of(ProtoKind::ListValue(prost_types::ListValue { values }));
-        let logical_inner = LogicalTypeHandle::list(&LogicalTypeId::Bigint.into());
+        let value = value_of(ProtoKind::ListValue(prost_types::ListValue {
+            values: vec![prost_types::Value {
+                kind: Some(ProtoKind::ListValue(prost_types::ListValue {
+                    values: inner_arrays,
+                })),
+            }],
+        }));
+        let logical_inner =
+            LogicalTypeHandle::list(&LogicalTypeHandle::list(&LogicalTypeId::Bigint.into()));
 
-        let (chunk, result) = write_list_one(
+        let (chunk, result) = write_list_one_with_sentinel_entry(
             logical_inner,
-            array_type_proto(scalar_type(TypeCode::Int64)),
+            array_type_proto(array_type_proto(scalar_type(TypeCode::Int64))),
             value,
             "nested",
         );
-        result.expect("oversized nested ARRAY conversion");
-
-        let outer = chunk.list_vector(0);
-        assert_eq!(outer.get_entry(0), (0, count));
-        let inner = outer.list_child();
-        assert_eq!(inner.len(), count);
-        let inner_entries = unsafe {
-            std::slice::from_raw_parts(
-                ffi::duckdb_vector_get_data(list_vector_raw(&inner))
-                    .cast::<ffi::duckdb_list_entry>(),
-                count,
-            )
-        };
-        let values = inner.child(count);
-        let values = unsafe { values.as_slice::<i64>() };
-        for i in 0..count {
-            assert_eq!(inner_entries[i].offset, i as u64);
-            assert_eq!(inner_entries[i].length, 1);
-            assert_eq!(values[i], i as i64);
+        match result {
+            Err(SpannerError::Conversion(message)) => {
+                assert!(
+                    message.contains("nested ARRAY flattened list-entry count"),
+                    "message: {message}"
+                );
+                assert!(
+                    message.contains("column 'nested', row 0, array element 0"),
+                    "message: {message}"
+                );
+            }
+            other => panic!("expected Conversion error, got {other:?}"),
         }
+
+        assert_sentinel_list_unpublished(&chunk);
     }
 
     #[test]
@@ -1432,12 +1996,12 @@ mod tests {
     }
 
     #[test]
-    fn unrepresentable_nested_child_count_returns_conversion_error() {
-        let too_many = usize::try_from(DUCKDB_MAX_RESULT_CHILDREN + 1).unwrap();
+    fn oversized_flattened_child_count_returns_conversion_error() {
+        let too_many = MAX_FLATTENED_CHILDREN + 1;
         let result = checked_child_count(0, too_many, &|| "test value".to_string());
         match result {
             Err(SpannerError::Conversion(message)) => {
-                assert!(message.contains("safe result-vector capacity"));
+                assert!(message.contains("64 MiB flattened result budget"));
                 assert!(message.contains("test value"));
             }
             other => panic!("expected Conversion error, got {other:?}"),
@@ -1536,6 +2100,92 @@ mod tests {
             }
             other => panic!("expected Conversion error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn deep_list_type_error_leaves_parent_list_unpublished() {
+        let element_type = struct_type_proto(vec![(
+            "flags",
+            array_type_proto(scalar_type(TypeCode::Bool)),
+        )]);
+        let logical_struct = LogicalTypeHandle::struct_type(&[(
+            "flags",
+            LogicalTypeHandle::list(&LogicalTypeId::Boolean.into()),
+        )]);
+        let value = value_of(ProtoKind::ListValue(prost_types::ListValue {
+            values: vec![prost_types::Value {
+                kind: Some(ProtoKind::ListValue(prost_types::ListValue {
+                    values: vec![prost_types::Value {
+                        kind: Some(ProtoKind::ListValue(prost_types::ListValue {
+                            values: vec![
+                                prost_types::Value {
+                                    kind: Some(ProtoKind::BoolValue(true)),
+                                },
+                                prost_types::Value {
+                                    kind: Some(ProtoKind::StringValue("nope".to_string())),
+                                },
+                            ],
+                        })),
+                    }],
+                })),
+            }],
+        }));
+
+        let (chunk, result) =
+            write_list_one_with_sentinel_entry(logical_struct, element_type, value, "items");
+        match result {
+            Err(SpannerError::Conversion(message)) => {
+                assert!(message.contains("BOOL"), "message: {message}");
+                assert!(message.contains("String"), "message: {message}");
+                assert!(message.contains("field 'flags'"), "message: {message}");
+                assert!(message.contains("array element 1"), "message: {message}");
+            }
+            other => panic!("expected Conversion error, got {other:?}"),
+        }
+        assert_sentinel_list_unpublished(&chunk);
+    }
+
+    #[test]
+    fn deep_struct_metadata_error_leaves_parent_list_unpublished() {
+        let malformed_nested_struct: Type = model::Type::new()
+            .set_code(model::TypeCode::Struct)
+            .set_struct_type(
+                model::StructType::new()
+                    .set_fields(vec![model::struct_type::Field::new().set_name("broken")]),
+            )
+            .into();
+        let element_type = struct_type_proto(vec![("payload", malformed_nested_struct)]);
+        let logical_nested =
+            LogicalTypeHandle::struct_type(&[("broken", LogicalTypeId::Boolean.into())]);
+        let logical_struct = LogicalTypeHandle::struct_type(&[("payload", logical_nested)]);
+        let value = value_of(ProtoKind::ListValue(prost_types::ListValue {
+            values: vec![prost_types::Value {
+                kind: Some(ProtoKind::ListValue(prost_types::ListValue {
+                    values: vec![prost_types::Value {
+                        kind: Some(ProtoKind::ListValue(prost_types::ListValue {
+                            values: vec![prost_types::Value {
+                                kind: Some(ProtoKind::BoolValue(true)),
+                            }],
+                        })),
+                    }],
+                })),
+            }],
+        }));
+
+        let (chunk, result) =
+            write_list_one_with_sentinel_entry(logical_struct, element_type, value, "items");
+        match result {
+            Err(SpannerError::Conversion(message)) => {
+                assert!(
+                    message.contains("STRUCT field 'broken' without type"),
+                    "message: {message}"
+                );
+                assert!(message.contains("field 'payload'"), "message: {message}");
+                assert!(message.contains("column 'items'"), "message: {message}");
+            }
+            other => panic!("expected Conversion error, got {other:?}"),
+        }
+        assert_sentinel_list_unpublished(&chunk);
     }
 
     #[test]
