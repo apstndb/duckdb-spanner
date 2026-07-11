@@ -1,5 +1,6 @@
 use std::sync::OnceLock;
 use tokio::runtime::Runtime;
+use tokio_util::sync::CancellationToken;
 
 use crate::error::SpannerError;
 
@@ -64,23 +65,54 @@ where
     Ok(rt.spawn(future))
 }
 
+/// Await an operation unless stream cancellation has already been requested.
+///
+/// Cancellation is biased so it wins when the operation becomes ready at the
+/// same time, preventing new RPC or row-delivery work after teardown starts.
+pub async fn await_or_cancel<F>(cancellation: &CancellationToken, future: F) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => None,
+        output = future => Some(output),
+    }
+}
+
+/// Send a row unless cancellation or receiver closure wins first.
+pub async fn send_or_cancel<T>(
+    cancellation: &CancellationToken,
+    tx: &tokio::sync::mpsc::Sender<T>,
+    value: T,
+) -> bool {
+    matches!(
+        await_or_cancel(cancellation, tx.send(value)).await,
+        Some(Ok(()))
+    )
+}
+
 /// Run partition jobs without allocating a Tokio task for every returned partition.
 ///
-/// At most `max_concurrency` tasks exist at once. The first error stops new work,
-/// aborts in-flight tasks, and drains them before returning.
+/// At most `max_concurrency` tasks exist at once. The first error or cancellation
+/// stops new work, aborts in-flight tasks, and drains them before returning.
 pub async fn run_bounded_partitions<I, T, F, Fut>(
     partitions: I,
     max_concurrency: usize,
+    cancellation: CancellationToken,
     mut run: F,
 ) -> Result<(), SpannerError>
 where
     I: IntoIterator<Item = T>,
     I::IntoIter: Send,
     T: Send + 'static,
-    F: FnMut(T) -> Fut + Send,
+    F: FnMut(T, CancellationToken) -> Fut + Send,
     Fut: std::future::Future<Output = Result<(), SpannerError>> + Send + 'static,
 {
     let mut partitions = partitions.into_iter();
+    if cancellation.is_cancelled() {
+        return Ok(());
+    }
     if max_concurrency == 0 {
         return if partitions.next().is_none() {
             Ok(())
@@ -96,10 +128,21 @@ where
         let Some(partition) = partitions.next() else {
             break;
         };
-        join_set.spawn(run(partition));
+        join_set.spawn(run(partition, cancellation.clone()));
     }
 
-    while let Some(joined) = join_set.join_next().await {
+    loop {
+        let joined = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                join_set.shutdown().await;
+                return Ok(());
+            }
+            joined = join_set.join_next() => joined,
+        };
+        let Some(joined) = joined else {
+            return Ok(());
+        };
         let result = match joined {
             Ok(result) => result,
             Err(error) if error.is_cancelled() => Ok(()),
@@ -109,17 +152,18 @@ where
         };
 
         if let Err(error) = result {
-            join_set.abort_all();
-            while join_set.join_next().await.is_some() {}
+            join_set.shutdown().await;
             return Err(error);
         }
 
+        if cancellation.is_cancelled() {
+            join_set.shutdown().await;
+            return Ok(());
+        }
         if let Some(partition) = partitions.next() {
-            join_set.spawn(run(partition));
+            join_set.spawn(run(partition, cancellation.clone()));
         }
     }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -127,6 +171,8 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::task::Poll;
+    use std::time::Duration;
     use tokio::sync::oneshot;
 
     struct DropSignal(Option<oneshot::Sender<()>>);
@@ -158,29 +204,77 @@ mod tests {
         assert!(partition_worker_limit(10, Some(2)) <= 2);
     }
 
+    #[tokio::test]
+    async fn pending_operation_stops_after_cancellation() {
+        let cancellation = CancellationToken::new();
+        let wait_cancellation = cancellation.clone();
+        let (polled_tx, polled_rx) = oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            let mut polled_tx = Some(polled_tx);
+            await_or_cancel(
+                &wait_cancellation,
+                std::future::poll_fn(move |_context| {
+                    if let Some(sender) = polled_tx.take() {
+                        let _ = sender.send(());
+                    }
+                    Poll::<()>::Pending
+                }),
+            )
+            .await
+        });
+
+        polled_rx.await.expect("operation future was not polled");
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("operation did not stop after cancellation")
+            .expect("operation task failed");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancellation_wins_over_a_ready_send() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+        assert!(!send_or_cancel(&cancellation, &tx, 1).await);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn cancelling_bounded_runner_aborts_remaining_tasks() {
+    async fn cancelling_bounded_runner_quiesces_remaining_tasks() {
         let (started_tx, started_rx) = oneshot::channel();
         let (dropped_tx, dropped_rx) = oneshot::channel();
         let started_tx = Arc::new(std::sync::Mutex::new(Some(started_tx)));
         let dropped_tx = Arc::new(std::sync::Mutex::new(Some(dropped_tx)));
-        let outer = tokio::spawn(run_bounded_partitions([()], 1, move |_| {
-            let started_tx = started_tx.clone();
-            let dropped_tx = dropped_tx.clone();
-            async move {
-                let _drop_signal = DropSignal(dropped_tx.lock().unwrap().take());
-                if let Some(sender) = started_tx.lock().unwrap().take() {
-                    let _ = sender.send(());
+        let cancellation = CancellationToken::new();
+        let runner_cancellation = cancellation.clone();
+        let outer = tokio::spawn(run_bounded_partitions(
+            [()],
+            1,
+            runner_cancellation,
+            move |_, _| {
+                let started_tx = started_tx.clone();
+                let dropped_tx = dropped_tx.clone();
+                async move {
+                    let _drop_signal = DropSignal(dropped_tx.lock().unwrap().take());
+                    if let Some(sender) = started_tx.lock().unwrap().take() {
+                        let _ = sender.send(());
+                    }
+                    std::future::pending::<Result<(), SpannerError>>().await
                 }
-                std::future::pending::<Result<(), SpannerError>>().await
-            }
-        }));
+            },
+        ));
         started_rx.await.expect("partition task did not start");
-        outer.abort();
-        assert!(outer.await.unwrap_err().is_cancelled());
-        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+        cancellation.cancel();
+        outer.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
             .await
-            .expect("dropping the outer task did not abort its JoinSet")
+            .expect("timed out waiting for the cancelled partition task to drain")
             .expect("partition task drop signal was not delivered");
     }
 
@@ -190,11 +284,11 @@ mod tests {
         let max_observed = Arc::new(AtomicUsize::new(0));
         let completed = Arc::new(AtomicUsize::new(0));
 
-        run_bounded_partitions(0..20, 2, {
+        run_bounded_partitions(0..20, 2, CancellationToken::new(), {
             let active = active.clone();
             let max_observed = max_observed.clone();
             let completed = completed.clone();
-            move |_| {
+            move |_, _| {
                 let active = active.clone();
                 let max_observed = max_observed.clone();
                 let completed = completed.clone();
@@ -222,11 +316,11 @@ mod tests {
         let dropped_tx = Arc::new(std::sync::Mutex::new(Some(dropped_tx)));
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
 
-        let result = run_bounded_partitions(0..100, 2, {
+        let result = run_bounded_partitions(0..100, 2, CancellationToken::new(), {
             let started = started.clone();
             let dropped_tx = dropped_tx.clone();
             let barrier = barrier.clone();
-            move |partition| {
+            move |partition, _| {
                 let started = started.clone();
                 let dropped_tx = dropped_tx.clone();
                 let barrier = barrier.clone();

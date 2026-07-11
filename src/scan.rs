@@ -10,6 +10,7 @@ use google_cloud_spanner::model::PartitionOptions;
 use google_cloud_spanner::read::ReadRequest;
 use google_cloud_spanner::result::Row;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use google_cloud_spanner_admin_database_v1::model::DatabaseDialect;
 
@@ -137,14 +138,51 @@ impl VTab for SpannerScanVTab {
         let timestamp_bound = bind_data.timestamp_bound.clone();
         let priority = bind_data.priority.clone();
 
-        let streaming = streaming::StreamingState::spawn(vector_size, move |tx| async move {
-            let rows_delivered = Arc::new(AtomicBool::new(false));
-            let client = client::get_or_create_client(&database, endpoint.as_deref()).await?;
+        let streaming = streaming::StreamingState::spawn(
+            vector_size,
+            move |tx, cancellation| async move {
+                let rows_delivered = Arc::new(AtomicBool::new(false));
+                let client = tokio::select! {
+                    _ = cancellation.cancelled() => return Ok(()),
+                    client = client::get_or_create_client(&database, endpoint.as_deref()) => client?,
+                };
 
-            let col_refs: Vec<&str> = column_names.iter().map(|s| s.as_str()).collect();
+                let col_refs: Vec<&str> = column_names.iter().map(|s| s.as_str()).collect();
 
-            if parallelism_mode.uses_partitioned_api() {
-                match stream_partitioned_read(
+                if parallelism_mode.uses_partitioned_api() {
+                    match stream_partitioned_read(
+                        &client,
+                        &tx,
+                        &table,
+                        &col_refs,
+                        &index,
+                        timestamp_bound.as_ref(),
+                        priority.clone(),
+                        use_data_boost,
+                        max_parallelism,
+                        rows_delivered.clone(),
+                        cancellation.clone(),
+                    )
+                    .await
+                    {
+                        Ok(()) => return Ok(()),
+                        Err(e)
+                            if should_fallback_after_partition_error(
+                                parallelism_mode,
+                                rows_delivered.load(Ordering::SeqCst),
+                                &cancellation,
+                            ) =>
+                        {
+                            eprintln!("[duckdb-spanner] Partitioned read failed: {e}, falling back to single read");
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+
+                if cancellation.is_cancelled() {
+                    return Ok(());
+                }
+                stream_single_read(
                     &client,
                     &tx,
                     &table,
@@ -152,34 +190,11 @@ impl VTab for SpannerScanVTab {
                     &index,
                     timestamp_bound.as_ref(),
                     priority.clone(),
-                    use_data_boost,
-                    max_parallelism,
-                    rows_delivered.clone(),
+                    &cancellation,
                 )
                 .await
-                {
-                    Ok(()) => return Ok(()),
-                    Err(e)
-                        if parallelism_mode
-                            .allows_fallback(rows_delivered.load(Ordering::SeqCst)) =>
-                    {
-                        eprintln!("[duckdb-spanner] Partitioned read failed: {e}, falling back to single read");
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
-
-            stream_single_read(
-                &client,
-                &tx,
-                &table,
-                &col_refs,
-                &index,
-                timestamp_bound.as_ref(),
-                priority.clone(),
-            )
-            .await
-        })?;
+            },
+        )?;
 
         init.set_max_threads(1);
 
@@ -314,22 +329,27 @@ async fn stream_partitioned_read(
     data_boost_enabled: bool,
     max_parallelism: Option<i64>,
     rows_delivered: Arc<AtomicBool>,
+    cancellation: CancellationToken,
 ) -> Result<(), SpannerError> {
     let mut batch_tx = client.batch_read_only_transaction();
     if let Some(tb) = timestamp_bound {
         batch_tx = batch_tx.set_timestamp_bound(tb.to_timestamp_bound());
     }
-    let batch_tx = batch_tx.build().await?;
+    let batch_tx = tokio::select! {
+        _ = cancellation.cancelled() => return Ok(()),
+        batch_tx = batch_tx.build() => batch_tx?,
+    };
 
     let read = build_read_request(table, column_names, index, priority);
-    let partitions = batch_tx
-        .partition_read(
+    let partitions = tokio::select! {
+        _ = cancellation.cancelled() => return Ok(()),
+        partitions = batch_tx.partition_read(
             read,
             max_parallelism
                 .map(|max| PartitionOptions::default().set_max_partitions(max))
                 .unwrap_or_default(),
-        )
-        .await?;
+        ) => partitions?,
+    };
 
     // Execute partitions concurrently, each with its own session from the pool.
     // Partitions embed the transaction selector, so any session can execute them
@@ -338,24 +358,39 @@ async fn stream_partitioned_read(
     let permits = runtime::partition_worker_limit(partitions.len(), max_parallelism);
     let tx = tx.clone();
     let client = client.clone();
-    runtime::run_bounded_partitions(partitions, permits, move |partition| {
-        let tx = tx.clone();
-        let client = client.clone();
-        let rows_delivered = rows_delivered.clone();
-        async move {
-            let mut iter = partition
-                .set_data_boost(data_boost_enabled)
-                .execute(&client)
-                .await?;
-            while let Some(row) = iter.next().await.transpose()? {
-                rows_delivered.store(true, Ordering::SeqCst);
-                if tx.send(Ok(row)).await.is_err() {
-                    return Ok(()); // receiver dropped
+    runtime::run_bounded_partitions(
+        partitions,
+        permits,
+        cancellation,
+        move |partition, cancellation| {
+            let tx = tx.clone();
+            let client = client.clone();
+            let rows_delivered = rows_delivered.clone();
+            async move {
+                let partition = partition.set_data_boost(data_boost_enabled);
+                let Some(iter) =
+                    runtime::await_or_cancel(&cancellation, partition.execute(&client)).await
+                else {
+                    return Ok(());
+                };
+                let mut iter = iter?;
+                loop {
+                    let Some(next) = runtime::await_or_cancel(&cancellation, iter.next()).await
+                    else {
+                        return Ok(());
+                    };
+                    let Some(row) = next.transpose()? else {
+                        break;
+                    };
+                    if !runtime::send_or_cancel(&cancellation, &tx, Ok(row)).await {
+                        return Ok(()); // cancelled or receiver dropped
+                    }
+                    rows_delivered.store(true, Ordering::SeqCst);
                 }
+                Ok::<(), SpannerError>(())
             }
-            Ok::<(), SpannerError>(())
-        }
-    })
+        },
+    )
     .await
 
     // Invariant: partition tasks must be fully terminated before this function
@@ -364,10 +399,11 @@ async fn stream_partitioned_read(
     // the streamer. The bounded runner drains (aborts + awaits) every task on
     // error before returning; the caller reads `rows_delivered` only after we
     // return, so an aborted straggler can no longer emit a row past the fallback
-    // decision. If StreamingState drops this outer producer task, Tokio drops
-    // this JoinSet and aborts every remaining partition task.
+    // decision. StreamingState cancellation makes the bounded runner shut down
+    // and await every remaining partition task before this producer completes.
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_single_read(
     client: &DatabaseClient,
     tx: &mpsc::Sender<Result<Row, SpannerError>>,
@@ -376,22 +412,44 @@ async fn stream_single_read(
     index: &str,
     timestamp_bound: Option<&crate::bind_utils::TimestampBoundConfig>,
     priority: Option<Priority>,
+    cancellation: &CancellationToken,
 ) -> Result<(), SpannerError> {
     let mut spanner_tx = client.single_use();
     if let Some(tb) = timestamp_bound {
         spanner_tx = spanner_tx.set_timestamp_bound(tb.to_timestamp_bound());
     }
+    if cancellation.is_cancelled() {
+        return Ok(());
+    }
     let spanner_tx = spanner_tx.build();
 
     let read = build_read_request(table, column_names, index, priority);
-    let mut iter = spanner_tx.execute_read(read).await?;
+    let Some(iter) = runtime::await_or_cancel(cancellation, spanner_tx.execute_read(read)).await
+    else {
+        return Ok(());
+    };
+    let mut iter = iter?;
 
-    while let Some(row) = iter.next().await.transpose()? {
-        if tx.send(Ok(row)).await.is_err() {
-            return Ok(()); // receiver dropped
+    loop {
+        let Some(next) = runtime::await_or_cancel(cancellation, iter.next()).await else {
+            return Ok(());
+        };
+        let Some(row) = next.transpose()? else {
+            break;
+        };
+        if !runtime::send_or_cancel(cancellation, tx, Ok(row)).await {
+            return Ok(()); // cancelled or receiver dropped
         }
     }
     Ok(())
+}
+
+fn should_fallback_after_partition_error(
+    parallelism_mode: crate::bind_utils::ParallelismMode,
+    rows_delivered: bool,
+    cancellation: &CancellationToken,
+) -> bool {
+    !cancellation.is_cancelled() && parallelism_mode.allows_fallback(rows_delivered)
 }
 
 fn build_read_request(
@@ -447,4 +505,26 @@ fn write_projected_rows(
 
     output.set_len(rows.len());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancellation_prevents_auto_read_fallback() {
+        let cancellation = CancellationToken::new();
+        assert!(should_fallback_after_partition_error(
+            crate::bind_utils::ParallelismMode::Auto,
+            false,
+            &cancellation,
+        ));
+
+        cancellation.cancel();
+        assert!(!should_fallback_after_partition_error(
+            crate::bind_utils::ParallelismMode::Auto,
+            false,
+            &cancellation,
+        ));
+    }
 }
