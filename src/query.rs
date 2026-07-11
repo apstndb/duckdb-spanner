@@ -76,7 +76,13 @@ impl VTab for SpannerQueryVTab {
 
         // Register output columns with DuckDB
         for col in &columns {
-            let logical_type = types::spanner_type_to_logical(&col.spanner_type);
+            let logical_type =
+                types::spanner_type_to_logical(&col.spanner_type).map_err(|error| {
+                    SpannerError::Other(format!(
+                        "Invalid metadata for query result column {:?}: {error}",
+                        col.name
+                    ))
+                })?;
             bind.add_result_column(&col.name, logical_type);
         }
 

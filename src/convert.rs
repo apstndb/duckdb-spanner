@@ -251,7 +251,11 @@ impl PreflightState {
                     fields: Self::for_struct_type(struct_type, context)?,
                 })
             }
-            _ => Ok(Self::Scalar),
+            code if is_supported_scalar_type(code) => Ok(Self::Scalar),
+            other => Err(SpannerError::Conversion(format!(
+                "unsupported Spanner TypeCode {other:?} ({})",
+                context()
+            ))),
         }
     }
 
@@ -380,6 +384,8 @@ fn preflight_struct_value(
         .try_as_list()
         .ok_or_else(|| type_mismatch_error("STRUCT (List)", value.kind(), &context()))?;
 
+    validate_struct_value_arity(values.len(), struct_type.fields.len(), context)?;
+
     debug_assert_eq!(field_states.len(), struct_type.fields.len());
     for (field_idx, (field, field_state)) in struct_type
         .fields
@@ -397,11 +403,27 @@ fn preflight_struct_value(
         let field_type = Type::from((**field_type).clone());
         let field_context = || format!("{}, field '{}'", context(), field.name);
 
-        // Positional STRUCT decoding historically treats missing fields as NULL
-        // and ignores trailing values, so only declared, present fields recurse.
-        if let Some(field_value) = values.get(field_idx) {
-            preflight_value(field_value, &field_type, field_state, &field_context)?;
-        }
+        let field_value = values.get(field_idx).ok_or_else(|| {
+            SpannerError::Conversion(format!(
+                "STRUCT field value is missing after arity validation ({})",
+                field_context()
+            ))
+        })?;
+        preflight_value(field_value, &field_type, field_state, &field_context)?;
+    }
+    Ok(())
+}
+
+fn validate_struct_value_arity(
+    value_count: usize,
+    field_count: usize,
+    context: &dyn Fn() -> String,
+) -> Result<(), SpannerError> {
+    if value_count != field_count {
+        return Err(SpannerError::Conversion(format!(
+            "STRUCT value has {value_count} values for {field_count} fields ({})",
+            context()
+        )));
     }
     Ok(())
 }
@@ -803,6 +825,7 @@ fn write_raw_struct_value_prevalidated(
     let values = value
         .try_as_list()
         .ok_or_else(|| type_mismatch_error("STRUCT (List)", value.kind(), &context()))?;
+    validate_struct_value_arity(values.len(), struct_type.fields.len(), context)?;
 
     for (field_idx, field) in struct_type.fields.iter().enumerate() {
         let field_type = field
@@ -813,58 +836,51 @@ fn write_raw_struct_value_prevalidated(
         let field_type_code = field_type.code();
         let field_context = || format!("{}, field '{}'", context(), field.name);
 
-        let field_value = values.get(field_idx);
+        let field_value = values.get(field_idx).ok_or_else(|| {
+            SpannerError::Conversion(format!(
+                "STRUCT field value is missing after arity validation ({})",
+                field_context()
+            ))
+        })?;
 
         match field_type_code {
             TypeCode::Struct => {
                 let mut child = struct_vector.struct_vector_child(field_idx);
-                if let Some(val) = field_value {
-                    let inner_struct_type = field_type.struct_type().ok_or_else(|| {
-                        SpannerError::Conversion("Nested STRUCT without struct_type".to_string())
-                    })?;
-                    write_raw_struct_value_prevalidated(
-                        &mut child,
-                        row_capacity,
-                        row_idx,
-                        val,
-                        inner_struct_type,
-                        &field_context,
-                    )?;
-                } else {
-                    child.set_null(row_idx);
-                }
+                let inner_struct_type = field_type.struct_type().ok_or_else(|| {
+                    SpannerError::Conversion("Nested STRUCT without struct_type".to_string())
+                })?;
+                write_raw_struct_value_prevalidated(
+                    &mut child,
+                    row_capacity,
+                    row_idx,
+                    field_value,
+                    inner_struct_type,
+                    &field_context,
+                )?;
             }
             TypeCode::Array => {
                 let mut child = struct_vector.list_vector_child(field_idx);
-                if let Some(val) = field_value {
-                    let elem_type = field_type.array_element_type().ok_or_else(|| {
-                        SpannerError::Conversion("ARRAY without element type".to_string())
-                    })?;
-                    write_raw_list_value_prevalidated(
-                        &mut child,
-                        row_capacity,
-                        row_idx,
-                        val,
-                        &elem_type,
-                        &field_context,
-                    )?;
-                } else {
-                    child.set_null(row_idx);
-                }
+                let elem_type = field_type.array_element_type().ok_or_else(|| {
+                    SpannerError::Conversion("ARRAY without element type".to_string())
+                })?;
+                write_raw_list_value_prevalidated(
+                    &mut child,
+                    row_capacity,
+                    row_idx,
+                    field_value,
+                    &elem_type,
+                    &field_context,
+                )?;
             }
             _ => {
                 let mut child = struct_vector.child(field_idx, row_capacity);
-                if let Some(val) = field_value {
-                    write_raw_scalar_to_flat(
-                        &mut child,
-                        row_idx,
-                        val,
-                        &field_type,
-                        &field_context,
-                    )?;
-                } else {
-                    child.set_null(row_idx);
-                }
+                write_raw_scalar_to_flat(
+                    &mut child,
+                    row_idx,
+                    field_value,
+                    &field_type,
+                    &field_context,
+                )?;
             }
         }
     }
@@ -1026,16 +1042,44 @@ enum PreparedScalar<'a> {
     Interval(DuckDBInterval),
 }
 
+fn is_supported_scalar_type(type_code: TypeCode) -> bool {
+    matches!(
+        type_code,
+        TypeCode::Bool
+            | TypeCode::Int64
+            | TypeCode::Float32
+            | TypeCode::Float64
+            | TypeCode::Numeric
+            | TypeCode::String
+            | TypeCode::Json
+            | TypeCode::Bytes
+            | TypeCode::Proto
+            | TypeCode::Date
+            | TypeCode::Timestamp
+            | TypeCode::Enum
+            | TypeCode::Uuid
+            | TypeCode::Interval
+    )
+}
+
 fn prepare_scalar_value<'a>(
     value: &'a SpannerValue,
     spanner_type: &Type,
     context: &dyn Fn() -> String,
 ) -> Result<PreparedScalar<'a>, SpannerError> {
+    let type_code = spanner_type.code();
+    if !is_supported_scalar_type(type_code) {
+        return Err(SpannerError::Conversion(format!(
+            "unsupported Spanner TypeCode {type_code:?} ({})",
+            context()
+        )));
+    }
+
     if value.kind() == Kind::Null {
         return Ok(PreparedScalar::Null);
     }
 
-    match spanner_type.code() {
+    match type_code {
         TypeCode::Bool => value
             .try_as_bool()
             .map(PreparedScalar::Bool)
@@ -1155,17 +1199,10 @@ fn prepare_scalar_value<'a>(
             })?;
             Ok(PreparedScalar::Interval(parse_iso8601_interval(value)?))
         }
-        _ => {
-            let value = value.try_as_string().ok_or_else(|| {
-                type_mismatch_error(
-                    "STRING (String, fallback for unrecognized type code)",
-                    value.kind(),
-                    &context(),
-                )
-            })?;
-            checked_duckdb_index(value.len(), "string length", context)?;
-            Ok(PreparedScalar::String(value))
-        }
+        other => Err(SpannerError::Conversion(format!(
+            "unsupported Spanner TypeCode {other:?} ({})",
+            context()
+        ))),
     }
 }
 
@@ -2044,6 +2081,40 @@ mod tests {
     }
 
     #[test]
+    fn unknown_scalar_type_errors_even_for_null_values() {
+        let unknown_type = scalar_type(TypeCode::Unknown(99));
+        let preflight_error = match PreflightState::for_type(&unknown_type, &|| {
+            "column 'future_value'".to_string()
+        }) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("unknown result type passed conversion preflight"),
+        };
+        assert!(preflight_error.contains("Unknown(99)"), "{preflight_error}");
+
+        for kind in [
+            ProtoKind::StringValue("value".to_string()),
+            ProtoKind::NullValue(0),
+        ] {
+            let (_chunk, result) = write_scalar_one(
+                LogicalTypeId::Varchar.into(),
+                unknown_type.clone(),
+                value_of(kind),
+                "future_value",
+            );
+            match result {
+                Err(SpannerError::Conversion(message)) => {
+                    assert!(message.contains("Unknown(99)"), "message: {message}");
+                    assert!(
+                        message.contains("column 'future_value', row 0"),
+                        "message: {message}"
+                    );
+                }
+                other => panic!("expected Conversion error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn scalar_absent_kind_writes_null_not_error() {
         // `kind: None` (absent) is handled as NULL by write_raw_scalar_to_flat.
         let (chunk, result) = write_scalar_one(
@@ -2211,6 +2282,50 @@ mod tests {
                 assert!(msg.contains("row 0"), "message: {msg}");
             }
             other => panic!("expected Conversion error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn struct_value_arity_mismatch_returns_conversion_error() {
+        let spanner_type = struct_type_proto(vec![
+            ("first", scalar_type(TypeCode::Int64)),
+            ("second", scalar_type(TypeCode::Int64)),
+        ]);
+
+        for values in [
+            vec![prost_types::Value {
+                kind: Some(ProtoKind::StringValue("1".to_string())),
+            }],
+            vec![
+                prost_types::Value {
+                    kind: Some(ProtoKind::StringValue("1".to_string())),
+                },
+                prost_types::Value {
+                    kind: Some(ProtoKind::StringValue("2".to_string())),
+                },
+                prost_types::Value {
+                    kind: Some(ProtoKind::StringValue("3".to_string())),
+                },
+            ],
+        ] {
+            let struct_value = value_of(ProtoKind::ListValue(prost_types::ListValue { values }));
+            let logical = LogicalTypeHandle::struct_type(&[
+                ("first", LogicalTypeId::Bigint.into()),
+                ("second", LogicalTypeId::Bigint.into()),
+            ]);
+            let (_chunk, result) =
+                write_struct_one(logical, spanner_type.clone(), struct_value, "payload");
+            match result {
+                Err(SpannerError::Conversion(message)) => {
+                    assert!(message.contains("STRUCT value has"), "message: {message}");
+                    assert!(message.contains("for 2 fields"), "message: {message}");
+                    assert!(
+                        message.contains("column 'payload', row 0"),
+                        "message: {message}"
+                    );
+                }
+                other => panic!("expected Conversion error, got {other:?}"),
+            }
         }
     }
 
