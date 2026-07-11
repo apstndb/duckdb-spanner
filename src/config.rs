@@ -10,6 +10,8 @@ use std::ptr;
 use duckdb::ffi;
 use duckdb::vtab::BindInfo;
 
+use crate::RegistrationError;
+
 macro_rules! owned_duckdb_handle {
     ($name:ident, $raw:ty, $destroy:path) => {
         struct $name($raw);
@@ -75,36 +77,82 @@ impl Drop for OwnedDuckDbString {
     }
 }
 
+pub(crate) struct PreparedConfigOptions(Vec<(String, OwnedDuckDbConfigOption)>);
+
+impl PreparedConfigOptions {
+    /// # Safety
+    /// `con` must be a valid `duckdb_connection`.
+    pub(crate) unsafe fn register(
+        self,
+        con: ffi::duckdb_connection,
+    ) -> Result<(), RegistrationError> {
+        for (name, option) in self.0 {
+            let rc = if crate::should_fail_status("register config option") {
+                ffi::DuckDBError
+            } else {
+                unsafe { ffi::duckdb_register_config_option(con, option.as_raw()) }
+            };
+            if rc != ffi::DuckDBSuccess {
+                return Err(RegistrationError::new(
+                    "register config option",
+                    name,
+                    format!("DuckDB returned status {rc}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(crate) unsafe fn prepare_config_options() -> Result<PreparedConfigOptions, RegistrationError> {
+    let specifications = [
+        (
+            "spanner_project",
+            "Default Google Cloud project ID for Spanner",
+        ),
+        ("spanner_instance", "Default Spanner instance ID"),
+        ("spanner_database", "Default Spanner database ID"),
+        (
+            "spanner_database_path",
+            "Default Spanner database resource path (projects/P/instances/I/databases/D)",
+        ),
+        ("spanner_endpoint", "Default Spanner gRPC endpoint"),
+        (
+            "spanner_admin_endpoint",
+            "Default Spanner admin REST endpoint",
+        ),
+    ];
+    let mut options = Vec::with_capacity(specifications.len());
+    for (name, description) in specifications {
+        options.push((name.to_owned(), unsafe {
+            prepare_varchar_option(name, description)?
+        }));
+    }
+    Ok(PreparedConfigOptions(options))
+}
+
 /// Register all spanner_* config options on the given connection.
 ///
 /// # Safety
 /// `con` must be a valid `duckdb_connection`.
-pub unsafe fn register_config_options(con: ffi::duckdb_connection) {
-    register_varchar_option(
-        con,
-        "spanner_project",
-        "Default Google Cloud project ID for Spanner",
-    );
-    register_varchar_option(con, "spanner_instance", "Default Spanner instance ID");
-    register_varchar_option(con, "spanner_database", "Default Spanner database ID");
-    register_varchar_option(
-        con,
-        "spanner_database_path",
-        "Default Spanner database resource path (projects/P/instances/I/databases/D)",
-    );
-    register_varchar_option(con, "spanner_endpoint", "Default Spanner gRPC endpoint");
-    register_varchar_option(
-        con,
-        "spanner_admin_endpoint",
-        "Default Spanner admin REST endpoint",
-    );
+#[cfg(test)]
+pub(crate) unsafe fn register_config_options(
+    con: ffi::duckdb_connection,
+) -> Result<(), RegistrationError> {
+    unsafe { prepare_config_options()?.register(con) }
 }
 
-unsafe fn register_varchar_option(con: ffi::duckdb_connection, name: &str, description: &str) {
+unsafe fn prepare_varchar_option(
+    name: &str,
+    description: &str,
+) -> Result<OwnedDuckDbConfigOption, RegistrationError> {
     let option = OwnedDuckDbConfigOption::from_raw(ffi::duckdb_create_config_option());
-    if option.as_raw().is_null() {
-        eprintln!("[duckdb-spanner] Failed to allocate config option: {name}");
-        return;
+    if option.as_raw().is_null() || crate::should_fail_allocation("config option") {
+        return Err(RegistrationError::new(
+            "allocate config option",
+            name,
+            "duckdb_create_config_option returned null",
+        ));
     }
 
     let c_name = CString::new(name).unwrap();
@@ -115,9 +163,12 @@ unsafe fn register_varchar_option(con: ffi::duckdb_connection, name: &str, descr
         let varchar_type = OwnedDuckDbLogicalType::from_raw(ffi::duckdb_create_logical_type(
             ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
         ));
-        if varchar_type.as_raw().is_null() {
-            eprintln!("[duckdb-spanner] Failed to allocate config option type: {name}");
-            return;
+        if varchar_type.as_raw().is_null() || crate::should_fail_allocation("config option type") {
+            return Err(RegistrationError::new(
+                "allocate config option type",
+                name,
+                "duckdb_create_logical_type returned null",
+            ));
         }
         ffi::duckdb_config_option_set_type(option.as_raw(), varchar_type.as_raw());
     }
@@ -126,9 +177,13 @@ unsafe fn register_varchar_option(con: ffi::duckdb_connection, name: &str, descr
     {
         let default_val =
             OwnedDuckDbValue::from_raw(ffi::duckdb_create_varchar_length(c"".as_ptr(), 0));
-        if default_val.as_raw().is_null() {
-            eprintln!("[duckdb-spanner] Failed to allocate config option default: {name}");
-            return;
+        if default_val.as_raw().is_null() || crate::should_fail_allocation("config option default")
+        {
+            return Err(RegistrationError::new(
+                "allocate config option default",
+                name,
+                "duckdb_create_varchar_length returned null",
+            ));
         }
         ffi::duckdb_config_option_set_default_value(option.as_raw(), default_val.as_raw());
     }
@@ -146,10 +201,7 @@ unsafe fn register_varchar_option(con: ffi::duckdb_connection, name: &str, descr
     // AddExtensionOption and never takes or deletes the CConfigOption. The C API
     // header also requires callers to destroy every duckdb_create_config_option
     // result, so keep the guard armed on both success and failure.
-    let rc = ffi::duckdb_register_config_option(con, option.as_raw());
-    if rc != ffi::DuckDBSuccess {
-        eprintln!("[duckdb-spanner] Failed to register config option: {name}");
-    }
+    Ok(option)
 }
 
 /// Read a spanner config option from a raw client context.

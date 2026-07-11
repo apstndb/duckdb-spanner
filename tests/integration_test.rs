@@ -1,11 +1,10 @@
 mod spanemuboost;
 
+use std::ops::Deref;
 use std::sync::{Arc, OnceLock};
 
 use duckdb::Connection;
-use duckdb_spanner::{
-    register_c_api_extensions, register_copy_function, register_extension_functions,
-};
+use duckdb_spanner::register_spanner_extension;
 use google_cloud_auth::credentials::anonymous::Builder as Anonymous;
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use google_cloud_spanner::result::Row as SpannerRow;
@@ -226,35 +225,82 @@ fn exec_spanner_on(db: &spanemuboost::SpanEmuDatabase, sql: &str) -> Vec<Spanner
 
 // DuckDB extension helpers
 
-/// Open an in-memory DuckDB connection with the same registration path as the
-/// loadable extension: C API pieces (config, copy, replacement scan) plus Rust
-/// VTabs, scalars, and SQL table macros.
-fn create_duckdb_connection() -> Connection {
+struct OwnedTestDatabase(duckdb::ffi::duckdb_database);
+
+impl Drop for OwnedTestDatabase {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { duckdb::ffi::duckdb_close(&mut self.0) };
+        }
+    }
+}
+
+struct OwnedTestConnection(duckdb::ffi::duckdb_connection);
+
+impl Drop for OwnedTestConnection {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { duckdb::ffi::duckdb_disconnect(&mut self.0) };
+        }
+    }
+}
+
+struct ExtensionTestConnection {
+    connection: Option<Connection>,
+    raw_connection: Option<OwnedTestConnection>,
+    database: Option<OwnedTestDatabase>,
+}
+
+impl ExtensionTestConnection {
+    fn raw_connection(&self) -> duckdb::ffi::duckdb_connection {
+        self.raw_connection.as_ref().unwrap().0
+    }
+}
+
+impl Deref for ExtensionTestConnection {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        self.connection.as_ref().unwrap()
+    }
+}
+
+impl Drop for ExtensionTestConnection {
+    fn drop(&mut self) {
+        drop(self.connection.take());
+        drop(self.raw_connection.take());
+        drop(self.database.take());
+    }
+}
+
+/// Open an in-memory DuckDB database with the same one-shot registration path
+/// as the loadable extension.
+fn create_duckdb_connection() -> ExtensionTestConnection {
     let _ = get_gsql_db(); // ensure emulator + database are ready
     open_extension_connection()
 }
 
-fn open_extension_connection() -> Connection {
+fn open_extension_connection() -> ExtensionTestConnection {
     unsafe {
         let mut db: duckdb::ffi::duckdb_database = std::ptr::null_mut();
-        let mut c_err: *mut std::os::raw::c_char = std::ptr::null_mut();
-        let r = duckdb::ffi::duckdb_open_ext(
-            c":memory:".as_ptr(),
-            &mut db,
-            std::ptr::null_mut(),
-            &mut c_err,
-        );
-        assert_eq!(r, duckdb::ffi::DuckDBSuccess, "duckdb_open_ext failed");
+        let status = duckdb::ffi::duckdb_open(c":memory:".as_ptr(), &mut db);
+        let database = OwnedTestDatabase(db);
+        assert_eq!(status, duckdb::ffi::DuckDBSuccess, "duckdb_open failed");
+        assert!(!database.0.is_null());
 
         let mut raw_con: duckdb::ffi::duckdb_connection = std::ptr::null_mut();
-        let rc = duckdb::ffi::duckdb_connect(db, &mut raw_con);
-        assert_eq!(rc, duckdb::ffi::DuckDBSuccess, "duckdb_connect failed");
-        register_c_api_extensions(db, raw_con);
-        duckdb::ffi::duckdb_disconnect(&mut raw_con);
+        let status = duckdb::ffi::duckdb_connect(db, &mut raw_con);
+        let raw_connection = OwnedTestConnection(raw_con);
+        assert_eq!(status, duckdb::ffi::DuckDBSuccess, "duckdb_connect failed");
+        assert!(!raw_connection.0.is_null());
 
         let conn = Connection::open_from_raw(db).unwrap();
-        register_extension_functions(&conn).unwrap();
-        conn
+        register_spanner_extension(db, raw_con, &conn).unwrap();
+        ExtensionTestConnection {
+            connection: Some(conn),
+            raw_connection: Some(raw_connection),
+            database: Some(database),
+        }
     }
 }
 
@@ -1529,7 +1575,7 @@ fn pg_vtab_scan_sql_with(table: &str, extra_params: &str) -> String {
     )
 }
 
-fn create_pg_duckdb_connection() -> Connection {
+fn create_pg_duckdb_connection() -> ExtensionTestConnection {
     let _ = get_pg_db(); // ensure emulator + PG database are ready
     open_extension_connection()
 }
@@ -1697,9 +1743,8 @@ fn test_pg_vtab_scan_exact_staleness() {
 // COPY TO tests
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// COPY TO tests use the unified extension registration path (copy function
-/// is registered via `register_c_api_extensions`).
-fn create_duckdb_connection_with_copy() -> Connection {
+/// COPY TO tests use the unified extension registration path.
+fn create_duckdb_connection_with_copy() -> ExtensionTestConnection {
     let _ = get_gsql_db();
     open_extension_connection()
 }
@@ -1713,15 +1758,8 @@ fn test_copy_to_registration() {
     // ADC / metadata-server waits. Omitting endpoint hangs CI runners that have
     // no credentials and try the default Spanner path indefinitely.
     unsafe {
-        let mut db: duckdb::ffi::duckdb_database = std::ptr::null_mut();
-        let r = duckdb::ffi::duckdb_open(c":memory:".as_ptr(), &mut db);
-        assert_eq!(r, duckdb::ffi::DuckDBSuccess);
-
-        let mut con: duckdb::ffi::duckdb_connection = std::ptr::null_mut();
-        let rc = duckdb::ffi::duckdb_connect(db, &mut con);
-        assert_eq!(rc, duckdb::ffi::DuckDBSuccess);
-
-        register_copy_function(con, false);
+        let connection = open_extension_connection();
+        let con = connection.raw_connection();
 
         // Try COPY with unreachable endpoint — should fail with Spanner connection
         // error, not crash or hang waiting for ADC.
@@ -1754,8 +1792,6 @@ fn test_copy_to_registration() {
             "unexpected COPY error: {err_str}"
         );
         duckdb::ffi::duckdb_destroy_result(&mut result);
-        duckdb::ffi::duckdb_disconnect(&mut con);
-        duckdb::ffi::duckdb_close(&mut db);
     }
 }
 
@@ -2133,7 +2169,7 @@ fn test_pg_ddl_operations() {
 // PostgreSQL dialect — COPY TO tests
 // ═══════════════════════════════════════════════════════════════════════════
 
-fn create_pg_duckdb_connection_with_copy() -> Connection {
+fn create_pg_duckdb_connection_with_copy() -> ExtensionTestConnection {
     let _ = get_pg_copy_db();
     open_extension_connection()
 }

@@ -32,6 +32,9 @@ brew install cargo-sweep
 
 - Extension initialization is intentionally manual rather than using `#[duckdb_entrypoint_c_api]`.
   The extension needs a raw `duckdb_connection` to register session config options and the `COPY TO ... FORMAT spanner` copy function, and duckdb-rs currently exposes those APIs only through `duckdb::ffi`.
+  Initialization preflights config, scalar, table-function, and macro names through `duckdb_settings()` and `duckdb_functions()`, prepares every native C API builder before mutation, then checks every registration status and reaches `Ready` only after all required stages complete. Config options are the first mutation and therefore form a preflight-visible retry barrier. COPY follows because DuckDB exposes no stable public COPY-function catalog lookup and permits duplicate COPY names; putting it after config guarantees that a failed attempt cannot leave COPY as the only residue. Loading this extension claims the global COPY format name `spanner`. DuckDB 1.5.4 silently replaces an existing handler with that name, and the stable C API cannot detect the collision; load order therefore determines ownership. A successful COPY registration status proves that this handler was installed, not that the name was previously unused. Scalars follow before table functions so a native registration failure cannot leave a higher-level SQL surface that appears usable. duckdb-rs does not expose separate prepare or unregister operations for table functions, so a table-function failure can still leave the C registrations and earlier table functions. SQL macros are installed as one rollback-capable transaction after their dependencies, and the replacement scan is last.
+  DuckDB exposes no stable public removal API or shared registration transaction for config, COPY, scalar, table-function, and replacement-scan registration. The macro transaction is the only stage this initializer can roll back. An unexpected later registration failure can therefore leave earlier native registrations in the database catalog. A fresh load attempt still fails deterministically because config registration precedes every later mutation and is found by preflight; function and macro residues are preflighted as additional defense. `duckdb_add_replacement_scan` returns no status and has no removal API, so initialization cannot verify or roll it back and installs it only after every status-returning stage succeeds.
+  Version 0.4.0 intentionally consolidates the Rust registration API as the breaking `register_spanner_extension(db, raw_con, &connection) -> Result<(), RegistrationError>`. The former public split-stage helpers are no longer exposed because calling them independently could bypass preflight and leave a misleading partial surface. Both supplied connections must be in autocommit mode; registration independently detects and rejects caller-owned transactions on `raw_con` and the Rust connection before any mutation.
 
 - DuckDB `VARIANT` is not used yet.
   Spanner JSON results currently map to DuckDB `VARCHAR` with the `JSON` alias.
@@ -618,7 +621,7 @@ cargo test
 
 ### Library-Mode Tests
 
-Rust integration tests call `register_c_api_extensions` (config, copy, scalars with null-input handling, replacement scan) and `register_extension_functions` (VTabs and SQL macros), mirroring the loadable extension init path.
+Rust integration tests call the one-shot `register_spanner_extension` orchestrator, matching the loadable initializer's preflight and stage ordering.
 
 ### Cleaning Stale Build Artifacts
 
