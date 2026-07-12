@@ -5,6 +5,8 @@ use duckdb::core::{LogicalTypeHandle, LogicalTypeId};
 use google_cloud_spanner::model;
 use google_cloud_spanner::types::{self as spanner_types, Type, TypeCode};
 
+use crate::error::SpannerError;
+
 static PG_NUMERIC_TYPE: LazyLock<Type> = LazyLock::new(spanner_types::pg_numeric);
 
 const MAX_TYPE_INPUT_BYTES: usize = 64 * 1024;
@@ -123,8 +125,8 @@ const GOOGLESQL_RESERVED_KEYWORDS: &[&str] = &[
 ];
 
 /// Convert a Spanner Type to a DuckDB LogicalTypeHandle.
-pub fn spanner_type_to_logical(spanner_type: &Type) -> LogicalTypeHandle {
-    match spanner_type.code() {
+pub fn spanner_type_to_logical(spanner_type: &Type) -> Result<LogicalTypeHandle, SpannerError> {
+    let logical_type = match spanner_type.code() {
         TypeCode::Bool => LogicalTypeHandle::from(LogicalTypeId::Boolean),
         TypeCode::Int64 => LogicalTypeHandle::from(LogicalTypeId::Bigint),
         TypeCode::Float32 => LogicalTypeHandle::from(LogicalTypeId::Float),
@@ -149,42 +151,59 @@ pub fn spanner_type_to_logical(spanner_type: &Type) -> LogicalTypeHandle {
         TypeCode::Uuid => LogicalTypeHandle::from(LogicalTypeId::Uuid),
         TypeCode::Interval => LogicalTypeHandle::from(LogicalTypeId::Interval),
         TypeCode::Array => {
-            if let Some(elem_type) = spanner_type.array_element_type() {
-                let child = spanner_type_to_logical(&elem_type);
-                LogicalTypeHandle::list(&child)
-            } else {
-                LogicalTypeHandle::list(&LogicalTypeHandle::from(LogicalTypeId::Varchar))
-            }
+            let element_type = spanner_type.array_element_type().ok_or_else(|| {
+                SpannerError::Other(
+                    "ARRAY result type is missing element type metadata".to_string(),
+                )
+            })?;
+            let child = spanner_type_to_logical(&element_type).map_err(|error| {
+                SpannerError::Other(format!(
+                    "Invalid ARRAY element result type metadata: {error}"
+                ))
+            })?;
+            LogicalTypeHandle::list(&child)
         }
         TypeCode::Struct => {
-            if let Some(struct_type) = spanner_type.struct_type() {
-                let fields: Vec<(&str, LogicalTypeHandle)> = struct_type
-                    .fields
-                    .iter()
-                    .map(|f| {
-                        let lt = f
-                            .r#type
-                            .as_ref()
-                            .map(|t| {
-                                let t: Type = (**t).clone().into();
-                                spanner_type_to_logical(&t)
-                            })
-                            .unwrap_or_else(|| LogicalTypeHandle::from(LogicalTypeId::Varchar));
-                        (f.name.as_str(), lt)
-                    })
-                    .collect();
-                LogicalTypeHandle::struct_type(&fields)
-            } else {
-                LogicalTypeHandle::from(LogicalTypeId::Varchar)
+            let struct_type = spanner_type.struct_type().ok_or_else(|| {
+                SpannerError::Other("STRUCT result type is missing struct metadata".to_string())
+            })?;
+            let mut fields = Vec::with_capacity(struct_type.fields.len());
+            for (index, field) in struct_type.fields.iter().enumerate() {
+                let field_type = field.r#type.as_ref().ok_or_else(|| {
+                    SpannerError::Other(format!(
+                        "STRUCT result type field {index} ({:?}) is missing type metadata",
+                        field.name
+                    ))
+                })?;
+                let field_type: Type = (**field_type).clone().into();
+                let logical_type = spanner_type_to_logical(&field_type).map_err(|error| {
+                    SpannerError::Other(format!(
+                        "Invalid STRUCT result type field {index} ({:?}) metadata: {error}",
+                        field.name
+                    ))
+                })?;
+                fields.push((field.name.as_str(), logical_type));
             }
+            LogicalTypeHandle::struct_type(&fields)
+        }
+        TypeCode::Unspecified => {
+            return Err(SpannerError::Other(
+                "Spanner result type is unspecified".to_string(),
+            ));
+        }
+        TypeCode::Unknown(code) => {
+            return Err(SpannerError::Other(format!(
+                "Unsupported Spanner result type code {code}"
+            )));
         }
         other => {
-            eprintln!(
-                "[duckdb-spanner] Unsupported Spanner TypeCode {other:?}, falling back to VARCHAR"
-            );
-            LogicalTypeHandle::from(LogicalTypeId::Varchar)
+            return Err(SpannerError::Other(format!(
+                "Unsupported Spanner result type code {other:?}"
+            )));
         }
-    }
+    };
+
+    Ok(logical_type)
 }
 
 /// Whether a NUMERIC Type uses PostgreSQL semantics.
@@ -1663,16 +1682,72 @@ mod tests {
         let pg_numeric = parse_pg_spanner_type("numeric").unwrap();
         assert!(is_pg_numeric(&pg_numeric));
         assert_eq!(
-            spanner_type_to_logical(&pg_numeric).id(),
+            spanner_type_to_logical(&pg_numeric).unwrap().id(),
             LogicalTypeId::Varchar
         );
 
         let googlesql_numeric = parse_spanner_type("NUMERIC").unwrap();
         assert!(!is_pg_numeric(&googlesql_numeric));
         assert_eq!(
-            spanner_type_to_logical(&googlesql_numeric).id(),
+            spanner_type_to_logical(&googlesql_numeric).unwrap().id(),
             LogicalTypeId::Decimal
         );
+    }
+
+    #[test]
+    fn result_type_conversion_rejects_unknown_and_unspecified_codes() {
+        for code in [12, 99] {
+            let error = spanner_type_to_logical(&type_from_code(TypeCode::Unknown(code)))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&code.to_string()), "{error}");
+        }
+
+        let error = spanner_type_to_logical(&type_from_code(TypeCode::Unspecified))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unspecified"), "{error}");
+    }
+
+    #[test]
+    fn result_type_conversion_rejects_missing_composite_metadata() {
+        let array_without_element: Type =
+            model::Type::new().set_code(model::TypeCode::Array).into();
+        let error = spanner_type_to_logical(&array_without_element)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("ARRAY"), "{error}");
+        assert!(error.contains("element type"), "{error}");
+
+        let struct_without_metadata: Type =
+            model::Type::new().set_code(model::TypeCode::Struct).into();
+        let error = spanner_type_to_logical(&struct_without_metadata)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("STRUCT"), "{error}");
+        assert!(error.contains("struct metadata"), "{error}");
+
+        let struct_with_missing_field_type =
+            struct_type(vec![model::struct_type::Field::new().set_name("payload")]);
+        let error = spanner_type_to_logical(&struct_with_missing_field_type)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("field 0"), "{error}");
+        assert!(error.contains("payload"), "{error}");
+        assert!(error.contains("missing type metadata"), "{error}");
+    }
+
+    #[test]
+    fn result_type_conversion_preserves_nested_metadata_context() {
+        let nested = array_type(struct_type(vec![model::struct_type::Field::new()
+            .set_name("payload")
+            .set_type(model::Type::new().set_code(model::TypeCode::from(99)))]));
+
+        let error = spanner_type_to_logical(&nested).unwrap_err().to_string();
+        assert!(error.contains("ARRAY element"), "{error}");
+        assert!(error.contains("STRUCT result type field 0"), "{error}");
+        assert!(error.contains("payload"), "{error}");
+        assert!(error.contains("99"), "{error}");
     }
 
     #[test]

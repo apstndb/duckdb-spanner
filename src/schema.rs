@@ -438,6 +438,10 @@ pub async fn discover_query_schema(
     let metadata = iter.metadata().ok_or_else(|| {
         SpannerError::Other(format!("No column metadata returned for query: {sql}"))
     })?;
+    validate_query_metadata_cardinality(
+        metadata.column_names().len(),
+        metadata.column_types().len(),
+    )?;
     if metadata.column_names().is_empty() {
         return Err(SpannerError::Other(format!(
             "No column metadata returned for query: {sql}"
@@ -457,6 +461,18 @@ pub async fn discover_query_schema(
         .collect();
 
     Ok(columns)
+}
+
+fn validate_query_metadata_cardinality(
+    column_names_len: usize,
+    column_types_len: usize,
+) -> Result<(), SpannerError> {
+    if column_names_len != column_types_len {
+        return Err(SpannerError::Other(format!(
+            "Query result metadata has {column_names_len} column names but {column_types_len} column types"
+        )));
+    }
+    Ok(())
 }
 
 /// Discover table schema from INFORMATION_SCHEMA.COLUMNS.
@@ -723,6 +739,16 @@ mod tests {
             DatabaseDialect::Postgresql
         );
         assert!(parse_dialect("mysql").is_err());
+    }
+
+    #[test]
+    fn query_metadata_cardinality_mismatch_is_rejected() {
+        let error = validate_query_metadata_cardinality(2, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("2 column names"), "{error}");
+        assert!(error.contains("1 column types"), "{error}");
+        assert!(validate_query_metadata_cardinality(2, 2).is_ok());
     }
 
     #[tokio::test]
