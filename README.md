@@ -95,12 +95,15 @@ workflow at that tag ref, providing the tag and source run ID. The workflow
 requires its dispatch ref, tag, source run, and empty draft release to agree on
 that commit, smoke-loads five platform artifacts on matching native DuckDB
 `v1.5.4` runners, generates `SHA256SUMS`, and attaches those exact bytes to the
-draft. The MinGW artifact's metadata footer is validated instead: GitHub's
-Windows runner and Python DuckDB wheel use the incompatible MSVC platform, so
-CI cannot honestly runtime-load that artifact without disabling the metadata
-guard. Publish the release only after the staging workflow and draft inspection
-succeed. Published assets are never rebuilt or replaced by a release event;
-releases created outside this flow receive no automatic assets.
+draft. The additional `windows_amd64_mingw` artifact is best-effort, matching
+[DuckDB's upstream support tier](https://duckdb.org/docs/stable/dev/building/overview#platforms-with-best-effort-support).
+GitHub's Windows runner and Python DuckDB wheel use the incompatible MSVC
+platform, so CI validates the MinGW artifact's metadata and PE import table
+instead. Release staging fails if it gains an unreviewed DLL dependency or a
+dynamic MinGW runtime dependency. Publish the release only after the staging
+workflow and draft inspection succeed. Published assets are never rebuilt or
+replaced by a release event; releases created outside this flow receive no
+automatic assets.
 
 Each asset name includes its target platform, for example
 `spanner-v1.5.4-linux_amd64.duckdb_extension`.

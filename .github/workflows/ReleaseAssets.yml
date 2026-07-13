@@ -105,7 +105,7 @@ jobs:
           actual=$(gh api "repos/$GH_REPO/actions/runs/$SOURCE_RUN_ID/artifacts" --paginate \
             --jq '.artifacts[] | select(.expired == false) | .name' | sort)
           if [[ "$actual" != "$expected" ]]; then
-            echo 'Source run artifact set does not match the six supported platforms.' >&2
+            echo 'Source run artifact set does not match the six distribution platforms.' >&2
             diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true
             exit 1
           fi
@@ -167,7 +167,7 @@ jobs:
         shell: bash
         run: python scripts/smoke-release-asset.py release-candidate/spanner.duckdb_extension
 
-      - name: Validate MinGW metadata footer
+      - name: Validate MinGW metadata and static runtime imports
         if: matrix.validation == 'metadata'
         shell: bash
         env:
