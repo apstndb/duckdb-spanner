@@ -70,6 +70,11 @@ SELECT IF(Exact, 1, error('expected exact TIMESTAMP_NS wire value')) FROM spanne
 statement ok
 SELECT IF(typeof(Ts) = 'TIMESTAMP WITH TIME ZONE' AND Ts = '2024-01-15 12:34:56.123456+00'::TIMESTAMPTZ, 1, error('expected documented Spanner TIMESTAMP return precision')) FROM spanner_query('SELECT TIMESTAMP "2024-01-15T12:34:56.123456789Z" AS Ts');
 
+# Spanner INTERVAL supports nanosecond fractional seconds. DuckDB INTERVAL has
+# microsecond precision, so the inbound conversion truncates toward zero.
+statement ok
+SELECT IF(interval_to_iso8601(Nanos) = 'PT0S', 1, error('expected documented Spanner INTERVAL return precision')) FROM spanner_query('SELECT INTERVAL 1 NANOSECOND AS Nanos');
+
 statement ok
 SELECT IF(len(Intervals) = 2, 1, error('expected ARRAY<INTERVAL> param round-trip')) FROM spanner_query('SELECT @v AS Intervals', params := {'v': spanner_typed(['P1D', 'P1Y3M'], 'ARRAY<INTERVAL>')});
 
