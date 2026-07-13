@@ -1261,137 +1261,334 @@ struct DuckDBInterval {
 /// Format: P[nY][nM][nD][T[nH][nM][nS]]
 /// Examples: "P1Y2M3DT4H5M6S", "P1Y", "PT1H30M", "P0-3 0 0:0:0" (Spanner format)
 fn parse_iso8601_interval(s: &str) -> Result<DuckDBInterval, SpannerError> {
-    let s = s.trim();
+    let original = s.trim();
 
     // Spanner can return intervals in a different format: "P<years>-<months> <days> <hours>:<minutes>:<seconds>"
     // Try the Spanner-specific format first
-    if let Some(result) = try_parse_spanner_interval(s) {
+    if let Some(result) = try_parse_spanner_interval(original) {
         return Ok(result);
     }
 
     // Standard ISO 8601 format: P[nY][nM][nD][T[nH][nM][n.nS]]
-    if !s.starts_with('P') && !s.starts_with('p') {
-        return Err(SpannerError::Conversion(format!(
-            "Invalid interval format: {s}"
-        )));
+    if !original.starts_with('P') && !original.starts_with('p') {
+        return Err(invalid_interval(original));
     }
 
-    let mut interval = DuckDBInterval::default();
-    let s = &s[1..]; // skip 'P'
-    let (date_part, time_part) = if let Some(t_pos) = s.find(['T', 't']) {
-        (&s[..t_pos], Some(&s[t_pos + 1..]))
+    let body = &original[1..]; // skip 'P'
+    let (date_part, time_part) = if let Some(t_pos) = body.find(['T', 't']) {
+        (&body[..t_pos], Some(&body[t_pos + 1..]))
     } else {
-        (s, None)
+        (body, None)
     };
 
-    // Parse date part: [nY][nM][nD]
-    parse_date_components(date_part, &mut interval)?;
-
-    // Parse time part: [nH][nM][n.nS]
+    let mut parts = IntervalParts::default();
+    let mut component_count = parse_iso_components(date_part, false, original, &mut parts)?;
     if let Some(time_str) = time_part {
-        parse_time_components(time_str, &mut interval)?;
+        if time_str.is_empty() {
+            return Err(invalid_interval(original));
+        }
+        component_count += parse_iso_components(time_str, true, original, &mut parts)?;
+    }
+    if component_count == 0 {
+        return Err(invalid_interval(original));
     }
 
-    Ok(interval)
+    parts.finish(original)
 }
 
 fn try_parse_spanner_interval(s: &str) -> Option<DuckDBInterval> {
     // Spanner format: "P<years>-<months> <days> <hours>:<minutes>:<seconds>"
-    let s = s.strip_prefix('P').or_else(|| s.strip_prefix('p'))?;
+    parse_spanner_interval(s).ok()
+}
+
+#[derive(Default)]
+struct IntervalParts {
+    months: i128,
+    days: i128,
+    micros: i128,
+}
+
+impl IntervalParts {
+    fn finish(self, s: &str) -> Result<DuckDBInterval, SpannerError> {
+        Ok(DuckDBInterval {
+            months: i32::try_from(self.months).map_err(|_| invalid_interval(s))?,
+            days: i32::try_from(self.days).map_err(|_| invalid_interval(s))?,
+            micros: i64::try_from(self.micros).map_err(|_| invalid_interval(s))?,
+        })
+    }
+}
+
+fn invalid_interval(s: &str) -> SpannerError {
+    SpannerError::Conversion(format!("Invalid interval format: {s}"))
+}
+
+fn parse_spanner_interval(s: &str) -> Result<DuckDBInterval, SpannerError> {
+    let original = s;
+    let s = s
+        .strip_prefix('P')
+        .or_else(|| s.strip_prefix('p'))
+        .ok_or_else(|| invalid_interval(original))?;
     let parts: Vec<&str> = s.split_whitespace().collect();
     if parts.len() != 3 {
-        return None;
+        return Err(invalid_interval(original));
     }
 
-    // Parse "years-months" (separator is the last '-', so "-1-2" => years=-1, months=2)
-    let sep = parts[0].rfind('-')?;
-    if sep == 0 {
-        return None;
-    }
-    let years: i32 = parts[0][..sep].parse().ok()?;
-    let months: i32 = parts[0][sep + 1..].parse().ok()?;
+    let months = parse_spanner_year_month(parts[0], original)?;
+    let days = parse_integer(parts[1], original)?;
 
-    // Parse days
-    let days: i32 = parts[1].parse().ok()?;
-
-    // Parse "hours:minutes:seconds"
     let hms: Vec<&str> = parts[2].split(':').collect();
     if hms.len() != 3 {
-        return None;
+        return Err(invalid_interval(original));
     }
-    let hours: i64 = hms[0].parse().ok()?;
-    let minutes: i64 = hms[1].parse().ok()?;
-    let seconds: f64 = hms[2].parse().ok()?;
+    let (negative_time, hours) = parse_group_sign(hms[0], original)?;
+    let hours = parse_unsigned_integer(hours, original)?
+        .checked_mul(3_600_000_000)
+        .ok_or_else(|| invalid_interval(original))?;
+    let minutes_value = parse_unsigned_integer(hms[1], original)?;
+    if minutes_value >= 60 {
+        return Err(invalid_interval(original));
+    }
+    let minutes = minutes_value
+        .checked_mul(60_000_000)
+        .ok_or_else(|| invalid_interval(original))?;
+    let seconds_whole = hms[2].split_once('.').map_or(hms[2], |(whole, _)| whole);
+    if parse_unsigned_integer(seconds_whole, original)? >= 60 {
+        return Err(invalid_interval(original));
+    }
+    let seconds = parse_seconds_micros(hms[2], original)?;
+    let micros_magnitude = hours
+        .checked_add(minutes)
+        .and_then(|value| value.checked_add(seconds))
+        .ok_or_else(|| invalid_interval(original))?;
+    let micros = if negative_time {
+        micros_magnitude
+            .checked_neg()
+            .ok_or_else(|| invalid_interval(original))?
+    } else {
+        micros_magnitude
+    };
 
-    let micros = hours * 3_600_000_000 + minutes * 60_000_000 + (seconds * 1_000_000.0) as i64;
-
-    Some(DuckDBInterval {
-        months: years * 12 + months,
+    IntervalParts {
+        months,
         days,
         micros,
-    })
+    }
+    .finish(original)
 }
 
-fn parse_date_components(s: &str, interval: &mut DuckDBInterval) -> Result<(), SpannerError> {
-    let mut num_start = 0;
-    for (i, ch) in s.char_indices() {
-        match ch {
-            'Y' | 'y' => {
-                let n: i32 = s[num_start..i].parse().map_err(|_| {
-                    SpannerError::Conversion(format!("Invalid year in interval: {s}"))
-                })?;
-                interval.months += n * 12;
-                num_start = i + 1;
-            }
-            'M' | 'm' => {
-                let n: i32 = s[num_start..i].parse().map_err(|_| {
-                    SpannerError::Conversion(format!("Invalid month in interval: {s}"))
-                })?;
-                interval.months += n;
-                num_start = i + 1;
-            }
-            'D' | 'd' => {
-                let n: i32 = s[num_start..i].parse().map_err(|_| {
-                    SpannerError::Conversion(format!("Invalid day in interval: {s}"))
-                })?;
-                interval.days += n;
-                num_start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    Ok(())
+fn parse_integer(s: &str, original: &str) -> Result<i128, SpannerError> {
+    s.parse::<i128>().map_err(|_| invalid_interval(original))
 }
 
-fn parse_time_components(s: &str, interval: &mut DuckDBInterval) -> Result<(), SpannerError> {
-    let mut num_start = 0;
-    for (i, ch) in s.char_indices() {
-        match ch {
-            'H' | 'h' => {
-                let n: i64 = s[num_start..i].parse().map_err(|_| {
-                    SpannerError::Conversion(format!("Invalid hours in interval: {s}"))
-                })?;
-                interval.micros += n * 3_600_000_000;
-                num_start = i + 1;
-            }
-            'M' | 'm' => {
-                let n: i64 = s[num_start..i].parse().map_err(|_| {
-                    SpannerError::Conversion(format!("Invalid minutes in interval: {s}"))
-                })?;
-                interval.micros += n * 60_000_000;
-                num_start = i + 1;
-            }
-            'S' | 's' => {
-                let n: f64 = s[num_start..i].parse().map_err(|_| {
-                    SpannerError::Conversion(format!("Invalid seconds in interval: {s}"))
-                })?;
-                interval.micros += (n * 1_000_000.0) as i64;
-                num_start = i + 1;
-            }
-            _ => {}
-        }
+fn parse_unsigned_integer(s: &str, original: &str) -> Result<i128, SpannerError> {
+    if s.is_empty() || !s.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(invalid_interval(original));
     }
-    Ok(())
+    parse_integer(s, original)
+}
+
+fn parse_group_sign<'a>(s: &'a str, original: &str) -> Result<(bool, &'a str), SpannerError> {
+    let (negative, unsigned) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    if unsigned.is_empty() {
+        return Err(invalid_interval(original));
+    }
+    Ok((negative, unsigned))
+}
+
+fn parse_spanner_year_month(s: &str, original: &str) -> Result<i128, SpannerError> {
+    let (negative, unsigned) = parse_group_sign(s, original)?;
+    let (years, months) = unsigned
+        .split_once('-')
+        .ok_or_else(|| invalid_interval(original))?;
+    if months.contains('-') {
+        return Err(invalid_interval(original));
+    }
+    let years = parse_unsigned_integer(years, original)?;
+    let months = parse_unsigned_integer(months, original)?;
+    if months >= 12 {
+        return Err(invalid_interval(original));
+    }
+    let magnitude = years
+        .checked_mul(12)
+        .and_then(|value| value.checked_add(months))
+        .ok_or_else(|| invalid_interval(original))?;
+    if negative {
+        magnitude
+            .checked_neg()
+            .ok_or_else(|| invalid_interval(original))
+    } else {
+        Ok(magnitude)
+    }
+}
+
+fn parse_seconds_micros(s: &str, original: &str) -> Result<i128, SpannerError> {
+    let (negative, unsigned) = match s.as_bytes().first() {
+        Some(b'-') => (true, &s[1..]),
+        Some(b'+') => (false, &s[1..]),
+        _ => (false, s),
+    };
+    let (whole, fraction) = if let Some((whole, fraction)) = unsigned.split_once('.') {
+        if fraction.is_empty() {
+            return Err(invalid_interval(original));
+        }
+        (whole, fraction)
+    } else {
+        (unsigned, "")
+    };
+    // Spanner allows nanosecond precision. DuckDB intervals store microseconds,
+    // so discard the final three digits deterministically instead of using a
+    // floating-point conversion.
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || (!fraction.is_empty() && !fraction.bytes().all(|byte| byte.is_ascii_digit()))
+        || fraction.len() > 9
+    {
+        return Err(invalid_interval(original));
+    }
+
+    let whole = whole
+        .parse::<i128>()
+        .map_err(|_| invalid_interval(original))?
+        .checked_mul(1_000_000)
+        .ok_or_else(|| invalid_interval(original))?;
+    let fraction = if fraction.is_empty() {
+        0
+    } else {
+        let micros_fraction = &fraction[..fraction.len().min(6)];
+        let value = micros_fraction
+            .parse::<i128>()
+            .map_err(|_| invalid_interval(original))?;
+        value
+            .checked_mul(10_i128.pow((6 - micros_fraction.len()) as u32))
+            .ok_or_else(|| invalid_interval(original))?
+    };
+    let magnitude = whole
+        .checked_add(fraction)
+        .ok_or_else(|| invalid_interval(original))?;
+    if negative {
+        magnitude
+            .checked_neg()
+            .ok_or_else(|| invalid_interval(original))
+    } else {
+        Ok(magnitude)
+    }
+}
+
+fn parse_iso_components(
+    s: &str,
+    time: bool,
+    original: &str,
+    parts: &mut IntervalParts,
+) -> Result<usize, SpannerError> {
+    let bytes = s.as_bytes();
+    let mut pos = 0;
+    let mut last_rank = 0;
+    let mut count = 0;
+
+    while pos < bytes.len() {
+        let start = pos;
+        if matches!(bytes[pos], b'+' | b'-') {
+            pos += 1;
+        }
+        let digits_start = pos;
+        while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+            pos += 1;
+        }
+        if digits_start == pos {
+            return Err(invalid_interval(original));
+        }
+        if pos < bytes.len() && bytes[pos] == b'.' {
+            pos += 1;
+            let fraction_start = pos;
+            while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+                pos += 1;
+            }
+            if fraction_start == pos {
+                return Err(invalid_interval(original));
+            }
+        }
+        if pos == bytes.len() {
+            return Err(invalid_interval(original));
+        }
+
+        let number_end = pos;
+        let unit = bytes[pos] as char;
+        pos += 1;
+        let rank = match (time, unit) {
+            (false, 'Y' | 'y') | (true, 'H' | 'h') => 1,
+            (false, 'M' | 'm') | (true, 'M' | 'm') => 2,
+            (false, 'D' | 'd') | (true, 'S' | 's') => 3,
+            _ => return Err(invalid_interval(original)),
+        };
+        if rank <= last_rank {
+            return Err(invalid_interval(original));
+        }
+        let number = &s[start..number_end];
+        let value = if unit == 'S' || unit == 's' {
+            parse_seconds_micros(number, original)?
+        } else {
+            if number.contains('.') {
+                return Err(invalid_interval(original));
+            }
+            parse_integer(number, original)?
+        };
+        match (time, unit) {
+            (false, 'Y' | 'y') => {
+                let value = value
+                    .checked_mul(12)
+                    .ok_or_else(|| invalid_interval(original))?;
+                parts.months = parts
+                    .months
+                    .checked_add(value)
+                    .ok_or_else(|| invalid_interval(original))?;
+            }
+            (false, 'M' | 'm') => {
+                parts.months = parts
+                    .months
+                    .checked_add(value)
+                    .ok_or_else(|| invalid_interval(original))?;
+            }
+            (false, 'D' | 'd') => {
+                parts.days = parts
+                    .days
+                    .checked_add(value)
+                    .ok_or_else(|| invalid_interval(original))?;
+            }
+            (true, 'H' | 'h') => {
+                let value = value
+                    .checked_mul(3_600_000_000)
+                    .ok_or_else(|| invalid_interval(original))?;
+                parts.micros = parts
+                    .micros
+                    .checked_add(value)
+                    .ok_or_else(|| invalid_interval(original))?;
+            }
+            (true, 'M' | 'm') => {
+                let value = value
+                    .checked_mul(60_000_000)
+                    .ok_or_else(|| invalid_interval(original))?;
+                parts.micros = parts
+                    .micros
+                    .checked_add(value)
+                    .ok_or_else(|| invalid_interval(original))?;
+            }
+            (true, 'S' | 's') => {
+                parts.micros = parts
+                    .micros
+                    .checked_add(value)
+                    .ok_or_else(|| invalid_interval(original))?;
+            }
+            _ => return Err(invalid_interval(original)),
+        }
+        last_rank = rank;
+        count += 1;
+    }
+
+    Ok(count)
 }
 
 fn base64_decode(s: &str) -> Result<Vec<u8>, SpannerError> {
@@ -1423,15 +1620,121 @@ mod tests {
     #[test]
     fn spanner_negative_year_month_interval() {
         let interval = try_parse_spanner_interval("P-1-2 0 0:0:0").expect("parse");
-        assert_eq!(interval.months, -10); // -1 year, +2 months
+        assert_eq!(interval.months, -14);
         assert_eq!(interval.days, 0);
         assert_eq!(interval.micros, 0);
+
+        let interval = try_parse_spanner_interval("P0-0 0 -1:30:0").expect("parse");
+        assert_eq!(interval.micros, -90 * 60 * 1_000_000);
+
+        let interval = try_parse_spanner_interval("P0-0 0 -0:30:10").expect("parse");
+        assert_eq!(interval.micros, -(30 * 60 + 10) * 1_000_000);
     }
 
     #[test]
     fn iso8601_negative_interval_round_trip() {
         let interval = parse_iso8601_interval("PT-1H-30M").expect("parse");
         assert_eq!(interval.micros, -90 * 60 * 1_000_000);
+    }
+
+    #[test]
+    fn interval_parser_preserves_valid_iso_and_spanner_forms() {
+        let interval = parse_iso8601_interval("P1Y2M3DT4H5M6S").expect("parse");
+        assert_eq!(interval.months, 14);
+        assert_eq!(interval.days, 3);
+        assert_eq!(interval.micros, 14_706_000_000);
+
+        let interval = parse_iso8601_interval("PT1H30M").expect("parse");
+        assert_eq!(interval.micros, 90 * 60 * 1_000_000);
+
+        let interval = parse_iso8601_interval("p1y2m3dt4h5m6s").expect("parse");
+        assert_eq!(interval.months, 14);
+        assert_eq!(interval.days, 3);
+        assert_eq!(interval.micros, 14_706_000_000);
+
+        let interval = parse_iso8601_interval("P0-3 0 0:0:0").expect("parse");
+        assert_eq!(interval.months, 3);
+        assert_eq!(interval.days, 0);
+        assert_eq!(interval.micros, 0);
+    }
+
+    #[test]
+    fn interval_parser_rejects_empty_unknown_and_trailing_input() {
+        for input in [
+            "P",
+            "PT",
+            "Pgarbage",
+            "P1Yjunk",
+            "P1Y2Mgarbage",
+            "PT1Hjunk",
+            "PT1H2H",
+            "P1D2Y",
+        ] {
+            assert!(
+                parse_iso8601_interval(input).is_err(),
+                "expected {input:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn interval_parser_rejects_non_finite_and_more_than_nanosecond_precision() {
+        for input in [
+            "PTNaNS",
+            "PTInfinityS",
+            "PT-InfinityS",
+            "P0-0 0 0:0:NaNS",
+            "P0-0 0 0:0:1.",
+            "PT0.0000000001S",
+            "PT1.1234567890S",
+            "P0-0 0 0:0:1.1234567890",
+            "P0-12 0 0:0:0",
+            "P0-0 0 0:60:0",
+            "P0-0 0 0:0:60",
+            "P0-0 0 0:-1:0",
+        ] {
+            assert!(
+                parse_iso8601_interval(input).is_err(),
+                "expected {input:?} to be rejected"
+            );
+        }
+
+        let interval = parse_iso8601_interval("PT1.123456S").expect("parse");
+        assert_eq!(interval.micros, 1_123_456);
+
+        let interval = parse_iso8601_interval("PT1.123456789S").expect("parse");
+        assert_eq!(interval.micros, 1_123_456);
+
+        let interval =
+            parse_iso8601_interval("P0-0 0 0:0:1.123456789").expect("parse Spanner form");
+        assert_eq!(interval.micros, 1_123_456);
+
+        let interval = parse_iso8601_interval("PT-0.000000001S").expect("parse");
+        assert_eq!(interval.micros, 0);
+    }
+
+    #[test]
+    fn interval_parser_checks_fraction_and_integer_boundaries() {
+        let interval = parse_iso8601_interval("PT9223372036854.775807S").expect("parse");
+        assert_eq!(interval.micros, i64::MAX);
+
+        let interval = parse_iso8601_interval("PT-9223372036854.775808S").expect("parse");
+        assert_eq!(interval.micros, i64::MIN);
+
+        for input in [
+            "PT9223372036854.775808S",
+            "PT-9223372036854.775809S",
+            "P178956971Y",
+            "P0-0 2147483648 0:0:0",
+            "PT2562047789H",
+            "P0-0 0 0:153722867281:0",
+            "P0-0 0 2562047789:0:0",
+        ] {
+            assert!(
+                parse_iso8601_interval(input).is_err(),
+                "expected {input:?} to be rejected"
+            );
+        }
     }
 
     // ─── Conversion-error classification (issue #11) ───────────────────────

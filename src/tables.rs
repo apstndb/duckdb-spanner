@@ -7,7 +7,7 @@ use google_cloud_spanner::statement::Statement;
 use google_cloud_spanner_admin_database_v1::model::DatabaseDialect;
 
 use crate::error::SpannerError;
-use crate::{client, runtime, schema};
+use crate::{client, runtime, schema, vtab_safety};
 
 #[derive(Clone)]
 struct TableRow {
@@ -38,54 +38,58 @@ impl VTab for SpannerTablesVTab {
     type InitData = TablesInitData;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        bind.add_result_column(
-            "table_schema",
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
-        );
-        bind.add_result_column(
-            "table_name",
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
-        );
-        bind.add_result_column(
-            "table_type",
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
-        );
-        bind.add_result_column(
-            "parent_table_name",
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
-        );
+        vtab_safety::guard_callback("SpannerTablesVTab", "bind", || {
+            bind.add_result_column(
+                "table_schema",
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            );
+            bind.add_result_column(
+                "table_name",
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            );
+            bind.add_result_column(
+                "table_type",
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            );
+            bind.add_result_column(
+                "parent_table_name",
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            );
 
-        let profile = crate::bind_utils::resolve_connection_profile(bind)?;
-        let dialect = crate::bind_utils::get_named_string(bind, "dialect")
-            .map(|value| schema::parse_dialect(&value))
-            .transpose()?
-            .unwrap_or(DatabaseDialect::Unspecified);
-        let filters = TableFilters {
-            // Preserve the original zero-argument behavior; callers opt into
-            // views (or other INFORMATION_SCHEMA table types) explicitly.
-            table_type: crate::bind_utils::get_named_string(bind, "table_type")
-                .map(|value| value.to_ascii_uppercase())
-                .unwrap_or_else(|| "BASE TABLE".to_string()),
-            schema: crate::bind_utils::get_named_string(bind, "schema"),
-            table_name: crate::bind_utils::get_named_string(bind, "table_name"),
-        };
+            let profile = crate::bind_utils::resolve_connection_profile(bind)?;
+            let dialect = crate::bind_utils::get_named_string(bind, "dialect")
+                .map(|value| schema::parse_dialect(&value))
+                .transpose()?
+                .unwrap_or(DatabaseDialect::Unspecified);
+            let filters = TableFilters {
+                // Preserve the original zero-argument behavior; callers opt into
+                // views (or other INFORMATION_SCHEMA table types) explicitly.
+                table_type: crate::bind_utils::get_named_string(bind, "table_type")
+                    .map(|value| value.to_ascii_uppercase())
+                    .unwrap_or_else(|| "BASE TABLE".to_string()),
+                schema: crate::bind_utils::get_named_string(bind, "schema"),
+                table_name: crate::bind_utils::get_named_string(bind, "table_name"),
+            };
 
-        let rows = runtime::run_bounded(
-            "Spanner table discovery",
-            runtime::METADATA_DISCOVERY_TIMEOUT,
-            async move {
-                let client = client::get_or_create_client(&profile).await?;
-                list_tables(&client, &profile, dialect, &filters).await
-            },
-        )??;
+            let rows = runtime::run_bounded(
+                "Spanner table discovery",
+                runtime::METADATA_DISCOVERY_TIMEOUT,
+                async move {
+                    let client = client::get_or_create_client(&profile).await?;
+                    list_tables(&client, &profile, dialect, &filters).await
+                },
+            )??;
 
-        bind.set_cardinality(rows.len() as u64, true);
-        Ok(TablesBindData { rows })
+            bind.set_cardinality(rows.len() as u64, true);
+            Ok(TablesBindData { rows })
+        })
     }
 
     fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
-        Ok(TablesInitData {
-            offset: AtomicUsize::new(0),
+        vtab_safety::guard_callback("SpannerTablesVTab", "init", || {
+            Ok(TablesInitData {
+                offset: AtomicUsize::new(0),
+            })
         })
     }
 
@@ -93,37 +97,39 @@ impl VTab for SpannerTablesVTab {
         func: &TableFunctionInfo<Self>,
         output: &mut DataChunkHandle,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let bind_data = func.get_bind_data();
-        let init_data = func.get_init_data();
+        vtab_safety::guard_callback("SpannerTablesVTab", "func", || {
+            let bind_data = func.get_bind_data();
+            let init_data = func.get_init_data();
 
-        let offset = init_data.offset.load(Ordering::Relaxed);
-        if offset >= bind_data.rows.len() {
-            output.set_len(0);
-            return Ok(());
-        }
-
-        let capacity = crate::vector_size::runtime_vector_size();
-        let end = (offset + capacity).min(bind_data.rows.len());
-        let count = end - offset;
-
-        let schema_vec = output.flat_vector(0);
-        let name_vec = output.flat_vector(1);
-        let type_vec = output.flat_vector(2);
-        let mut parent_vec = output.flat_vector(3);
-
-        for (out_idx, row) in bind_data.rows[offset..end].iter().enumerate() {
-            schema_vec.insert(out_idx, &row.table_schema);
-            name_vec.insert(out_idx, &row.table_name);
-            type_vec.insert(out_idx, &row.table_type);
-            match &row.parent_table_name {
-                Some(parent) => parent_vec.insert(out_idx, parent),
-                None => parent_vec.set_null(out_idx),
+            let offset = init_data.offset.load(Ordering::Relaxed);
+            if offset >= bind_data.rows.len() {
+                output.set_len(0);
+                return Ok(());
             }
-        }
 
-        init_data.offset.store(end, Ordering::Relaxed);
-        output.set_len(count);
-        Ok(())
+            let capacity = crate::vector_size::runtime_vector_size();
+            let end = (offset + capacity).min(bind_data.rows.len());
+            let count = end - offset;
+
+            let schema_vec = output.flat_vector(0);
+            let name_vec = output.flat_vector(1);
+            let type_vec = output.flat_vector(2);
+            let mut parent_vec = output.flat_vector(3);
+
+            for (out_idx, row) in bind_data.rows[offset..end].iter().enumerate() {
+                schema_vec.insert(out_idx, &row.table_schema);
+                name_vec.insert(out_idx, &row.table_name);
+                type_vec.insert(out_idx, &row.table_type);
+                match &row.parent_table_name {
+                    Some(parent) => parent_vec.insert(out_idx, parent),
+                    None => parent_vec.set_null(out_idx),
+                }
+            }
+
+            init_data.offset.store(end, Ordering::Relaxed);
+            output.set_len(count);
+            Ok(())
+        })
     }
 
     fn named_parameters() -> Option<Vec<(String, LogicalTypeHandle)>> {

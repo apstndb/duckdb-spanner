@@ -17,7 +17,7 @@ use google_cloud_spanner_admin_database_v1::model::DatabaseDialect;
 use crate::connection::ConnectionProfile;
 use crate::error::SpannerError;
 use crate::schema::ColumnInfo;
-use crate::{client, convert, runtime, schema, streaming, types, vector_size};
+use crate::{client, convert, runtime, schema, streaming, types, vector_size, vtab_safety};
 
 pub struct ScanBindData {
     profile: ConnectionProfile,
@@ -44,120 +44,159 @@ impl VTab for SpannerScanVTab {
     type InitData = ScanInitData;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        let table = bind.get_parameter(0).to_string();
-        let profile = crate::bind_utils::resolve_connection_profile(bind)?;
-        let legacy_use_parallelism =
-            crate::bind_utils::get_named_bool(bind, "use_parallelism", false);
-        let parallelism_mode = crate::bind_utils::resolve_parallelism_mode(
-            crate::bind_utils::get_named_string(bind, "parallelism_mode").as_deref(),
-            legacy_use_parallelism,
-        )?;
-        let use_data_boost = crate::bind_utils::get_named_bool(bind, "use_data_boost", false);
-        let max_parallelism = crate::bind_utils::get_named_int64(bind, "max_parallelism");
-        crate::bind_utils::validate_parallelism_options(
-            parallelism_mode,
-            use_data_boost,
-            max_parallelism,
-        )?;
-        let index = crate::bind_utils::get_named_string(bind, "index").unwrap_or_default();
-        let timestamp_bound = crate::bind_utils::resolve_timestamp_bound(
-            crate::bind_utils::get_named_int64(bind, "exact_staleness_secs"),
-            crate::bind_utils::get_named_int64(bind, "max_staleness_secs"),
-            crate::bind_utils::get_named_string(bind, "read_timestamp").as_deref(),
-            crate::bind_utils::get_named_string(bind, "min_read_timestamp").as_deref(),
-        )?;
-        let priority = crate::bind_utils::get_named_string(bind, "priority")
-            .map(|s| crate::bind_utils::parse_priority(&s))
-            .transpose()?;
-        let dialect = match crate::bind_utils::get_named_string(bind, "dialect") {
-            Some(s) => schema::parse_dialect(&s)?,
-            None => DatabaseDialect::Unspecified,
-        };
-        let stream_timeout_policy = crate::config::resolve_stream_timeout_policy(bind)?;
+        vtab_safety::guard_callback("SpannerScanVTab", "bind", || {
+            let table = bind.get_parameter(0).to_string();
+            let profile = crate::bind_utils::resolve_connection_profile(bind)?;
+            let legacy_use_parallelism =
+                crate::bind_utils::get_named_bool(bind, "use_parallelism", false);
+            let parallelism_mode = crate::bind_utils::resolve_parallelism_mode(
+                crate::bind_utils::get_named_string(bind, "parallelism_mode").as_deref(),
+                legacy_use_parallelism,
+            )?;
+            let use_data_boost = crate::bind_utils::get_named_bool(bind, "use_data_boost", false);
+            let max_parallelism = crate::bind_utils::get_named_int64(bind, "max_parallelism");
+            crate::bind_utils::validate_parallelism_options(
+                parallelism_mode,
+                use_data_boost,
+                max_parallelism,
+            )?;
+            let index = crate::bind_utils::get_named_string(bind, "index").unwrap_or_default();
+            let timestamp_bound = crate::bind_utils::resolve_timestamp_bound(
+                crate::bind_utils::get_named_int64(bind, "exact_staleness_secs"),
+                crate::bind_utils::get_named_int64(bind, "max_staleness_secs"),
+                crate::bind_utils::get_named_string(bind, "read_timestamp").as_deref(),
+                crate::bind_utils::get_named_string(bind, "min_read_timestamp").as_deref(),
+            )?;
+            let priority = crate::bind_utils::get_named_string(bind, "priority")
+                .map(|s| crate::bind_utils::parse_priority(&s))
+                .transpose()?;
+            let dialect = match crate::bind_utils::get_named_string(bind, "dialect") {
+                Some(s) => schema::parse_dialect(&s)?,
+                None => DatabaseDialect::Unspecified,
+            };
+            let stream_timeout_policy = crate::config::resolve_stream_timeout_policy(bind)?;
 
-        // Discover table schema from INFORMATION_SCHEMA
-        // If dialect is specified, uses correct param syntax directly.
-        // If not, auto-detects via INFORMATION_SCHEMA.DATABASE_OPTIONS.
-        let schema_profile = profile.clone();
-        let schema_table = table.clone();
-        let columns = runtime::run_bounded(
-            "Spanner table schema discovery",
-            runtime::METADATA_DISCOVERY_TIMEOUT,
-            async move {
-                let client = client::get_or_create_client(&schema_profile).await?;
-                schema::discover_table_schema(&client, &schema_table, dialect, &schema_profile)
-                    .await
-            },
-        )??;
+            // Discover table schema from INFORMATION_SCHEMA
+            // If dialect is specified, uses correct param syntax directly.
+            // If not, auto-detects via INFORMATION_SCHEMA.DATABASE_OPTIONS.
+            let schema_profile = profile.clone();
+            let schema_table = table.clone();
+            let columns = runtime::run_bounded(
+                "Spanner table schema discovery",
+                runtime::METADATA_DISCOVERY_TIMEOUT,
+                async move {
+                    let client = client::get_or_create_client(&schema_profile).await?;
+                    schema::discover_table_schema(&client, &schema_table, dialect, &schema_profile)
+                        .await
+                },
+            )??;
 
-        // Register output columns with DuckDB
-        for col in &columns {
-            let logical_type =
-                types::spanner_type_to_logical(&col.spanner_type).map_err(|error| {
-                    SpannerError::Other(format!(
-                        "Invalid metadata for scan result column {:?}: {error}",
-                        col.name
-                    ))
-                })?;
-            bind.add_result_column(&col.name, logical_type);
-        }
+            // Register output columns with DuckDB
+            for (index, col) in columns.iter().enumerate() {
+                vtab_safety::validate_result_name(
+                    &col.name,
+                    &format!("scan result column {index}"),
+                )?;
+                let logical_type =
+                    types::spanner_type_to_logical(&col.spanner_type).map_err(|error| {
+                        SpannerError::Other(format!(
+                            "Invalid metadata for scan result column {:?}: {error}",
+                            col.name
+                        ))
+                    })?;
+                bind.add_result_column(&col.name, logical_type);
+            }
 
-        Ok(ScanBindData {
-            profile,
-            table,
-            parallelism_mode,
-            use_data_boost,
-            max_parallelism,
-            index,
-            timestamp_bound,
-            priority,
-            stream_timeout_policy,
-            columns,
+            Ok(ScanBindData {
+                profile,
+                table,
+                parallelism_mode,
+                use_data_boost,
+                max_parallelism,
+                index,
+                timestamp_bound,
+                priority,
+                stream_timeout_policy,
+                columns,
+            })
         })
     }
 
     fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
-        let bind_data = unsafe { &*init.get_bind_data::<ScanBindData>() };
-        let vector_size = vector_size::runtime_vector_size();
+        vtab_safety::guard_callback("SpannerScanVTab", "init", || {
+            let bind_data = unsafe { &*init.get_bind_data::<ScanBindData>() };
+            let vector_size = vector_size::runtime_vector_size();
 
-        // Get projected column indices (DuckDB tells us which columns it needs)
-        let projected_columns: Vec<usize> = init
-            .get_column_indices()
-            .iter()
-            .map(|&idx| idx as usize)
-            .collect();
+            // Get projected column indices (DuckDB tells us which columns it needs)
+            let projected_columns: Vec<usize> = init
+                .get_column_indices()
+                .iter()
+                .map(|&idx| idx as usize)
+                .collect();
 
-        // Determine which columns to request from Spanner
-        let column_names: Vec<String> = projected_columns
-            .iter()
-            .map(|&idx| bind_data.columns[idx].name.clone())
-            .collect();
+            // Determine which columns to request from Spanner
+            let column_names: Vec<String> = projected_columns
+                .iter()
+                .map(|&idx| bind_data.columns[idx].name.clone())
+                .collect();
 
-        // Clone bind data fields for the spawned task ('static requirement)
-        let profile = bind_data.profile.clone();
-        let table = bind_data.table.clone();
-        let index = bind_data.index.clone();
-        let parallelism_mode = bind_data.parallelism_mode;
-        let use_data_boost = bind_data.use_data_boost;
-        let max_parallelism = bind_data.max_parallelism;
-        let timestamp_bound = bind_data.timestamp_bound.clone();
-        let priority = bind_data.priority.clone();
-        let stream_timeout_policy = bind_data.stream_timeout_policy;
+            // Clone bind data fields for the spawned task ('static requirement)
+            let profile = bind_data.profile.clone();
+            let table = bind_data.table.clone();
+            let index = bind_data.index.clone();
+            let parallelism_mode = bind_data.parallelism_mode;
+            let use_data_boost = bind_data.use_data_boost;
+            let max_parallelism = bind_data.max_parallelism;
+            let timestamp_bound = bind_data.timestamp_bound.clone();
+            let priority = bind_data.priority.clone();
+            let stream_timeout_policy = bind_data.stream_timeout_policy;
 
-        let streaming = streaming::StreamingState::spawn(
-            vector_size,
-            stream_timeout_policy,
-            move |tx, cancellation| async move {
-                let rows_delivered = Arc::new(AtomicBool::new(false));
-                let client = tokio::select! {
-                    _ = cancellation.cancelled() => return Ok(()),
-                    client = client::get_or_create_client(&profile) => client?,
-                };
+            let streaming = streaming::StreamingState::spawn(
+                vector_size,
+                stream_timeout_policy,
+                move |tx, cancellation| async move {
+                    let rows_delivered = Arc::new(AtomicBool::new(false));
+                    let client = tokio::select! {
+                        _ = cancellation.cancelled() => return Ok(()),
+                        client = client::get_or_create_client(&profile) => client?,
+                    };
 
-                let col_refs: Vec<&str> = column_names.iter().map(|s| s.as_str()).collect();
+                    let col_refs: Vec<&str> = column_names.iter().map(|s| s.as_str()).collect();
 
-                if parallelism_mode.uses_partitioned_api() {
-                    match stream_partitioned_read(
+                    if parallelism_mode.uses_partitioned_api() {
+                        match stream_partitioned_read(
+                            &client,
+                            &tx,
+                            &table,
+                            &col_refs,
+                            &index,
+                            timestamp_bound.as_ref(),
+                            priority.clone(),
+                            use_data_boost,
+                            max_parallelism,
+                            rows_delivered.clone(),
+                            cancellation.clone(),
+                        )
+                        .await
+                        {
+                            Ok(()) => return Ok(()),
+                            Err(e)
+                                if should_fallback_after_partition_error(
+                                    parallelism_mode,
+                                    rows_delivered.load(Ordering::SeqCst),
+                                    &cancellation,
+                                ) =>
+                            {
+                                eprintln!("[duckdb-spanner] Partitioned read failed: {e}, falling back to single read");
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+
+                    if cancellation.is_cancelled() {
+                        return Ok(());
+                    }
+                    stream_single_read(
                         &client,
                         &tx,
                         &table,
@@ -165,49 +204,18 @@ impl VTab for SpannerScanVTab {
                         &index,
                         timestamp_bound.as_ref(),
                         priority.clone(),
-                        use_data_boost,
-                        max_parallelism,
-                        rows_delivered.clone(),
-                        cancellation.clone(),
+                        &cancellation,
                     )
                     .await
-                    {
-                        Ok(()) => return Ok(()),
-                        Err(e)
-                            if should_fallback_after_partition_error(
-                                parallelism_mode,
-                                rows_delivered.load(Ordering::SeqCst),
-                                &cancellation,
-                            ) =>
-                        {
-                            eprintln!("[duckdb-spanner] Partitioned read failed: {e}, falling back to single read");
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
+                },
+            )?;
 
-                if cancellation.is_cancelled() {
-                    return Ok(());
-                }
-                stream_single_read(
-                    &client,
-                    &tx,
-                    &table,
-                    &col_refs,
-                    &index,
-                    timestamp_bound.as_ref(),
-                    priority.clone(),
-                    &cancellation,
-                )
-                .await
-            },
-        )?;
+            init.set_max_threads(1);
 
-        init.set_max_threads(1);
-
-        Ok(ScanInitData {
-            streaming,
-            projected_columns,
+            Ok(ScanInitData {
+                streaming,
+                projected_columns,
+            })
         })
     }
 
@@ -215,27 +223,29 @@ impl VTab for SpannerScanVTab {
         func: &TableFunctionInfo<Self>,
         output: &mut DataChunkHandle,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let bind_data = func.get_bind_data();
-        let init_data = func.get_init_data();
+        vtab_safety::guard_callback("SpannerScanVTab", "func", || {
+            let bind_data = func.get_bind_data();
+            let init_data = func.get_init_data();
 
-        let batch = match init_data.streaming.next_batch()? {
-            Some(batch) => batch,
-            None => {
-                output.set_len(0);
-                return Ok(());
-            }
-        };
+            let batch = match init_data.streaming.next_batch()? {
+                Some(batch) => batch,
+                None => {
+                    output.set_len(0);
+                    return Ok(());
+                }
+            };
 
-        // Write projected columns using the unified conversion.
-        // Spanner Read API returns columns in the order we requested (projected order),
-        // so spanner_col_idx = i and output_col_idx = i.
-        write_projected_rows(
-            output,
-            &batch,
-            &bind_data.columns,
-            &init_data.projected_columns,
-        )?;
-        Ok(())
+            // Write projected columns using the unified conversion.
+            // Spanner Read API returns columns in the order we requested (projected order),
+            // so spanner_col_idx = i and output_col_idx = i.
+            write_projected_rows(
+                output,
+                &batch,
+                &bind_data.columns,
+                &init_data.projected_columns,
+            )?;
+            Ok(())
+        })
     }
 
     fn parameters() -> Option<Vec<LogicalTypeHandle>> {

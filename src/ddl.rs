@@ -20,7 +20,7 @@ use tokio::task::AbortHandle;
 use crate::cache::LruCache;
 use crate::connection::{AuthenticationMode, ConnectionProfile, EndpointMode};
 use crate::error::SpannerError;
-use crate::{bind_utils, runtime};
+use crate::{bind_utils, runtime, vtab_safety};
 
 // ---------------------------------------------------------------------------
 // Admin client cache
@@ -1454,68 +1454,72 @@ impl VTab for SpannerDdlVTab {
     type InitData = DdlInitData;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        let statements = ddl_statements_from_bind(bind)?;
-        let profile = bind_utils::resolve_connection_profile(bind)?;
+        vtab_safety::guard_callback("SpannerDdlVTab", "bind", || {
+            let statements = ddl_statements_from_bind(bind)?;
+            let profile = bind_utils::resolve_connection_profile(bind)?;
 
-        bind.add_result_column(
-            "operation_name",
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
-        );
-        bind.add_result_column("done", LogicalTypeHandle::from(LogicalTypeId::Boolean));
-        bind.add_result_column(
-            "duration_secs",
-            LogicalTypeHandle::from(LogicalTypeId::Double),
-        );
+            bind.add_result_column(
+                "operation_name",
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            );
+            bind.add_result_column("done", LogicalTypeHandle::from(LogicalTypeId::Boolean));
+            bind.add_result_column(
+                "duration_secs",
+                LogicalTypeHandle::from(LogicalTypeId::Double),
+            );
 
-        Ok(DdlBindData {
-            profile,
-            statements,
-            cached_result: Arc::new(Mutex::new(None)),
+            Ok(DdlBindData {
+                profile,
+                statements,
+                cached_result: Arc::new(Mutex::new(None)),
+            })
         })
     }
 
     fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
-        let bind_data = unsafe { &*init.get_bind_data::<DdlBindData>() };
+        vtab_safety::guard_callback("SpannerDdlVTab", "init", || {
+            let bind_data = unsafe { &*init.get_bind_data::<DdlBindData>() };
 
-        let result = cached_init_result(&bind_data.cached_result, || {
-            let profile = bind_data.profile.clone();
-            let statements = bind_data.statements.clone();
+            let result = cached_init_result(&bind_data.cached_result, || {
+                let profile = bind_data.profile.clone();
+                let statements = bind_data.statements.clone();
 
-            runtime::run(async move {
-                let overall_start = Instant::now();
-                let admin = get_or_create_admin_client(&profile).await?;
+                runtime::run(async move {
+                    let overall_start = Instant::now();
+                    let admin = get_or_create_admin_client(&profile).await?;
 
-                let start = Instant::now();
-                let op = update_database_ddl(&admin, &profile, statements).await?;
+                    let start = Instant::now();
+                    let op = update_database_ddl(&admin, &profile, statements).await?;
 
-                let operation_name = op.name.clone();
-                let remaining = DEFAULT_TIMEOUTS
-                    .operation
-                    .checked_sub(overall_start.elapsed())
-                    .ok_or_else(|| {
-                        operation_deadline_error(&operation_name, DEFAULT_TIMEOUTS.operation)
-                    })?;
-                let op =
-                    wait_database_operation(&admin, &profile, &operation_name, remaining).await?;
-                if let Some(err) = ddl_operation_error(&op) {
-                    return Err(SpannerError::Other(err));
-                }
+                    let operation_name = op.name.clone();
+                    let remaining = DEFAULT_TIMEOUTS
+                        .operation
+                        .checked_sub(overall_start.elapsed())
+                        .ok_or_else(|| {
+                            operation_deadline_error(&operation_name, DEFAULT_TIMEOUTS.operation)
+                        })?;
+                    let op = wait_database_operation(&admin, &profile, &operation_name, remaining)
+                        .await?;
+                    if let Some(err) = ddl_operation_error(&op) {
+                        return Err(SpannerError::Other(err));
+                    }
 
-                let duration_secs = start.elapsed().as_secs_f64();
+                    let duration_secs = start.elapsed().as_secs_f64();
 
-                Ok::<DdlResult, SpannerError>(DdlResult {
-                    operation_name,
-                    done: op.done,
-                    duration_secs,
-                })
-            })?
-            .map_err(Into::into)
-        })?;
+                    Ok::<DdlResult, SpannerError>(DdlResult {
+                        operation_name,
+                        done: op.done,
+                        duration_secs,
+                    })
+                })?
+                .map_err(Into::into)
+            })?;
 
-        init.set_max_threads(1);
+            init.set_max_threads(1);
 
-        Ok(DdlInitData {
-            result: Mutex::new(Some(result)),
+            Ok(DdlInitData {
+                result: Mutex::new(Some(result)),
+            })
         })
     }
 
@@ -1523,34 +1527,36 @@ impl VTab for SpannerDdlVTab {
         func: &TableFunctionInfo<Self>,
         output: &mut DataChunkHandle,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let init_data = func.get_init_data();
+        vtab_safety::guard_callback("SpannerDdlVTab", "func", || {
+            let init_data = func.get_init_data();
 
-        let result = init_data
-            .result
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+            let result = init_data
+                .result
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
 
-        match result {
-            Some(r) => {
-                let col_name = output.flat_vector(0);
-                col_name.insert(0, &r.operation_name);
-                let mut col_done = output.flat_vector(1);
-                let mut col_duration = output.flat_vector(2);
-                // SAFETY: the bind phase registers these columns as BOOLEAN and DOUBLE,
-                // and index 0 is within the single-row output batch.
-                unsafe {
-                    col_done.as_mut_slice::<bool>()[0] = r.done;
-                    col_duration.as_mut_slice::<f64>()[0] = r.duration_secs;
+            match result {
+                Some(r) => {
+                    let col_name = output.flat_vector(0);
+                    col_name.insert(0, &r.operation_name);
+                    let mut col_done = output.flat_vector(1);
+                    let mut col_duration = output.flat_vector(2);
+                    // SAFETY: the bind phase registers these columns as BOOLEAN and DOUBLE,
+                    // and index 0 is within the single-row output batch.
+                    unsafe {
+                        col_done.as_mut_slice::<bool>()[0] = r.done;
+                        col_duration.as_mut_slice::<f64>()[0] = r.duration_secs;
+                    }
+                    output.set_len(1);
                 }
-                output.set_len(1);
+                None => {
+                    output.set_len(0);
+                }
             }
-            None => {
-                output.set_len(0);
-            }
-        }
 
-        Ok(())
+            Ok(())
+        })
     }
 
     fn parameters() -> Option<Vec<LogicalTypeHandle>> {
@@ -1593,49 +1599,53 @@ impl VTab for SpannerDdlAsyncVTab {
     type InitData = DdlAsyncInitData;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        let statements = ddl_statements_from_bind(bind)?;
-        let profile = bind_utils::resolve_connection_profile(bind)?;
+        vtab_safety::guard_callback("SpannerDdlAsyncVTab", "bind", || {
+            let statements = ddl_statements_from_bind(bind)?;
+            let profile = bind_utils::resolve_connection_profile(bind)?;
 
-        bind.add_result_column(
-            "operation_name",
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
-        );
-        bind.add_result_column("done", LogicalTypeHandle::from(LogicalTypeId::Boolean));
+            bind.add_result_column(
+                "operation_name",
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            );
+            bind.add_result_column("done", LogicalTypeHandle::from(LogicalTypeId::Boolean));
 
-        Ok(DdlAsyncBindData {
-            profile,
-            statements,
-            cached_result: Arc::new(Mutex::new(None)),
+            Ok(DdlAsyncBindData {
+                profile,
+                statements,
+                cached_result: Arc::new(Mutex::new(None)),
+            })
         })
     }
 
     fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
-        let bind_data = unsafe { &*init.get_bind_data::<DdlAsyncBindData>() };
+        vtab_safety::guard_callback("SpannerDdlAsyncVTab", "init", || {
+            let bind_data = unsafe { &*init.get_bind_data::<DdlAsyncBindData>() };
 
-        let result = cached_init_result(&bind_data.cached_result, || {
-            let profile = bind_data.profile.clone();
-            let statements = bind_data.statements.clone();
+            let result = cached_init_result(&bind_data.cached_result, || {
+                let profile = bind_data.profile.clone();
+                let statements = bind_data.statements.clone();
 
-            runtime::run(async move {
-                let admin = get_or_create_admin_client(&profile).await?;
+                runtime::run(async move {
+                    let admin = get_or_create_admin_client(&profile).await?;
 
-                let op = update_database_ddl(&admin, &profile, statements).await?;
-                if let Some(err) = ddl_operation_error(&op) {
-                    return Err(SpannerError::Other(err));
-                }
+                    let op = update_database_ddl(&admin, &profile, statements).await?;
+                    if let Some(err) = ddl_operation_error(&op) {
+                        return Err(SpannerError::Other(err));
+                    }
 
-                Ok::<DdlAsyncResult, SpannerError>(DdlAsyncResult {
-                    operation_name: op.name,
-                    done: op.done,
-                })
-            })?
-            .map_err(Into::into)
-        })?;
+                    Ok::<DdlAsyncResult, SpannerError>(DdlAsyncResult {
+                        operation_name: op.name,
+                        done: op.done,
+                    })
+                })?
+                .map_err(Into::into)
+            })?;
 
-        init.set_max_threads(1);
+            init.set_max_threads(1);
 
-        Ok(DdlAsyncInitData {
-            result: Mutex::new(Some(result)),
+            Ok(DdlAsyncInitData {
+                result: Mutex::new(Some(result)),
+            })
         })
     }
 
@@ -1643,32 +1653,34 @@ impl VTab for SpannerDdlAsyncVTab {
         func: &TableFunctionInfo<Self>,
         output: &mut DataChunkHandle,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let init_data = func.get_init_data();
+        vtab_safety::guard_callback("SpannerDdlAsyncVTab", "func", || {
+            let init_data = func.get_init_data();
 
-        let result = init_data
-            .result
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+            let result = init_data
+                .result
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
 
-        match result {
-            Some(r) => {
-                let col_name = output.flat_vector(0);
-                col_name.insert(0, &r.operation_name);
-                let mut col_done = output.flat_vector(1);
-                // SAFETY: the bind phase registers this column as BOOLEAN, and index 0
-                // is within the single-row output batch.
-                unsafe {
-                    col_done.as_mut_slice::<bool>()[0] = r.done;
+            match result {
+                Some(r) => {
+                    let col_name = output.flat_vector(0);
+                    col_name.insert(0, &r.operation_name);
+                    let mut col_done = output.flat_vector(1);
+                    // SAFETY: the bind phase registers this column as BOOLEAN, and index 0
+                    // is within the single-row output batch.
+                    unsafe {
+                        col_done.as_mut_slice::<bool>()[0] = r.done;
+                    }
+                    output.set_len(1);
                 }
-                output.set_len(1);
+                None => {
+                    output.set_len(0);
+                }
             }
-            None => {
-                output.set_len(0);
-            }
-        }
 
-        Ok(())
+            Ok(())
+        })
     }
 
     fn parameters() -> Option<Vec<LogicalTypeHandle>> {
@@ -1713,42 +1725,45 @@ impl VTab for SpannerOperationsVTab {
     type InitData = OperationsInitData;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-        let profile = bind_utils::resolve_connection_profile(bind)?;
-        let filter = bind_utils::get_named_string(bind, "filter");
+        vtab_safety::guard_callback("SpannerOperationsVTab", "bind", || {
+            let profile = bind_utils::resolve_connection_profile(bind)?;
+            let filter = bind_utils::get_named_string(bind, "filter");
 
-        bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-        bind.add_result_column("done", LogicalTypeHandle::from(LogicalTypeId::Boolean));
-        bind.add_result_column(
-            "metadata_type",
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
-        );
-        bind.add_result_column(
-            "error_code",
-            LogicalTypeHandle::from(LogicalTypeId::Integer),
-        );
-        bind.add_result_column(
-            "error_message",
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
-        );
+            bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
+            bind.add_result_column("done", LogicalTypeHandle::from(LogicalTypeId::Boolean));
+            bind.add_result_column(
+                "metadata_type",
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            );
+            bind.add_result_column(
+                "error_code",
+                LogicalTypeHandle::from(LogicalTypeId::Integer),
+            );
+            bind.add_result_column(
+                "error_message",
+                LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            );
 
-        Ok(OperationsBindData { profile, filter })
+            Ok(OperationsBindData { profile, filter })
+        })
     }
 
     fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
-        let bind_data = unsafe { &*init.get_bind_data::<OperationsBindData>() };
+        vtab_safety::guard_callback("SpannerOperationsVTab", "init", || {
+            let bind_data = unsafe { &*init.get_bind_data::<OperationsBindData>() };
 
-        let profile = bind_data.profile.clone();
-        let filter = bind_data.filter.clone();
+            let profile = bind_data.profile.clone();
+            let filter = bind_data.filter.clone();
 
-        let ops =
-            runtime::run(
-                async move { list_database_operations(&profile, filter.as_deref()).await },
-            )??;
+            let ops = runtime::run(async move {
+                list_database_operations(&profile, filter.as_deref()).await
+            })??;
 
-        init.set_max_threads(1);
+            init.set_max_threads(1);
 
-        Ok(OperationsInitData {
-            operations: Mutex::new(ops),
+            Ok(OperationsInitData {
+                operations: Mutex::new(ops),
+            })
         })
     }
 
@@ -1756,54 +1771,56 @@ impl VTab for SpannerOperationsVTab {
         func: &TableFunctionInfo<Self>,
         output: &mut DataChunkHandle,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let init_data = func.get_init_data();
+        vtab_safety::guard_callback("SpannerOperationsVTab", "func", || {
+            let init_data = func.get_init_data();
 
-        let mut ops = init_data
-            .operations
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+            let mut ops = init_data
+                .operations
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
 
-        if ops.is_empty() {
-            output.set_len(0);
-            return Ok(());
-        }
-
-        // Drain at most one DuckDB data chunk per call.
-        let batch_size = ops.len().min(crate::vector_size::runtime_vector_size());
-        let batch: Vec<OperationRow> = ops.drain(..batch_size).collect();
-
-        let col_name = output.flat_vector(0);
-        let mut col_done = output.flat_vector(1);
-        let col_metadata_type = output.flat_vector(2);
-        let mut col_error_code = output.flat_vector(3);
-        let mut col_error_message = output.flat_vector(4);
-
-        // SAFETY: the bind phase registers `done` as BOOLEAN, and the loop
-        // only writes indices within the drained batch size.
-        let done_values = unsafe { col_done.as_mut_slice::<bool>() };
-        for (i, row) in batch.iter().enumerate() {
-            col_name.insert(i, &row.name);
-            done_values[i] = row.done;
-            col_metadata_type.insert(i, &row.metadata_type);
-            if row.error_code.is_none() {
-                col_error_code.set_null(i);
+            if ops.is_empty() {
+                output.set_len(0);
+                return Ok(());
             }
-            match &row.error_message {
-                Some(msg) => col_error_message.insert(i, msg),
-                None => col_error_message.set_null(i),
-            }
-        }
-        // SAFETY: the bind phase registers `error_code` as INTEGER, and the loop
-        // only writes indices within the drained batch size.
-        let error_code_values = unsafe { col_error_code.as_mut_slice::<i32>() };
-        for (i, row) in batch.iter().enumerate() {
-            if let Some(code) = row.error_code {
-                error_code_values[i] = code;
-            }
-        }
 
-        output.set_len(batch.len());
-        Ok(())
+            // Drain at most one DuckDB data chunk per call.
+            let batch_size = ops.len().min(crate::vector_size::runtime_vector_size());
+            let batch: Vec<OperationRow> = ops.drain(..batch_size).collect();
+
+            let col_name = output.flat_vector(0);
+            let mut col_done = output.flat_vector(1);
+            let col_metadata_type = output.flat_vector(2);
+            let mut col_error_code = output.flat_vector(3);
+            let mut col_error_message = output.flat_vector(4);
+
+            // SAFETY: the bind phase registers `done` as BOOLEAN, and the loop
+            // only writes indices within the drained batch size.
+            let done_values = unsafe { col_done.as_mut_slice::<bool>() };
+            for (i, row) in batch.iter().enumerate() {
+                col_name.insert(i, &row.name);
+                done_values[i] = row.done;
+                col_metadata_type.insert(i, &row.metadata_type);
+                if row.error_code.is_none() {
+                    col_error_code.set_null(i);
+                }
+                match &row.error_message {
+                    Some(msg) => col_error_message.insert(i, msg),
+                    None => col_error_message.set_null(i),
+                }
+            }
+            // SAFETY: the bind phase registers `error_code` as INTEGER, and the loop
+            // only writes indices within the drained batch size.
+            let error_code_values = unsafe { col_error_code.as_mut_slice::<i32>() };
+            for (i, row) in batch.iter().enumerate() {
+                if let Some(code) = row.error_code {
+                    error_code_values[i] = code;
+                }
+            }
+
+            output.set_len(batch.len());
+            Ok(())
+        })
     }
 
     fn parameters() -> Option<Vec<LogicalTypeHandle>> {
