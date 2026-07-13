@@ -94,8 +94,9 @@ exact annotated release-tag commit. Dispatch the **Stage Release Assets**
 workflow at that tag ref, providing the tag and source run ID. The workflow
 requires its dispatch ref, tag, source run, and empty draft release to agree on
 that commit, smoke-loads five platform artifacts on matching native DuckDB
-`v1.5.4` runners, generates `SHA256SUMS`, and attaches those exact bytes to the
-draft. The additional `windows_amd64_mingw` artifact is best-effort, matching
+`v1.5.4` runners, packages each verified binary as the sole canonical member of
+a platform ZIP, generates `SHA256SUMS` for those archives, and attaches them to
+the draft. The additional `windows_amd64_mingw` artifact is best-effort, matching
 [DuckDB's upstream support tier](https://duckdb.org/docs/stable/dev/building/overview#platforms-with-best-effort-support).
 GitHub's Windows runner and Python DuckDB wheel use the incompatible MSVC
 platform, so CI validates the MinGW artifact's metadata and PE import table
@@ -109,7 +110,8 @@ Each platform archive includes its target platform in the asset name, for
 example `spanner-v1.5.4-linux_amd64.zip`. Every archive contains exactly one
 file named `spanner.duckdb_extension`. Keep that canonical filename when
 extracting it: DuckDB derives the extension initialization symbol from the
-filename.
+filename. Verify the ZIP against `SHA256SUMS`, extract it into an empty
+directory, and load that sole member without renaming it.
 
 ### Loading the Extension
 

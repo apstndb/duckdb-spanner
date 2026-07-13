@@ -1,5 +1,6 @@
 import importlib.util
 from pathlib import Path
+import subprocess
 from tempfile import TemporaryDirectory
 import unittest
 from zipfile import ZipFile
@@ -63,6 +64,42 @@ class PackageReleaseAssetsTests(unittest.TestCase):
                 [archive.read_bytes() for archive in first],
                 [archive.read_bytes() for archive in second],
             )
+
+    def test_external_unzip_reads_exact_payload(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            payloads = self.create_inputs(root / "input")
+            archives = packaging.package_release_assets(
+                root / "input", root / "output", TEST_DUCKDB_VERSION
+            )
+            archive = archives[0]
+            subprocess.run(
+                ["unzip", "-t", archive], check=True, capture_output=True
+            )
+            extracted = subprocess.run(
+                ["unzip", "-p", archive, packaging.CANONICAL_FILENAME],
+                check=True,
+                capture_output=True,
+            ).stdout
+            self.assertEqual(extracted, payloads[packaging.PLATFORMS[0]])
+
+    def test_rejects_empty_artifact_and_cleans_partial_output(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.create_inputs(root / "input")
+            empty = (
+                root
+                / "input"
+                / f"spanner-{TEST_DUCKDB_VERSION}-extension-osx_arm64"
+                / packaging.CANONICAL_FILENAME
+            )
+            empty.write_bytes(b"")
+            with self.assertRaisesRegex(RuntimeError, "verified artifact is empty"):
+                packaging.package_release_assets(
+                    root / "input", root / "output", TEST_DUCKDB_VERSION
+                )
+            self.assertFalse((root / "output").exists())
+            self.assertFalse((root / ".output.tmp").exists())
 
     def test_rejects_missing_platform(self) -> None:
         with TemporaryDirectory() as directory:
