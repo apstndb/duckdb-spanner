@@ -29,13 +29,14 @@ def main() -> None:
         raise SystemExit(f"usage: {sys.argv[0]} ARTIFACT")
 
     artifact = Path(sys.argv[1]).resolve(strict=True)
-    escaped_path = str(artifact).replace("'", "''")
+    escaped_path = artifact.as_posix().replace("'", "''")
 
     signed_only_connection = duckdb.connect()
     try:
         signed_only_connection.execute(f"LOAD '{escaped_path}'")
     except duckdb.Error as error:
         message = str(error).lower()
+        # Both markers are required so an unrelated LOAD failure cannot pass.
         if "signature" not in message or "unsigned extension" not in message:
             raise RuntimeError(f"unexpected signed-only LOAD failure: {error}") from error
     else:

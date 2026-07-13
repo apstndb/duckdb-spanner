@@ -20,7 +20,10 @@ FIELDS = {
 
 def footer_field(footer: bytes, offset: int) -> str:
     raw = footer[offset : offset + FIELD_SIZE].split(b"\0", 1)[0]
-    return raw.decode("ascii")
+    try:
+        return raw.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise RuntimeError(f"metadata field at offset {offset} is not ASCII") from error
 
 
 def main() -> None:
