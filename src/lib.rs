@@ -143,6 +143,7 @@ const CONFIG_OPTION_NAMES: &[&str] = &[
     "spanner_endpoint",
     "spanner_endpoint_mode",
     "spanner_admin_endpoint",
+    "spanner_stream_idle_timeout_secs",
 ];
 
 const FUNCTION_NAMES: &[&str] = &[
@@ -1107,6 +1108,39 @@ HRVeBmUqB9ZvD2iFzjibxg==
             // duplicate status, is the retry defense for this surface.
             scalars::register_scalars_c_api(raw_con).unwrap();
             scalars::register_scalars_c_api(raw_con).unwrap();
+        }
+    }
+
+    #[test]
+    fn stream_idle_timeout_config_registers_bigint_default_and_overrides() {
+        unsafe {
+            let handles = open_registration_handles();
+            let raw_con = handles.raw_connection();
+            let con = handles.connection();
+            register_config_options(raw_con).unwrap();
+
+            let setting = || {
+                con.query_row(
+                    "SELECT current_setting('spanner_stream_idle_timeout_secs')::BIGINT",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+            };
+            assert_eq!(setting(), 900);
+
+            con.execute_batch("SET spanner_stream_idle_timeout_secs = 42")
+                .unwrap();
+            assert_eq!(setting(), 42);
+
+            con.execute_batch("SET spanner_stream_idle_timeout_secs = 0")
+                .unwrap();
+            assert_eq!(setting(), 0);
+
+            let error = con
+                .execute_batch("SET spanner_stream_idle_timeout_secs = 9223372036854775808")
+                .unwrap_err();
+            assert!(error.to_string().contains("INT64"), "{error}");
         }
     }
 

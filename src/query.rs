@@ -25,6 +25,7 @@ pub struct QueryBindData {
     timestamp_bound: Option<crate::bind_utils::TimestampBoundConfig>,
     priority: Option<Priority>,
     params_json: Option<String>,
+    stream_timeout_policy: streaming::StreamTimeoutPolicy,
     columns: Vec<ColumnInfo>,
 }
 
@@ -64,15 +65,21 @@ impl VTab for SpannerQueryVTab {
             .map(|s| crate::bind_utils::parse_priority(&s))
             .transpose()?;
         let params_json = crate::bind_utils::get_named_string(bind, "params");
+        let stream_timeout_policy = crate::config::resolve_stream_timeout_policy(bind)?;
 
         // Discover output schema
         let schema_profile = profile.clone();
         let schema_sql = sql.clone();
         let schema_params_json = params_json.clone();
-        let columns = runtime::run(async move {
-            let client = client::get_or_create_client(&schema_profile).await?;
-            schema::discover_query_schema(&client, &schema_sql, schema_params_json.as_deref()).await
-        })??;
+        let columns = runtime::run_bounded(
+            "Spanner query schema discovery",
+            runtime::METADATA_DISCOVERY_TIMEOUT,
+            async move {
+                let client = client::get_or_create_client(&schema_profile).await?;
+                schema::discover_query_schema(&client, &schema_sql, schema_params_json.as_deref())
+                    .await
+            },
+        )??;
 
         // Register output columns with DuckDB
         for col in &columns {
@@ -95,6 +102,7 @@ impl VTab for SpannerQueryVTab {
             timestamp_bound,
             priority,
             params_json,
+            stream_timeout_policy,
             columns,
         })
     }
@@ -112,9 +120,11 @@ impl VTab for SpannerQueryVTab {
         let max_parallelism = bind_data.max_parallelism;
         let timestamp_bound = bind_data.timestamp_bound.clone();
         let priority = bind_data.priority.clone();
+        let stream_timeout_policy = bind_data.stream_timeout_policy;
 
         let streaming = streaming::StreamingState::spawn(
             vector_size,
+            stream_timeout_policy,
             move |tx, cancellation| async move {
                 let rows_delivered = Arc::new(AtomicBool::new(false));
                 let client = tokio::select! {

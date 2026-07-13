@@ -302,6 +302,26 @@ SELECT * FROM spanner_tables(
 SELECT * FROM spanner_tables(dialect := 'googlesql');
 ```
 
+### Foreground Timeout Contract
+
+Active foreground callbacks use finite defaults so DuckDB does not silently
+wait forever for a stalled Spanner endpoint.
+
+- Query/scan schema planning, `spanner_tables` discovery, COPY client setup,
+  and COPY target-schema discovery each have a 60-second bound. Client creation
+  also retains its existing 15-second connection bound.
+- `spanner_query` and `spanner_scan` streams default to a 900-second (15-minute)
+  idle bound per next-batch request. Set `spanner_stream_idle_timeout_secs` from
+  `1` through `31536000` seconds to override it, or set it to `0` to disable the
+  stream idle timeout. This is an idle policy, not a statement-wide deadline.
+
+An expired foreground wait returns a timeout error and cancels the submitted
+runtime work; it is never reported as a clean end of stream. Disabling the idle
+timer does not alter producer errors or an already-latched timeout. DDL keeps
+its documented operation policy below, and each COPY write batch keeps the
+existing bounded transaction retry policy because a timeout there can leave a
+commit outcome unknown.
+
 ### Config Options
 
 Session-level defaults can be set via `SET` statements. These are used when the corresponding named parameter is not specified.
@@ -315,6 +335,7 @@ Session-level defaults can be set via `SET` statements. These are used when the 
 | `spanner_endpoint` | VARCHAR | Default gRPC endpoint |
 | `spanner_endpoint_mode` | VARCHAR | Default connection profile: `default`, `emulator`, `custom`, or `omni` |
 | `spanner_admin_endpoint` | VARCHAR | Default admin endpoint for DDL/operations; mode determines credentials and default scheme |
+| `spanner_stream_idle_timeout_secs` | BIGINT | Per-next-batch query/scan idle timeout in seconds (default `900`, `0` disables, maximum `31536000`) |
 
 ### Database Resolution
 
@@ -753,6 +774,7 @@ This extension registers the following names into the global DuckDB namespace.
 | `spanner_endpoint` | VARCHAR | Default gRPC endpoint |
 | `spanner_endpoint_mode` | VARCHAR | Default connection profile |
 | `spanner_admin_endpoint` | VARCHAR | Default admin endpoint for DDL/operations |
+| `spanner_stream_idle_timeout_secs` | BIGINT | Query/scan idle timeout seconds (default `900`, `0` disables, maximum `31536000`) |
 
 ### Convenience Macro Pattern
 

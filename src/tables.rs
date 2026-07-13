@@ -70,10 +70,14 @@ impl VTab for SpannerTablesVTab {
             table_name: crate::bind_utils::get_named_string(bind, "table_name"),
         };
 
-        let rows = runtime::run(async move {
-            let client = client::get_or_create_client(&profile).await?;
-            list_tables(&client, &profile, dialect, &filters).await
-        })??;
+        let rows = runtime::run_bounded(
+            "Spanner table discovery",
+            runtime::METADATA_DISCOVERY_TIMEOUT,
+            async move {
+                let client = client::get_or_create_client(&profile).await?;
+                list_tables(&client, &profile, dialect, &filters).await
+            },
+        )??;
 
         bind.set_cardinality(rows.len() as u64, true);
         Ok(TablesBindData { rows })

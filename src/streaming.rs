@@ -9,6 +9,44 @@ use crate::error::SpannerError;
 use crate::runtime;
 
 const PRODUCER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+pub(crate) const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: i64 = 15 * 60;
+pub(crate) const MAX_STREAM_IDLE_TIMEOUT_SECS: i64 = 365 * 24 * 60 * 60;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct StreamTimeoutPolicy(Option<Duration>);
+
+impl StreamTimeoutPolicy {
+    pub(crate) fn from_seconds(seconds: i64) -> Result<Self, String> {
+        match seconds {
+            ..=-1 => Err(format!(
+                "spanner_stream_idle_timeout_secs must be non-negative, got {seconds}"
+            )),
+            0 => Ok(Self(None)),
+            1..=MAX_STREAM_IDLE_TIMEOUT_SECS => {
+                Ok(Self(Some(Duration::from_secs(seconds as u64))))
+            }
+            _ => Err(format!(
+                "spanner_stream_idle_timeout_secs must not exceed {MAX_STREAM_IDLE_TIMEOUT_SECS}, got {seconds}"
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    const fn enabled(timeout: Duration) -> Self {
+        Self(Some(timeout))
+    }
+
+    const fn timeout(self) -> Option<Duration> {
+        self.0
+    }
+}
+
+impl Default for StreamTimeoutPolicy {
+    fn default() -> Self {
+        Self::from_seconds(DEFAULT_STREAM_IDLE_TIMEOUT_SECS)
+            .expect("default stream idle timeout must be valid")
+    }
+}
 
 struct CompletionSignal(Option<std_mpsc::SyncSender<()>>);
 
@@ -85,6 +123,8 @@ pub struct StreamingState<T: Send + 'static> {
     cancellation: CancellationToken,
     reporter_done: Mutex<Option<std_mpsc::Receiver<()>>>,
     shutdown_timeout: Duration,
+    timeout_policy: StreamTimeoutPolicy,
+    timeout_error: Mutex<Option<String>>,
     #[cfg(test)]
     fallback_probe: Option<std_mpsc::SyncSender<()>>,
 }
@@ -94,18 +134,29 @@ where
     T: Send + 'static,
 {
     /// Start a bounded producer and retain cancellation for its lifetime.
-    pub fn spawn<F, Fut>(batch_size: usize, producer: F) -> Result<Self, SpannerError>
+    pub(crate) fn spawn<F, Fut>(
+        batch_size: usize,
+        timeout_policy: StreamTimeoutPolicy,
+        producer: F,
+    ) -> Result<Self, SpannerError>
     where
         F: FnOnce(mpsc::Sender<Result<T, SpannerError>>, CancellationToken) -> Fut,
         Fut: std::future::Future<Output = Result<(), SpannerError>> + Send + 'static,
     {
         #[cfg(test)]
         {
-            Self::spawn_inner(batch_size, producer, None, PRODUCER_SHUTDOWN_TIMEOUT, None)
+            Self::spawn_inner(
+                batch_size,
+                timeout_policy,
+                producer,
+                None,
+                PRODUCER_SHUTDOWN_TIMEOUT,
+                None,
+            )
         }
         #[cfg(not(test))]
         {
-            Self::spawn_inner(batch_size, producer)
+            Self::spawn_inner(batch_size, timeout_policy, producer)
         }
     }
 
@@ -122,6 +173,7 @@ where
     {
         Self::spawn_inner(
             batch_size,
+            StreamTimeoutPolicy::default(),
             producer,
             Some(ReporterSendProbe {
                 pending: Some(reporter_send_pending),
@@ -145,6 +197,7 @@ where
     {
         Self::spawn_inner(
             batch_size,
+            StreamTimeoutPolicy::default(),
             producer,
             None,
             shutdown_timeout,
@@ -152,8 +205,29 @@ where
         )
     }
 
+    #[cfg(test)]
+    fn spawn_with_idle_timeout<F, Fut>(
+        batch_size: usize,
+        producer: F,
+        idle_timeout: Duration,
+    ) -> Result<Self, SpannerError>
+    where
+        F: FnOnce(mpsc::Sender<Result<T, SpannerError>>, CancellationToken) -> Fut,
+        Fut: std::future::Future<Output = Result<(), SpannerError>> + Send + 'static,
+    {
+        Self::spawn_inner(
+            batch_size,
+            StreamTimeoutPolicy::enabled(idle_timeout),
+            producer,
+            None,
+            PRODUCER_SHUTDOWN_TIMEOUT,
+            None,
+        )
+    }
+
     fn spawn_inner<F, Fut>(
         batch_size: usize,
+        timeout_policy: StreamTimeoutPolicy,
         producer: F,
         #[cfg(test)] reporter_send_probe: Option<ReporterSendProbe>,
         #[cfg(test)] shutdown_timeout: Duration,
@@ -209,6 +283,8 @@ where
             cancellation,
             reporter_done: Mutex::new(Some(reporter_done_rx)),
             shutdown_timeout,
+            timeout_policy,
+            timeout_error: Mutex::new(None),
             #[cfg(test)]
             fallback_probe,
         })
@@ -217,9 +293,15 @@ where
     /// Receive one row on the runtime owner, then drain immediately available
     /// rows into a DuckDB-sized batch. `None` is a clean end of stream.
     pub fn next_batch(&self) -> Result<Option<Vec<T>>, SpannerError> {
+        if let Some(error) = self.timeout_error() {
+            return Err(error);
+        }
+
+        let timeout_name = "Spanner stream idle";
+
         let mut lease = ReceiverLease::acquire(Arc::clone(&self.receiver))?;
         let batch_size = self.batch_size;
-        let (lease, result) = runtime::run(async move {
+        let wait = async move {
             let result = async {
                 let receiver = lease.receiver_mut();
                 let first = match receiver.recv().await {
@@ -244,9 +326,52 @@ where
             }
             .await;
             (lease, result)
-        })?;
-        drop(lease);
-        result
+        };
+        let result = match self.timeout_policy.timeout() {
+            Some(wait_timeout) => runtime::run_bounded(timeout_name, wait_timeout, wait),
+            None => runtime::run(wait).map_err(runtime::RuntimeWaitError::Runtime),
+        };
+        match result {
+            Ok((lease, result)) => {
+                drop(lease);
+                result
+            }
+            Err(runtime::RuntimeWaitError::TimedOut { timeout, .. }) => {
+                Err(self.fail_timeout(timeout_name, timeout))
+            }
+            Err(error) => Err(error.into_spanner_error()),
+        }
+    }
+
+    fn timeout_error(&self) -> Option<SpannerError> {
+        self.timeout_error
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|message| SpannerError::Other(message.clone()))
+    }
+
+    fn fail_timeout(&self, operation: &str, timeout: Duration) -> SpannerError {
+        let message = format!(
+            "{operation} timed out after {}s; stream was cancelled",
+            timeout.as_secs_f64()
+        );
+        let mut timeout_error = self
+            .timeout_error
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if timeout_error.is_none() {
+            *timeout_error = Some(message);
+            self.cancellation.cancel();
+            self.producer_abort.abort();
+            self.reporter_abort.abort();
+        }
+        SpannerError::Other(
+            timeout_error
+                .as_ref()
+                .expect("timeout error must be set")
+                .clone(),
+        )
     }
 }
 
@@ -342,15 +467,84 @@ mod tests {
     }
 
     #[test]
+    fn stream_timeout_policy_defaults_to_fifteen_minutes() {
+        assert_eq!(
+            StreamTimeoutPolicy::default().timeout(),
+            Some(Duration::from_secs(900))
+        );
+    }
+
+    #[test]
+    fn stream_timeout_policy_accepts_positive_override() {
+        assert_eq!(
+            StreamTimeoutPolicy::from_seconds(42).unwrap().timeout(),
+            Some(Duration::from_secs(42))
+        );
+    }
+
+    #[test]
+    fn stream_timeout_policy_zero_disables_idle_timeout() {
+        assert_eq!(
+            StreamTimeoutPolicy::from_seconds(0).unwrap().timeout(),
+            None
+        );
+    }
+
+    #[test]
+    fn disabled_idle_timeout_waits_for_delayed_row() {
+        let state = StreamingState::spawn(
+            1,
+            StreamTimeoutPolicy::from_seconds(0).unwrap(),
+            move |tx, _cancellation| async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                tx.send(Ok(7)).await.unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(state.next_batch().unwrap(), Some(vec![7]));
+        assert_eq!(state.next_batch().unwrap(), None);
+    }
+
+    #[test]
+    fn stream_timeout_policy_rejects_negative_timeout() {
+        let error = StreamTimeoutPolicy::from_seconds(-1).unwrap_err();
+        assert!(error.contains("must be non-negative"), "{error}");
+    }
+
+    #[test]
+    fn stream_timeout_policy_accepts_maximum() {
+        assert_eq!(
+            StreamTimeoutPolicy::from_seconds(MAX_STREAM_IDLE_TIMEOUT_SECS)
+                .unwrap()
+                .timeout(),
+            Some(Duration::from_secs(MAX_STREAM_IDLE_TIMEOUT_SECS as u64))
+        );
+    }
+
+    #[test]
+    fn stream_timeout_policy_rejects_above_maximum() {
+        for seconds in [MAX_STREAM_IDLE_TIMEOUT_SECS + 1, i64::MAX] {
+            let error = StreamTimeoutPolicy::from_seconds(seconds).unwrap_err();
+            assert!(error.contains("must not exceed 31536000"), "{error}");
+        }
+    }
+
+    #[test]
     fn dropping_state_cancels_a_pending_producer_promptly() {
         let (started_tx, started_rx) = sync_channel(1);
         let (dropped_tx, dropped_rx) = sync_channel(1);
-        let state = StreamingState::<usize>::spawn(1, move |_tx, cancellation| async move {
-            let _drop_signal = DropSignal(Some(dropped_tx));
-            started_tx.send(()).unwrap();
-            cancellation.cancelled().await;
-            Ok(())
-        })
+        let state = StreamingState::<usize>::spawn(
+            1,
+            StreamTimeoutPolicy::default(),
+            move |_tx, cancellation| async move {
+                let _drop_signal = DropSignal(Some(dropped_tx));
+                started_tx.send(()).unwrap();
+                cancellation.cancelled().await;
+                Ok(())
+            },
+        )
         .unwrap();
 
         started_rx
@@ -364,12 +558,16 @@ mod tests {
 
     #[test]
     fn producer_panic_is_reported_as_a_stream_error() {
-        let state = StreamingState::<usize>::spawn(1, |_tx, _cancellation| async move {
-            if std::hint::black_box(true) {
-                panic!("test producer panic");
-            }
-            Ok(())
-        })
+        let state = StreamingState::<usize>::spawn(
+            1,
+            StreamTimeoutPolicy::default(),
+            |_tx, _cancellation| async move {
+                if std::hint::black_box(true) {
+                    panic!("test producer panic");
+                }
+                Ok(())
+            },
+        )
         .unwrap();
 
         let error = state.next_batch().unwrap_err();
@@ -378,9 +576,13 @@ mod tests {
 
     #[test]
     fn producer_error_is_reported_as_a_stream_error() {
-        let state = StreamingState::<usize>::spawn(1, |_tx, _cancellation| async move {
-            Err(SpannerError::Other("test producer error".to_string()))
-        })
+        let state = StreamingState::<usize>::spawn(
+            1,
+            StreamTimeoutPolicy::default(),
+            |_tx, _cancellation| async move {
+                Err(SpannerError::Other("test producer error".to_string()))
+            },
+        )
         .unwrap();
 
         let error = state.next_batch().unwrap_err();
@@ -388,15 +590,56 @@ mod tests {
     }
 
     #[test]
+    fn never_ready_producer_hits_the_idle_deadline() {
+        let (started_tx, started_rx) = sync_channel(1);
+        let (dropped_tx, dropped_rx) = sync_channel(1);
+        let state = StreamingState::<usize>::spawn_with_idle_timeout(
+            1,
+            move |_tx, _cancellation| async move {
+                let _drop_signal = DropSignal(Some(dropped_tx));
+                started_tx.send(()).unwrap();
+                std::future::pending::<Result<(), SpannerError>>().await
+            },
+            Duration::from_millis(10),
+        )
+        .unwrap();
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("producer did not start");
+        let error = state.next_batch().unwrap_err();
+        assert!(
+            error.to_string().contains("stream idle timed out"),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("stream was cancelled"),
+            "{error}"
+        );
+        dropped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("idle timeout did not abort the producer");
+        assert!(state
+            .next_batch()
+            .unwrap_err()
+            .to_string()
+            .contains("stream idle timed out"));
+    }
+
+    #[test]
     fn next_batch_drains_available_rows_after_the_first_row() {
         let (sent_tx, sent_rx) = sync_channel(1);
-        let state = StreamingState::spawn(4, move |tx, _cancellation| async move {
-            for row in 1..=4 {
-                tx.send(Ok(row)).await.unwrap();
-            }
-            sent_tx.send(()).unwrap();
-            Ok(())
-        })
+        let state = StreamingState::spawn(
+            4,
+            StreamTimeoutPolicy::default(),
+            move |tx, _cancellation| async move {
+                for row in 1..=4 {
+                    tx.send(Ok(row)).await.unwrap();
+                }
+                sent_tx.send(()).unwrap();
+                Ok(())
+            },
+        )
         .unwrap();
 
         sent_rx
@@ -407,11 +650,15 @@ mod tests {
     }
 
     fn assert_next_batch_from_tokio_worker() {
-        let state = StreamingState::spawn(2, move |tx, _cancellation| async move {
-            tx.send(Ok(10)).await.unwrap();
-            tx.send(Ok(20)).await.unwrap();
-            Ok(())
-        })
+        let state = StreamingState::spawn(
+            2,
+            StreamTimeoutPolicy::default(),
+            move |tx, _cancellation| async move {
+                tx.send(Ok(10)).await.unwrap();
+                tx.send(Ok(20)).await.unwrap();
+                Ok(())
+            },
+        )
         .unwrap();
 
         assert_eq!(state.next_batch().unwrap(), Some(vec![10, 20]));
@@ -433,11 +680,15 @@ mod tests {
     #[test]
     fn next_batch_restores_receiver_after_owner_reentry_rejection() {
         let state = Arc::new(
-            StreamingState::spawn(1, move |tx, cancellation| async move {
-                tx.send(Ok(7)).await.unwrap();
-                cancellation.cancelled().await;
-                Ok(())
-            })
+            StreamingState::spawn(
+                1,
+                StreamTimeoutPolicy::default(),
+                move |tx, cancellation| async move {
+                    tx.send(Ok(7)).await.unwrap();
+                    cancellation.cancelled().await;
+                    Ok(())
+                },
+            )
             .unwrap(),
         );
         let task_state = Arc::clone(&state);
@@ -489,18 +740,22 @@ mod tests {
     fn dropping_state_quiesces_partition_children_before_returning() {
         let (started_tx, started_rx) = sync_channel(1);
         let (dropped_tx, dropped_rx) = sync_channel(1);
-        let state = StreamingState::<usize>::spawn(1, move |_tx, cancellation| async move {
-            runtime::run_bounded_partitions([()], 1, cancellation, move |_, _| {
-                let started_tx = started_tx.clone();
-                let dropped_tx = dropped_tx.clone();
-                async move {
-                    let _drop_signal = DropSignal(Some(dropped_tx));
-                    started_tx.send(()).unwrap();
-                    std::future::pending::<Result<(), SpannerError>>().await
-                }
-            })
-            .await
-        })
+        let state = StreamingState::<usize>::spawn(
+            1,
+            StreamTimeoutPolicy::default(),
+            move |_tx, cancellation| async move {
+                runtime::run_bounded_partitions([()], 1, cancellation, move |_, _| {
+                    let started_tx = started_tx.clone();
+                    let dropped_tx = dropped_tx.clone();
+                    async move {
+                        let _drop_signal = DropSignal(Some(dropped_tx));
+                        started_tx.send(()).unwrap();
+                        std::future::pending::<Result<(), SpannerError>>().await
+                    }
+                })
+                .await
+            },
+        )
         .unwrap();
 
         started_rx

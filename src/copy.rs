@@ -458,9 +458,13 @@ unsafe fn copy_global_init_inner(
 
     // Connect to Spanner
     let profile = bind_data.profile.clone();
-    let client = runtime::run(async move { client::get_or_create_client(&profile).await })
-        .map_err(|e| format!("Runtime error: {e}"))?
-        .map_err(|e| format!("Failed to connect to Spanner: {e}"))?;
+    let client = runtime::run_bounded(
+        "Spanner COPY client setup",
+        runtime::METADATA_DISCOVERY_TIMEOUT,
+        async move { client::get_or_create_client(&profile).await },
+    )
+    .map_err(|e| format!("Runtime error: {e}"))?
+    .map_err(|e| format!("Failed to connect to Spanner: {e}"))?;
 
     // An explicit dialect avoids metadata discovery for endpoints that do not
     // expose INFORMATION_SCHEMA.DATABASE_OPTIONS. COPY discovery retains
@@ -469,15 +473,19 @@ unsafe fn copy_global_init_inner(
     let schema_table_name = table_name.clone();
     let schema_dialect = bind_data.dialect.clone();
     let schema_profile = bind_data.profile.clone();
-    let schema_columns = runtime::run(async move {
-        schema::discover_table_schema_for_copy(
-            &schema_client,
-            &schema_table_name,
-            schema_dialect,
-            &schema_profile,
-        )
-        .await
-    })
+    let schema_columns = runtime::run_bounded(
+        "Spanner COPY schema discovery",
+        runtime::METADATA_DISCOVERY_TIMEOUT,
+        async move {
+            schema::discover_table_schema_for_copy(
+                &schema_client,
+                &schema_table_name,
+                schema_dialect,
+                &schema_profile,
+            )
+            .await
+        },
+    )
     .map_err(|e| format!("Runtime error: {e}"))?
     .map_err(|e| format!("Schema discovery failed for table '{table_name}': {e}"))?;
 
