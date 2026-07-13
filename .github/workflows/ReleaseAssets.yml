@@ -31,7 +31,8 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       actions: read
-      contents: read
+      # Draft releases are visible only to tokens with push access.
+      contents: write
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
