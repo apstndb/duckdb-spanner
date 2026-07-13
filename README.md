@@ -105,8 +105,11 @@ workflow and draft inspection succeed. Published assets are never rebuilt or
 replaced by a release event; releases created outside this flow receive no
 automatic assets.
 
-Each asset name includes its target platform, for example
-`spanner-v1.5.4-linux_amd64.duckdb_extension`.
+Each platform archive includes its target platform in the asset name, for
+example `spanner-v1.5.4-linux_amd64.zip`. Every archive contains exactly one
+file named `spanner.duckdb_extension`. Keep that canonical filename when
+extracting it: DuckDB derives the extension initialization symbol from the
+filename.
 
 ### Loading the Extension
 

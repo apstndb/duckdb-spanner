@@ -187,6 +187,12 @@ jobs:
       GH_REPO: ${{ github.repository }}
       RELEASE_TAG: ${{ inputs.release_tag }}
     steps:
+      - name: Check out the release tag
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: refs/tags/${{ inputs.release_tag }}
+          persist-credentials: false
+
       - name: Download all verified artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -196,28 +202,16 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ inputs.source_run_id }}
 
-      - name: Name assets and generate checksums
+      - name: Package assets and generate checksums
         shell: bash
         run: |
           set -euo pipefail
-          platforms=(
-            linux_amd64 linux_arm64 osx_amd64 osx_arm64
-            windows_amd64 windows_amd64_mingw
-          )
-          mkdir staged-assets
-          for platform in "${platforms[@]}"; do
-            source="release-assets/spanner-v1.5.4-extension-$platform/spanner.duckdb_extension"
-            if [[ ! -f "$source" ]]; then
-              echo "Missing verified artifact for $platform: $source" >&2
-              exit 1
-            fi
-            cp "$source" "staged-assets/spanner-v1.5.4-$platform.duckdb_extension"
-          done
-          if [[ $(find staged-assets -type f -name '*.duckdb_extension' | wc -l) -ne 6 ]]; then
-            echo 'Expected exactly six staged extension files.' >&2
+          python scripts/package-release-assets.py release-assets staged-assets
+          if [[ $(find staged-assets -type f -name '*.zip' | wc -l) -ne 6 ]]; then
+            echo 'Expected exactly six staged extension archives.' >&2
             exit 1
           fi
-          (cd staged-assets && sha256sum -- ./*.duckdb_extension > SHA256SUMS)
+          (cd staged-assets && sha256sum -- ./*.zip > SHA256SUMS)
 
       - name: Upload only to the still-draft release
         shell: bash
