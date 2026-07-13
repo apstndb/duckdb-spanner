@@ -662,6 +662,11 @@ can be `NaN` or exceed DuckDB DECIMAL's 38-digit precision and 9-digit scale.
 Cast those VARCHAR results explicitly when a value fits the desired DuckDB
 DECIMAL type.
 
+Spanner `INTERVAL` values can carry nanosecond fractional seconds. DuckDB
+`INTERVAL` stores microseconds, so inbound conversion truncates the final three
+fractional digits toward zero, matching the inbound `TIMESTAMP` precision
+policy described above.
+
 ## Testing
 
 ### SQLLogicTest (primary)

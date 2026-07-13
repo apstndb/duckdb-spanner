@@ -18,6 +18,7 @@ mod streaming;
 mod tables;
 mod types;
 mod vector_size;
+mod vtab_safety;
 
 pub use ddl::{SpannerDdlAsyncVTab, SpannerDdlVTab, SpannerOperationsVTab};
 pub use query::SpannerQueryVTab;
