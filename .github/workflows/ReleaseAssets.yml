@@ -1,100 +1,235 @@
-# Build the supported extension distributions and attach them to a published release.
-name: Publish Release Assets
+# Promote an exact successful main run into a fully staged draft release.
+name: Stage Release Assets
 
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing annotated release tag (for example, v0.4.0)
+        required: true
+        type: string
+      source_run_id:
+        description: Successful main distribution workflow run to promote
+        required: true
+        type: string
 
 permissions:
+  actions: read
   contents: read
 
+concurrency:
+  group: stage-release-assets-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+env:
+  DUCKDB_VERSION: v1.5.4
+  EXTENSION_NAME: spanner
+
 jobs:
-  release-preflight:
-    name: Validate published release provenance
-    runs-on: ubuntu-latest
+  preflight:
+    name: Validate tag, run, draft, and artifact set
+    runs-on: ubuntu-24.04
     permissions:
+      actions: read
       contents: read
     env:
-      RELEASE_TAG: ${{ github.event.release.tag_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      DISPATCH_SHA: ${{ github.sha }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      SOURCE_RUN_ID: ${{ inputs.source_run_id }}
     steps:
-      - name: Check out the published tag
+      - name: Check out the release tag
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
-          ref: refs/tags/${{ github.event.release.tag_name }}
+          ref: refs/tags/${{ inputs.release_tag }}
           fetch-depth: 0
 
-      - name: Verify the release commit is on main
+      - name: Validate immutable release inputs
+        shell: bash
         run: |
           set -euo pipefail
-          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
-          if ! git merge-base --is-ancestor HEAD refs/remotes/origin/main; then
-            echo "Release tag $RELEASE_TAG does not point to a commit reachable from main." >&2
+
+          source_run=$(gh api "repos/$GH_REPO/actions/runs/$SOURCE_RUN_ID")
+          source_sha=$(jq -r '.head_sha' <<<"$source_run")
+          source_branch=$(jq -r '.head_branch' <<<"$source_run")
+          source_event=$(jq -r '.event' <<<"$source_run")
+          source_status=$(jq -r '.status' <<<"$source_run")
+          source_conclusion=$(jq -r '.conclusion' <<<"$source_run")
+          source_path=$(jq -r '.path' <<<"$source_run")
+          tag_sha=$(git rev-parse HEAD)
+
+          if [[ "$source_branch" != main || "$source_event" != push ||
+                "$source_status" != completed || "$source_conclusion" != success ||
+                "$source_path" != .github/workflows/MainDistributionPipeline.yml ]]; then
+            echo "Source run is not a successful main distribution push: $source_run" >&2
+            exit 1
+          fi
+          if [[ "$tag_sha" != "$source_sha" ]]; then
+            echo "Release tag $RELEASE_TAG points to $tag_sha, not source run SHA $source_sha." >&2
+            exit 1
+          fi
+          if [[ "$DISPATCH_SHA" != "$tag_sha" ]]; then
+            echo "Dispatch ref points to $DISPATCH_SHA, not release tag SHA $tag_sha." >&2
+            exit 1
+          fi
+          if [[ $(git cat-file -t "refs/tags/$RELEASE_TAG") != tag ]]; then
+            echo "Release tag $RELEASE_TAG must be an annotated tag." >&2
             exit 1
           fi
 
-      - name: Validate release metadata and CI integrity
-        run: scripts/check-release-integrity.sh --release-tag "$RELEASE_TAG"
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          if ! git merge-base --is-ancestor "$tag_sha" refs/remotes/origin/main; then
+            echo "Release tag $RELEASE_TAG is not reachable from origin/main." >&2
+            exit 1
+          fi
 
-  build-distributions:
-    name: Build extension distributions
-    needs: release-preflight
+          draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')
+          if [[ "$draft" != true ]]; then
+            echo "Release $RELEASE_TAG must exist and remain draft during staging." >&2
+            exit 1
+          fi
+          asset_count=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets | length')
+          if [[ "$asset_count" != 0 ]]; then
+            echo "Draft release $RELEASE_TAG already has $asset_count uploaded asset(s)." >&2
+            exit 1
+          fi
+
+          expected=$(printf '%s\n' \
+            spanner-v1.5.4-extension-linux_amd64 \
+            spanner-v1.5.4-extension-linux_arm64 \
+            spanner-v1.5.4-extension-osx_amd64 \
+            spanner-v1.5.4-extension-osx_arm64 \
+            spanner-v1.5.4-extension-windows_amd64 \
+            spanner-v1.5.4-extension-windows_amd64_mingw | sort)
+          actual=$(gh api "repos/$GH_REPO/actions/runs/$SOURCE_RUN_ID/artifacts" --paginate \
+            --jq '.artifacts[] | select(.expired == false) | .name' | sort)
+          if [[ "$actual" != "$expected" ]]; then
+            echo 'Source run artifact set does not match the six distribution platforms.' >&2
+            diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true
+            exit 1
+          fi
+
+          scripts/check-release-integrity.sh --release-tag "$RELEASE_TAG"
+          bash scripts/check-google-cloud-rust.sh
+
+  smoke-assets:
+    name: Smoke ${{ matrix.platform }} release bytes
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux_amd64
+            runner: ubuntu-24.04
+            validation: load
+          - platform: linux_arm64
+            runner: ubuntu-24.04-arm
+            validation: load
+          - platform: osx_amd64
+            runner: macos-15-intel
+            validation: load
+          - platform: osx_arm64
+            runner: macos-15
+            validation: load
+          - platform: windows_amd64
+            runner: windows-2025
+            validation: load
+          - platform: windows_amd64_mingw
+            runner: windows-2025
+            validation: metadata
+    runs-on: ${{ matrix.runner }}
     permissions:
+      actions: read
       contents: read
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@e1fff3981c714851d54fd856237769ec6cbaa957 # e1fff3981c714851d54fd856237769ec6cbaa957
-    with:
-      duckdb_version: v1.5.4
-      ci_tools_version: e1fff3981c714851d54fd856237769ec6cbaa957
-      extension_name: spanner
-      extra_toolchains: rust;python3
-      # musl: not targeted; wasm: extension uses tokio+gRPC+rustls (not wasm-compatible).
-      exclude_archs: 'linux_amd64_musl;wasm_mvp;wasm_eh;wasm_threads'
-      # Release assets are a full distribution, rather than the reduced PR matrix.
-      reduced_ci_mode: disabled
-      run_disk_clean_step: true
-      # macOS/windows runners lack a Spanner emulator; tests run in the main CI workflow.
-      skip_tests: true
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: refs/tags/${{ inputs.release_tag }}
 
-  upload-release-assets:
-    name: Upload extension distributions
-    needs: build-distributions
-    runs-on: ubuntu-latest
+      - name: Download exact main-run artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: spanner-v1.5.4-extension-${{ matrix.platform }}
+          path: release-candidate
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+
+      - name: Install DuckDB v1.5.4
+        if: matrix.validation == 'load'
+        shell: bash
+        run: python -m pip install --disable-pip-version-check 'duckdb==1.5.4'
+
+      - name: Load and exercise the exact release bytes
+        if: matrix.validation == 'load'
+        shell: bash
+        run: python scripts/smoke-release-asset.py release-candidate/spanner.duckdb_extension
+
+      - name: Validate MinGW metadata and static runtime imports
+        if: matrix.validation == 'metadata'
+        shell: bash
+        env:
+          EXPECTED_EXTENSION_TAG: ${{ inputs.release_tag }}
+        run: python scripts/check-release-asset-metadata.py release-candidate/spanner.duckdb_extension
+
+  stage-draft:
+    name: Attach verified assets to draft release
+    needs: [preflight, smoke-assets]
+    runs-on: ubuntu-24.04
     permissions:
+      actions: read
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      RELEASE_TAG: ${{ github.event.release.tag_name }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
     steps:
-      - name: Download distribution artifacts
+      - name: Download all verified artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: spanner-v1.5.4-extension-*
           path: release-assets
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
 
-      - name: Name assets by target platform
+      - name: Name assets and generate checksums
         shell: bash
         run: |
           set -euo pipefail
-          shopt -s nullglob
-
-          artifacts=(release-assets/*/spanner.duckdb_extension)
-          if (( ${#artifacts[@]} == 0 )); then
-            echo 'No extension distribution artifacts were downloaded.' >&2
-            exit 1
-          fi
-
-          for artifact in "${artifacts[@]}"; do
-            artifact_dir=${artifact%/*}
-            artifact_name=${artifact_dir##*/}
-            platform=${artifact_name#spanner-v1.5.4-extension-}
-            if [[ "$platform" == "$artifact_name" ]]; then
-              echo "Unexpected artifact directory: $artifact_name" >&2
+          platforms=(
+            linux_amd64 linux_arm64 osx_amd64 osx_arm64
+            windows_amd64 windows_amd64_mingw
+          )
+          mkdir staged-assets
+          for platform in "${platforms[@]}"; do
+            source="release-assets/spanner-v1.5.4-extension-$platform/spanner.duckdb_extension"
+            if [[ ! -f "$source" ]]; then
+              echo "Missing verified artifact for $platform: $source" >&2
               exit 1
             fi
-
-            mv "$artifact" "release-assets/spanner-v1.5.4-${platform}.duckdb_extension"
+            cp "$source" "staged-assets/spanner-v1.5.4-$platform.duckdb_extension"
           done
+          if [[ $(find staged-assets -type f -name '*.duckdb_extension' | wc -l) -ne 6 ]]; then
+            echo 'Expected exactly six staged extension files.' >&2
+            exit 1
+          fi
+          (cd staged-assets && sha256sum -- ./*.duckdb_extension > SHA256SUMS)
 
-      - name: Upload assets to the published release
+      - name: Upload only to the still-draft release
         shell: bash
-        run: gh release upload "$RELEASE_TAG" release-assets/*.duckdb_extension --clobber
+        run: |
+          set -euo pipefail
+          draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')
+          if [[ "$draft" != true ]]; then
+            echo "Release $RELEASE_TAG is no longer a draft; refusing asset upload." >&2
+            exit 1
+          fi
+          asset_count=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets | length')
+          if [[ "$asset_count" != 0 ]]; then
+            echo "Draft release $RELEASE_TAG now has $asset_count uploaded asset(s)." >&2
+            exit 1
+          fi
+          gh release upload "$RELEASE_TAG" staged-assets/*
