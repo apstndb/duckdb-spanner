@@ -96,6 +96,7 @@ jobs:
           cache-on-failure: true
 
       - run: make check-google-cloud-rust
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_check_release_asset_metadata.py
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --features loadable-extension -- -D warnings
       - run: cargo test --lib

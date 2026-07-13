@@ -89,7 +89,24 @@ The built extension is `spanner.duckdb_extension` (via `make extension`) or `tar
 
 ### Published Release Assets
 
-Publishing a GitHub Release builds the supported DuckDB `v1.5.4` distributions and attaches them to that release. Each asset name includes its target platform, for example `spanner-v1.5.4-linux_amd64.duckdb_extension`. Draft releases do not build assets until they are published.
+Release assets are promoted from one successful `main` distribution run at the
+exact annotated release-tag commit. Dispatch the **Stage Release Assets**
+workflow at that tag ref, providing the tag and source run ID. The workflow
+requires its dispatch ref, tag, source run, and empty draft release to agree on
+that commit, smoke-loads five platform artifacts on matching native DuckDB
+`v1.5.4` runners, generates `SHA256SUMS`, and attaches those exact bytes to the
+draft. The additional `windows_amd64_mingw` artifact is best-effort, matching
+[DuckDB's upstream support tier](https://duckdb.org/docs/stable/dev/building/overview#platforms-with-best-effort-support).
+GitHub's Windows runner and Python DuckDB wheel use the incompatible MSVC
+platform, so CI validates the MinGW artifact's metadata and PE import table
+instead. Release staging fails if it gains an unreviewed DLL dependency or a
+dynamic MinGW runtime dependency. Publish the release only after the staging
+workflow and draft inspection succeed. Published assets are never rebuilt or
+replaced by a release event; releases created outside this flow receive no
+automatic assets.
+
+Each asset name includes its target platform, for example
+`spanner-v1.5.4-linux_amd64.duckdb_extension`.
 
 ### Loading the Extension
 

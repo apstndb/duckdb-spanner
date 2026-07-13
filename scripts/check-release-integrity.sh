@@ -4,8 +4,8 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 release_tag=""
-readonly EXPECTED_WORKFLOW_REFS=2
-readonly EXPECTED_CI_TOOLS_VERSIONS=2
+readonly EXPECTED_WORKFLOW_REFS=1
+readonly EXPECTED_CI_TOOLS_VERSIONS=1
 while (($# > 0)); do
   case "$1" in
     --release-tag)
