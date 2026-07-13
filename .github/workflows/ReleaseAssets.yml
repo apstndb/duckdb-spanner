@@ -33,6 +33,10 @@ jobs:
       actions: read
       # Draft releases are visible only to tokens with push access.
       contents: write
+    outputs:
+      artifact_ids: ${{ steps.validate.outputs.artifact_ids }}
+      artifact_ids_csv: ${{ steps.validate.outputs.artifact_ids_csv }}
+      artifact_manifest: ${{ steps.validate.outputs.artifact_manifest }}
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -45,8 +49,10 @@ jobs:
         with:
           ref: refs/tags/${{ inputs.release_tag }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Validate immutable release inputs
+        id: validate
         shell: bash
         run: |
           set -euo pipefail
@@ -103,13 +109,44 @@ jobs:
             spanner-v1.5.4-extension-osx_arm64 \
             spanner-v1.5.4-extension-windows_amd64 \
             spanner-v1.5.4-extension-windows_amd64_mingw | sort)
-          actual=$(gh api "repos/$GH_REPO/actions/runs/$SOURCE_RUN_ID/artifacts" --paginate \
-            --jq '.artifacts[] | select(.expired == false) | .name' | sort)
+          artifacts_json=$(gh api \
+            "repos/$GH_REPO/actions/runs/$SOURCE_RUN_ID/artifacts?per_page=100")
+          active_artifacts=$(jq -c \
+            '[.artifacts[] | select(.expired == false)] | sort_by(.name)' \
+            <<<"$artifacts_json")
+          actual=$(jq -r '.[].name' <<<"$active_artifacts")
           if [[ "$actual" != "$expected" ]]; then
             echo 'Source run artifact set does not match the six distribution platforms.' >&2
             diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true
             exit 1
           fi
+          if ! jq -e '
+            length == 6 and
+            all(.[];
+              (.id | type) == "number" and
+              (.digest | type) == "string" and
+              (.digest | test("^sha256:[0-9a-f]{64}$"))
+            )
+          ' <<<"$active_artifacts" >/dev/null; then
+            echo 'Source artifacts must have six unique IDs and SHA-256 digests.' >&2
+            exit 1
+          fi
+
+          artifact_ids=$(jq -c '
+            map({
+              key: (.name | sub("^spanner-v1\\.5\\.4-extension-"; "")),
+              value: (.id | tostring)
+            }) | from_entries
+          ' <<<"$active_artifacts")
+          artifact_ids_csv=$(jq -r 'map(.id | tostring) | join(",")' \
+            <<<"$active_artifacts")
+          artifact_manifest=$(jq -c '[.[] | {id, name, digest}]' \
+            <<<"$active_artifacts")
+          {
+            echo "artifact_ids=$artifact_ids"
+            echo "artifact_ids_csv=$artifact_ids_csv"
+            echo "artifact_manifest=$artifact_manifest"
+          } >> "$GITHUB_OUTPUT"
 
           scripts/check-release-integrity.sh --release-tag "$RELEASE_TAG"
           bash scripts/check-google-cloud-rust.sh
@@ -144,16 +181,18 @@ jobs:
       actions: read
       contents: read
     steps:
-      - name: Check out the release tag
+      - name: Check out the immutable dispatch commit
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
-          ref: refs/tags/${{ inputs.release_tag }}
+          ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Download exact main-run artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: spanner-v1.5.4-extension-${{ matrix.platform }}
+          artifact-ids: ${{ fromJSON(needs.preflight.outputs.artifact_ids)[matrix.platform] }}
           path: release-candidate
+          merge-multiple: true
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ inputs.source_run_id }}
@@ -182,47 +221,76 @@ jobs:
     permissions:
       actions: read
       contents: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-      RELEASE_TAG: ${{ inputs.release_tag }}
     steps:
+      - name: Check out the immutable dispatch commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
       - name: Download all verified artifacts
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          pattern: spanner-v1.5.4-extension-*
+          # Keep artifact-name directories because every artifact has the same filename.
+          artifact-ids: ${{ needs.preflight.outputs.artifact_ids_csv }}
           path: release-assets
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ inputs.source_run_id }}
 
-      - name: Name assets and generate checksums
+      - name: Package assets and generate checksums
         shell: bash
         run: |
           set -euo pipefail
-          platforms=(
-            linux_amd64 linux_arm64 osx_amd64 osx_arm64
-            windows_amd64 windows_amd64_mingw
-          )
-          mkdir staged-assets
-          for platform in "${platforms[@]}"; do
-            source="release-assets/spanner-v1.5.4-extension-$platform/spanner.duckdb_extension"
-            if [[ ! -f "$source" ]]; then
-              echo "Missing verified artifact for $platform: $source" >&2
-              exit 1
-            fi
-            cp "$source" "staged-assets/spanner-v1.5.4-$platform.duckdb_extension"
-          done
-          if [[ $(find staged-assets -type f -name '*.duckdb_extension' | wc -l) -ne 6 ]]; then
-            echo 'Expected exactly six staged extension files.' >&2
+          python scripts/package-release-assets.py \
+            --duckdb-version "$DUCKDB_VERSION" release-assets staged-assets
+          if [[ $(find staged-assets -type f -name '*.zip' | wc -l) -ne 6 ]]; then
+            echo 'Expected exactly six staged extension archives.' >&2
             exit 1
           fi
-          (cd staged-assets && sha256sum -- ./*.duckdb_extension > SHA256SUMS)
+          (cd staged-assets && sha256sum -- ./*.zip > SHA256SUMS)
 
       - name: Upload only to the still-draft release
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DISPATCH_SHA: ${{ github.sha }}
+          EXPECTED_ARTIFACT_MANIFEST: ${{ needs.preflight.outputs.artifact_manifest }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
         run: |
           set -euo pipefail
+
+          tag_ref=$(gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG")
+          tag_object_type=$(jq -r '.object.type' <<<"$tag_ref")
+          tag_object_sha=$(jq -r '.object.sha' <<<"$tag_ref")
+          if [[ "$tag_object_type" != tag ]]; then
+            echo "Release tag $RELEASE_TAG is no longer annotated." >&2
+            exit 1
+          fi
+          tag_object=$(gh api "repos/$GH_REPO/git/tags/$tag_object_sha")
+          tag_target_type=$(jq -r '.object.type' <<<"$tag_object")
+          tag_sha=$(jq -r '.object.sha' <<<"$tag_object")
+          source_sha=$(gh api "repos/$GH_REPO/actions/runs/$SOURCE_RUN_ID" \
+            --jq '.head_sha')
+          if [[ "$tag_target_type" != commit || "$tag_sha" != "$DISPATCH_SHA" ||
+                "$source_sha" != "$DISPATCH_SHA" ]]; then
+            echo 'Tag, dispatch commit, and source-run commit changed during staging.' >&2
+            exit 1
+          fi
+
+          current_artifacts=$(gh api \
+            "repos/$GH_REPO/actions/runs/$SOURCE_RUN_ID/artifacts?per_page=100")
+          current_manifest=$(jq -c '
+            [.artifacts[] | select(.expired == false) | {id, name, digest}] |
+            sort_by(.name)
+          ' <<<"$current_artifacts")
+          if [[ "$current_manifest" != "$EXPECTED_ARTIFACT_MANIFEST" ]]; then
+            echo 'Source artifact IDs or digests changed during staging.' >&2
+            exit 1
+          fi
+
           draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')
           if [[ "$draft" != true ]]; then
             echo "Release $RELEASE_TAG is no longer a draft; refusing asset upload." >&2
