@@ -6,6 +6,7 @@ use google_cloud_spanner::model;
 use google_cloud_spanner::types::{self as spanner_types, Type, TypeCode};
 
 use crate::error::SpannerError;
+use crate::vtab_safety;
 
 static PG_NUMERIC_TYPE: LazyLock<Type> = LazyLock::new(spanner_types::pg_numeric);
 
@@ -169,6 +170,10 @@ pub fn spanner_type_to_logical(spanner_type: &Type) -> Result<LogicalTypeHandle,
             })?;
             let mut fields = Vec::with_capacity(struct_type.fields.len());
             for (index, field) in struct_type.fields.iter().enumerate() {
+                vtab_safety::validate_result_name(
+                    &field.name,
+                    &format!("STRUCT result type field {index}"),
+                )?;
                 let field_type = field.r#type.as_ref().ok_or_else(|| {
                     SpannerError::Other(format!(
                         "STRUCT result type field {index} ({:?}) is missing type metadata",
@@ -1748,6 +1753,19 @@ mod tests {
         assert!(error.contains("STRUCT result type field 0"), "{error}");
         assert!(error.contains("payload"), "{error}");
         assert!(error.contains("99"), "{error}");
+    }
+
+    #[test]
+    fn result_type_conversion_rejects_nested_struct_field_nul() {
+        let nested = array_type(struct_type(vec![model::struct_type::Field::new()
+            .set_name("payload\0value")
+            .set_type(model::Type::new().set_code(model::TypeCode::Bool))]));
+
+        let error = spanner_type_to_logical(&nested).unwrap_err().to_string();
+        assert!(error.contains("ARRAY element"), "{error}");
+        assert!(error.contains("STRUCT result type field 0"), "{error}");
+        assert!(error.contains("interior NUL"), "{error}");
+        assert!(!error.contains('\0'), "{error:?}");
     }
 
     #[test]
