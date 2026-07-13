@@ -48,6 +48,54 @@ const MAX_WORKER_THREADS: usize = 4;
 const OWNER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const OWNER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
+/// Bound foreground metadata work so a bind callback cannot wait indefinitely
+/// for an unreachable endpoint or a stalled discovery RPC.
+pub(crate) const METADATA_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Error returned when a synchronous wait on the runtime owner expires.
+#[derive(Debug)]
+pub(crate) enum RuntimeWaitError {
+    TimedOut {
+        operation: &'static str,
+        timeout: Duration,
+    },
+    Runtime(SpannerError),
+}
+
+impl RuntimeWaitError {
+    pub(crate) fn into_spanner_error(self) -> SpannerError {
+        match self {
+            Self::TimedOut { operation, timeout } => SpannerError::Other(format!(
+                "Timed out waiting for {operation} after {}s; submitted work was cancelled",
+                timeout.as_secs_f64()
+            )),
+            Self::Runtime(error) => error,
+        }
+    }
+}
+
+impl std::fmt::Display for RuntimeWaitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TimedOut { operation, timeout } => write!(
+                formatter,
+                "Timed out waiting for {operation} after {}s; submitted work was cancelled",
+                timeout.as_secs_f64()
+            ),
+            Self::Runtime(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for RuntimeWaitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::TimedOut { .. } => None,
+            Self::Runtime(error) => Some(error),
+        }
+    }
+}
+
 // DuckDB's C extension API has no unload hook, so the global owner and cached Spanner
 // clients live for the process lifetime. RuntimeOwner still has a complete shutdown
 // path for tests and any future host lifecycle hook.
@@ -203,18 +251,53 @@ impl RuntimeOwner {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
+        self.run_with_timeout(None, future)
+            .map_err(RuntimeWaitError::into_spanner_error)
+    }
+
+    fn run_bounded<F>(
+        &self,
+        operation: &'static str,
+        timeout: Duration,
+        future: F,
+    ) -> Result<F::Output, RuntimeWaitError>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.run_with_timeout(Some((operation, timeout)), future)
+    }
+
+    fn run_with_timeout<F>(
+        &self,
+        timeout: Option<(&'static str, Duration)>,
+        future: F,
+    ) -> Result<F::Output, RuntimeWaitError>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
         if EXTENSION_RUNTIME_THREAD.get() {
-            return Err(SpannerError::Other(
+            return Err(RuntimeWaitError::Runtime(SpannerError::Other(
                 "runtime::run cannot be called from an extension-owned runtime task".to_string(),
-            ));
+            )));
         }
 
         let (response_tx, response_rx) = std_mpsc::sync_channel(1);
+        let (abort_tx, abort_rx) = std_mpsc::sync_channel(1);
         let cancellation = CancellationToken::new();
         let request_cancellation = cancellation.clone();
+        let request_cancellation_before_spawn = request_cancellation.clone();
         self.submit(RuntimeRequest::Run(Box::new(move |context| {
+            if request_cancellation_before_spawn.is_cancelled() {
+                let _ = response_tx.send(Err(SpannerError::Other(
+                    "Runtime request was cancelled".to_string(),
+                )));
+                return;
+            }
             let mut task = context.spawn(future);
             let fallback_abort = task.abort_handle();
+            let _ = abort_tx.send(fallback_abort.clone());
             let reporter = async move {
                 let result = tokio::select! {
                     biased;
@@ -230,17 +313,55 @@ impl RuntimeOwner {
             if catch_unwind(AssertUnwindSafe(|| context.spawn(reporter))).is_err() {
                 fallback_abort.abort();
             }
-        })))?;
+        })))
+        .map_err(RuntimeWaitError::Runtime)?;
 
-        match response_rx.recv() {
-            Ok(result) => result,
-            Err(_) => {
-                cancellation.cancel();
-                Err(SpannerError::Other(
-                    "Runtime request ended without a response".to_string(),
-                ))
+        let response = match timeout {
+            Some((operation, timeout)) => {
+                let deadline = Instant::now()
+                    .checked_add(timeout)
+                    .unwrap_or_else(Instant::now);
+                let abort = match abort_rx.recv_timeout(remaining_until(deadline)) {
+                    Ok(abort) => abort,
+                    Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                        cancellation.cancel();
+                        return Err(RuntimeWaitError::TimedOut { operation, timeout });
+                    }
+                    Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                        cancellation.cancel();
+                        return Err(RuntimeWaitError::Runtime(SpannerError::Other(
+                            "Runtime request ended before its task was submitted".to_string(),
+                        )));
+                    }
+                };
+                match response_rx.recv_timeout(remaining_until(deadline)) {
+                    Ok(result) => result,
+                    Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                        cancellation.cancel();
+                        abort.abort();
+                        return Err(RuntimeWaitError::TimedOut { operation, timeout });
+                    }
+                    Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                        cancellation.cancel();
+                        abort.abort();
+                        return Err(RuntimeWaitError::Runtime(SpannerError::Other(
+                            "Runtime request ended without a response".to_string(),
+                        )));
+                    }
+                }
             }
-        }
+            None => match response_rx.recv() {
+                Ok(result) => result,
+                Err(_) => {
+                    cancellation.cancel();
+                    return Err(RuntimeWaitError::Runtime(SpannerError::Other(
+                        "Runtime request ended without a response".to_string(),
+                    )));
+                }
+            },
+        };
+
+        response.map_err(RuntimeWaitError::Runtime)
     }
 
     fn spawn<F>(&self, future: F) -> Result<JoinHandle<F::Output>, SpannerError>
@@ -350,6 +471,25 @@ where
     F::Output: Send + 'static,
 {
     get_or_init_owner()?.run(future)
+}
+
+/// Run async foreground work with a finite synchronous wait.
+///
+/// On expiry, the runtime request's cancellation token is signalled. The
+/// reporter aborts the submitted task rather than allowing the caller to treat
+/// a stalled request as a clean end of stream.
+pub(crate) fn run_bounded<F>(
+    operation: &'static str,
+    timeout: Duration,
+    future: F,
+) -> Result<F::Output, RuntimeWaitError>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    get_or_init_owner()
+        .map_err(RuntimeWaitError::Runtime)?
+        .run_bounded(operation, timeout, future)
 }
 
 pub fn spawn<F>(future: F) -> Result<JoinHandle<F::Output>, SpannerError>
@@ -639,6 +779,46 @@ mod tests {
         .unwrap_err();
         assert!(error.to_string().contains("Runtime task panicked"));
         assert_eq!(run(async move { 7 }).unwrap(), 7);
+    }
+
+    #[test]
+    fn bounded_run_times_out_and_aborts_submitted_work() {
+        let owner = RuntimeOwner::start().unwrap();
+        let (started_tx, started_rx) = sync_channel(1);
+        let (dropped_tx, dropped_rx) = sync_channel(1);
+
+        let error = owner
+            .run_bounded(
+                "test foreground request",
+                Duration::from_millis(10),
+                async move {
+                    let _drop_signal = StdDropSignal(Some(dropped_tx));
+                    started_tx.send(()).unwrap();
+                    std::future::pending::<usize>().await
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeWaitError::TimedOut {
+                operation: "test foreground request",
+                ..
+            }
+        ));
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("bounded request did not start");
+        dropped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("bounded request was not aborted");
+        owner.shutdown().unwrap();
+    }
+
+    #[test]
+    fn runtime_wait_error_preserves_runtime_error_source() {
+        let error = RuntimeWaitError::Runtime(SpannerError::Other("inner error".to_string()));
+        let source = std::error::Error::source(&error).expect("runtime source");
+        assert_eq!(source.to_string(), "inner error");
     }
 
     #[test]

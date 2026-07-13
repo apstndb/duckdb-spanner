@@ -10,7 +10,12 @@ use std::ptr;
 use duckdb::ffi;
 use duckdb::vtab::BindInfo;
 
+use crate::streaming::{
+    StreamTimeoutPolicy, DEFAULT_STREAM_IDLE_TIMEOUT_SECS, MAX_STREAM_IDLE_TIMEOUT_SECS,
+};
 use crate::RegistrationError;
+
+pub(crate) const STREAM_IDLE_TIMEOUT_OPTION: &str = "spanner_stream_idle_timeout_secs";
 
 macro_rules! owned_duckdb_handle {
     ($name:ident, $raw:ty, $destroy:path) => {
@@ -126,12 +131,21 @@ pub(crate) unsafe fn prepare_config_options() -> Result<PreparedConfigOptions, R
             "Default Spanner admin REST endpoint",
         ),
     ];
-    let mut options = Vec::with_capacity(specifications.len());
+    let mut options = Vec::with_capacity(specifications.len() + 1);
     for (name, description) in specifications {
         options.push((name.to_owned(), unsafe {
             prepare_varchar_option(name, description)?
         }));
     }
+    options.push((STREAM_IDLE_TIMEOUT_OPTION.to_owned(), unsafe {
+        prepare_bigint_option(
+            STREAM_IDLE_TIMEOUT_OPTION,
+            &format!(
+                "Maximum seconds to wait for the next query or scan row (0 disables, maximum {MAX_STREAM_IDLE_TIMEOUT_SECS})"
+            ),
+            DEFAULT_STREAM_IDLE_TIMEOUT_SECS,
+        )?
+    }));
     Ok(PreparedConfigOptions(options))
 }
 
@@ -208,6 +222,63 @@ unsafe fn prepare_varchar_option(
     Ok(option)
 }
 
+unsafe fn prepare_bigint_option(
+    name: &str,
+    description: &str,
+    default_value: i64,
+) -> Result<OwnedDuckDbConfigOption, RegistrationError> {
+    let option = OwnedDuckDbConfigOption::from_raw(ffi::duckdb_create_config_option());
+    if option.as_raw().is_null() || crate::should_fail_allocation("config option") {
+        return Err(RegistrationError::new(
+            "allocate config option",
+            name,
+            "duckdb_create_config_option returned null",
+        ));
+    }
+
+    let c_name = CString::new(name).unwrap();
+    ffi::duckdb_config_option_set_name(option.as_raw(), c_name.as_ptr());
+
+    {
+        let bigint_type = OwnedDuckDbLogicalType::from_raw(ffi::duckdb_create_logical_type(
+            ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT,
+        ));
+        if bigint_type.as_raw().is_null() || crate::should_fail_allocation("config option type") {
+            return Err(RegistrationError::new(
+                "allocate config option type",
+                name,
+                "duckdb_create_logical_type returned null",
+            ));
+        }
+        ffi::duckdb_config_option_set_type(option.as_raw(), bigint_type.as_raw());
+    }
+
+    {
+        let default_val = OwnedDuckDbValue::from_raw(ffi::duckdb_create_int64(default_value));
+        if default_val.as_raw().is_null() || crate::should_fail_allocation("config option default")
+        {
+            return Err(RegistrationError::new(
+                "allocate config option default",
+                name,
+                "duckdb_create_int64 returned null",
+            ));
+        }
+        ffi::duckdb_config_option_set_default_value(option.as_raw(), default_val.as_raw());
+    }
+
+    ffi::duckdb_config_option_set_default_scope(
+        option.as_raw(),
+        ffi::duckdb_config_option_scope_DUCKDB_CONFIG_OPTION_SCOPE_SESSION,
+    );
+
+    let c_desc = CString::new(description).unwrap();
+    ffi::duckdb_config_option_set_description(option.as_raw(), c_desc.as_ptr());
+
+    // DuckDB copies the builder fields during registration; the caller still
+    // owns and must destroy the CConfigOption on both success and failure.
+    Ok(option)
+}
+
 /// Read a spanner config option from a raw client context.
 ///
 /// Returns `None` if the option is unset, empty, or not registered on this database.
@@ -247,26 +318,66 @@ pub unsafe fn get_config_string_from_context(
     }
 }
 
-/// Read a spanner config option from the client context during bind.
+/// Read a BIGINT config option from a raw client context.
 ///
-/// Returns `None` if the option is unset, empty, or not registered on this database.
-pub fn get_config_string(bind: &BindInfo, option_name: &str) -> Option<String> {
+/// Returns `None` if the option is not registered on this database.
+///
+/// # Safety
+/// `ctx` must be a valid, non-null `duckdb_client_context`.
+unsafe fn get_config_int64_from_context(
+    ctx: ffi::duckdb_client_context,
+    option_name: &str,
+) -> Option<i64> {
     unsafe {
-        // Extract raw duckdb_bind_info from BindInfo (single-pointer struct).
+        let c_name = CString::new(option_name).ok()?;
+        let val = OwnedDuckDbValue::from_raw(ffi::duckdb_client_context_get_config_option(
+            ctx,
+            c_name.as_ptr(),
+            ptr::null_mut(),
+        ));
+        if val.as_raw().is_null() {
+            None
+        } else {
+            Some(ffi::duckdb_get_int64(val.as_raw()))
+        }
+    }
+}
+
+unsafe fn bind_client_context(bind: &BindInfo) -> Option<OwnedDuckDbClientContext> {
+    unsafe {
         const _: () = assert!(
             std::mem::size_of::<BindInfo>() == std::mem::size_of::<ffi::duckdb_bind_info>(),
             "BindInfo size mismatch — duckdb crate layout may have changed"
         );
         let bind_ptr = *(bind as *const BindInfo as *const ffi::duckdb_bind_info);
-
-        // Get client context from bind info
         let mut ctx: ffi::duckdb_client_context = ptr::null_mut();
         ffi::duckdb_table_function_get_client_context(bind_ptr, &mut ctx);
         let ctx = OwnedDuckDbClientContext::from_raw(ctx);
-        if ctx.as_raw().is_null() {
-            return None;
-        }
+        (!ctx.as_raw().is_null()).then_some(ctx)
+    }
+}
 
+/// Read a spanner config option from the client context during bind.
+///
+/// Returns `None` if the option is unset, empty, or not registered on this database.
+pub fn get_config_string(bind: &BindInfo, option_name: &str) -> Option<String> {
+    unsafe {
+        let ctx = bind_client_context(bind)?;
         get_config_string_from_context(ctx.as_raw(), option_name)
     }
+}
+
+fn get_config_int64(bind: &BindInfo, option_name: &str) -> Option<i64> {
+    unsafe {
+        let ctx = bind_client_context(bind)?;
+        get_config_int64_from_context(ctx.as_raw(), option_name)
+    }
+}
+
+pub(crate) fn resolve_stream_timeout_policy(
+    bind: &BindInfo,
+) -> Result<StreamTimeoutPolicy, Box<dyn std::error::Error>> {
+    let seconds = get_config_int64(bind, STREAM_IDLE_TIMEOUT_OPTION)
+        .unwrap_or(DEFAULT_STREAM_IDLE_TIMEOUT_SECS);
+    StreamTimeoutPolicy::from_seconds(seconds).map_err(Into::into)
 }
