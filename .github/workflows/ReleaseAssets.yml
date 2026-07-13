@@ -206,7 +206,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python scripts/package-release-assets.py release-assets staged-assets
+          python scripts/package-release-assets.py \
+            --duckdb-version "$DUCKDB_VERSION" release-assets staged-assets
           if [[ $(find staged-assets -type f -name '*.zip' | wc -l) -ne 6 ]]; then
             echo 'Expected exactly six staged extension archives.' >&2
             exit 1

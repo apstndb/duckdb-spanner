@@ -10,6 +10,7 @@ SPEC = importlib.util.spec_from_file_location("package_release_assets", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 packaging = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(packaging)
+TEST_DUCKDB_VERSION = "v9.8.7"
 
 
 class PackageReleaseAssetsTests(unittest.TestCase):
@@ -20,7 +21,7 @@ class PackageReleaseAssetsTests(unittest.TestCase):
             payloads[platform] = payload
             artifact = (
                 root
-                / f"spanner-v1.5.4-extension-{platform}"
+                / f"spanner-{TEST_DUCKDB_VERSION}-extension-{platform}"
                 / packaging.CANONICAL_FILENAME
             )
             artifact.parent.mkdir(parents=True)
@@ -32,12 +33,14 @@ class PackageReleaseAssetsTests(unittest.TestCase):
             root = Path(directory)
             payloads = self.create_inputs(root / "input")
             archives = packaging.package_release_assets(
-                root / "input", root / "output"
+                root / "input", root / "output", TEST_DUCKDB_VERSION
             )
 
             self.assertEqual(len(archives), len(packaging.PLATFORMS))
             for platform, archive in zip(packaging.PLATFORMS, archives, strict=True):
-                self.assertEqual(archive.name, f"spanner-v1.5.4-{platform}.zip")
+                self.assertEqual(
+                    archive.name, f"spanner-{TEST_DUCKDB_VERSION}-{platform}.zip"
+                )
                 with ZipFile(archive) as zip_file:
                     self.assertEqual(
                         zip_file.namelist(), [packaging.CANONICAL_FILENAME]
@@ -50,8 +53,12 @@ class PackageReleaseAssetsTests(unittest.TestCase):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             self.create_inputs(root / "input")
-            first = packaging.package_release_assets(root / "input", root / "first")
-            second = packaging.package_release_assets(root / "input", root / "second")
+            first = packaging.package_release_assets(
+                root / "input", root / "first", TEST_DUCKDB_VERSION
+            )
+            second = packaging.package_release_assets(
+                root / "input", root / "second", TEST_DUCKDB_VERSION
+            )
             self.assertEqual(
                 [archive.read_bytes() for archive in first],
                 [archive.read_bytes() for archive in second],
@@ -64,12 +71,16 @@ class PackageReleaseAssetsTests(unittest.TestCase):
             missing = (
                 root
                 / "input"
-                / "spanner-v1.5.4-extension-linux_amd64"
+                / f"spanner-{TEST_DUCKDB_VERSION}-extension-osx_arm64"
                 / packaging.CANONICAL_FILENAME
             )
             missing.unlink()
             with self.assertRaisesRegex(RuntimeError, "missing verified artifact"):
-                packaging.package_release_assets(root / "input", root / "output")
+                packaging.package_release_assets(
+                    root / "input", root / "output", TEST_DUCKDB_VERSION
+                )
+            self.assertFalse((root / "output").exists())
+            self.assertFalse((root / ".output.tmp").exists())
 
     def test_rejects_existing_output_directory(self) -> None:
         with TemporaryDirectory() as directory:
@@ -77,7 +88,30 @@ class PackageReleaseAssetsTests(unittest.TestCase):
             self.create_inputs(root / "input")
             (root / "output").mkdir()
             with self.assertRaisesRegex(RuntimeError, "output directory already exists"):
-                packaging.package_release_assets(root / "input", root / "output")
+                packaging.package_release_assets(
+                    root / "input", root / "output", TEST_DUCKDB_VERSION
+                )
+
+    def test_rejects_existing_temporary_output_directory(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.create_inputs(root / "input")
+            (root / ".output.tmp").mkdir()
+            with self.assertRaisesRegex(
+                RuntimeError, "temporary output directory already exists"
+            ):
+                packaging.package_release_assets(
+                    root / "input", root / "output", TEST_DUCKDB_VERSION
+                )
+
+    def test_rejects_invalid_duckdb_version(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.create_inputs(root / "input")
+            with self.assertRaisesRegex(RuntimeError, "invalid DuckDB version"):
+                packaging.package_release_assets(
+                    root / "input", root / "output", "../../unexpected"
+                )
 
 
 if __name__ == "__main__":
