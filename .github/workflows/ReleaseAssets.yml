@@ -192,6 +192,7 @@ jobs:
         with:
           artifact-ids: ${{ fromJSON(needs.preflight.outputs.artifact_ids)[matrix.platform] }}
           path: release-candidate
+          merge-multiple: true
           github-token: ${{ github.token }}
           repository: ${{ github.repository }}
           run-id: ${{ inputs.source_run_id }}
