@@ -15,7 +15,7 @@ FIELD_SIZE = 32
 FIELDS = {
     "abi": (96, "C_STRUCT_UNSTABLE"),
     "extension_version": (128, None),
-    "duckdb_version": (160, "v1.5.4"),
+    "duckdb_version": (160, "v1.5.5"),
     "platform": (192, "windows_amd64_mingw"),
 }
 

@@ -1,5 +1,6 @@
 use duckdb::core::{DataChunkHandle, FlatVector, Inserter, ListVector, StructVector};
 use duckdb::ffi;
+use duckdb::types::Decimal;
 use google_cloud_spanner::model;
 use google_cloud_spanner::result::Row;
 use google_cloud_spanner::types::{Type, TypeCode};
@@ -21,7 +22,7 @@ const MAX_FLATTENED_CHILDREN: usize =
 
 /// Extract the raw `duckdb_vector` handle from a FlatVector.
 ///
-/// duckdb-rs 1.10504.0 does not expose the underlying `duckdb_vector` handle,
+/// duckdb-rs 1.10505.0 does not expose the underlying `duckdb_vector` handle,
 /// which is needed for `duckdb_unsafe_vector_assign_string_element_len`.
 /// `FlatVector<'_>` currently stores `ptr` first, followed by capacity and the
 /// lifetime marker. We read the first pointer-sized value and debug-check it
@@ -114,68 +115,20 @@ fn ensure_row_count(row_count: usize, context: &dyn Fn() -> String) -> Result<()
     Ok(())
 }
 
-fn ensure_nested_list_entry_capacity(
+/// Reserve the outer list's child before constructing its nested ListVector.
+/// duckdb-rs 1.10505.0 carries this reservation into `list_child()`, so nested
+/// arrays are no longer limited to DuckDB's standard vector size.
+fn reserve_nested_list_child(
+    list_vector: &ListVector<'_>,
     entry_count: usize,
     context: &dyn Fn() -> String,
 ) -> Result<(), SpannerError> {
-    let capacity = rows_capacity_hint();
-    if entry_count > capacity {
-        return Err(SpannerError::Conversion(format!(
-            "nested ARRAY flattened list-entry count {entry_count} exceeds duckdb-rs ListVector capacity {capacity} ({})",
+    list_vector.try_reserve(entry_count).map_err(|error| {
+        SpannerError::Conversion(format!(
+            "failed to reserve {entry_count} nested ARRAY entries: {error} ({})",
             context()
-        )));
-    }
-    Ok(())
-}
-
-fn first_struct_array_field_path(
-    struct_type: &model::StructType,
-) -> Result<Option<String>, SpannerError> {
-    for (field_idx, field) in struct_type.fields.iter().enumerate() {
-        let field_name = if field.name.is_empty() {
-            format!("field {field_idx}")
-        } else {
-            field.name.clone()
-        };
-        let field_type = field.r#type.as_ref().ok_or_else(|| {
-            SpannerError::Conversion(format!("STRUCT field '{field_name}' without type"))
-        })?;
-
-        match TypeCode::from(field_type.code.clone()) {
-            TypeCode::Array => return Ok(Some(field_name)),
-            TypeCode::Struct => {
-                let nested_type = field_type.struct_type.as_deref().ok_or_else(|| {
-                    SpannerError::Conversion(format!(
-                        "nested STRUCT field '{field_name}' without struct_type"
-                    ))
-                })?;
-                if let Some(nested_path) = first_struct_array_field_path(nested_type)? {
-                    return Ok(Some(format!("{field_name}.{nested_path}")));
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(None)
-}
-
-fn ensure_array_struct_list_entry_capacity(
-    child_count: usize,
-    struct_type: &model::StructType,
-    context: &dyn Fn() -> String,
-) -> Result<(), SpannerError> {
-    let capacity = rows_capacity_hint();
-    if child_count <= capacity {
-        return Ok(());
-    }
-    let Some(field_path) = first_struct_array_field_path(struct_type)? else {
-        return Ok(());
-    };
-
-    Err(SpannerError::Conversion(format!(
-        "ARRAY<STRUCT> child count {child_count} exceeds duckdb-rs nested ListVector capacity {capacity}: ARRAY field '{field_path}' requires one list entry per struct child ({})",
-        context()
-    )))
+        ))
+    })
 }
 
 fn set_list_entry_checked(
@@ -351,17 +304,6 @@ fn preflight_list_value(
         .try_as_list()
         .ok_or_else(|| type_mismatch_error("ARRAY (List)", value.kind(), &context()))?;
     let new_child_count = checked_child_count(*child_count, values.len(), context)?;
-
-    match element_type.code() {
-        TypeCode::Array => ensure_nested_list_entry_capacity(new_child_count, context)?,
-        TypeCode::Struct => {
-            let struct_type = element_type.struct_type().ok_or_else(|| {
-                SpannerError::Conversion(format!("STRUCT without struct_type ({})", context()))
-            })?;
-            ensure_array_struct_list_entry_capacity(new_child_count, struct_type, context)?;
-        }
-        _ => {}
-    }
 
     for (element_idx, element_value) in values.iter().enumerate() {
         let element_context = || format!("{}, array element {element_idx}", context());
@@ -608,15 +550,12 @@ fn write_array_column<R: ConversionRow>(
         let struct_type = element_type
             .struct_type()
             .ok_or_else(|| SpannerError::Conversion("STRUCT without struct_type".to_string()))?;
-        ensure_array_struct_list_entry_capacity(total_children, struct_type, &|| {
-            format!("column '{column_name}' ARRAY<STRUCT> child")
-        })?;
         Some(struct_type)
     } else {
         None
     };
     if elem_type_code == TypeCode::Array {
-        ensure_nested_list_entry_capacity(total_children, &|| {
+        reserve_nested_list_child(&list_vector, total_children, &|| {
             format!("column '{column_name}' nested ARRAY child")
         })?;
     }
@@ -949,13 +888,12 @@ fn write_raw_list_value_prevalidated(
         let struct_type = element_type
             .struct_type()
             .ok_or_else(|| SpannerError::Conversion("STRUCT without struct_type".to_string()))?;
-        ensure_array_struct_list_entry_capacity(new_len, struct_type, context)?;
         Some(struct_type)
     } else {
         None
     };
     if elem_type_code == TypeCode::Array {
-        ensure_nested_list_entry_capacity(new_len, context)?;
+        reserve_nested_list_child(list_vector, new_len, context)?;
     }
     set_list_entry_checked(
         list_vector,
@@ -1143,10 +1081,15 @@ fn prepare_scalar_value<'a>(
             let decimal = BigDecimal::from_str(value)
                 .map_err(|e| SpannerError::Conversion(format!("NUMERIC parse error: {e}")))?;
             let (unscaled, _scale) = decimal.with_scale(9).into_bigint_and_scale();
-            let value = unscaled.to_i128().ok_or_else(|| {
+            let unscaled = unscaled.to_i128().ok_or_else(|| {
                 SpannerError::Conversion(format!("NUMERIC value out of i128 range: {value}"))
             })?;
-            Ok(PreparedScalar::I128(value))
+            let decimal = Decimal::new(38, 9, unscaled).map_err(|error| {
+                SpannerError::Conversion(format!(
+                    "NUMERIC value does not fit DuckDB DECIMAL(38,9): {value}: {error}"
+                ))
+            })?;
+            Ok(PreparedScalar::I128(decimal.value()))
         }
         TypeCode::String | TypeCode::Json => {
             let value = value.try_as_string().ok_or_else(|| {
@@ -2134,119 +2077,62 @@ mod tests {
     }
 
     #[test]
-    fn array_of_struct_with_array_field_rejects_oversized_children_before_writing() {
-        let count = rows_capacity_hint() + 1;
-        let struct_type = struct_type_proto(vec![(
-            "values",
-            array_type_proto(scalar_type(TypeCode::Int64)),
-        )]);
-        let logical_struct = LogicalTypeHandle::struct_type(&[(
-            "values",
-            LogicalTypeHandle::list(&LogicalTypeId::Bigint.into()),
-        )]);
-        let struct_value = prost_types::Value {
-            kind: Some(ProtoKind::ListValue(prost_types::ListValue {
-                values: vec![prost_types::Value {
-                    kind: Some(ProtoKind::ListValue(prost_types::ListValue {
-                        values: Vec::new(),
-                    })),
-                }],
-            })),
-        };
-        let value = value_of(ProtoKind::ListValue(prost_types::ListValue {
-            values: vec![struct_value; count],
-        }));
-
-        let (chunk, result) =
-            write_list_one_with_sentinel_entry(logical_struct, struct_type, value, "items");
-        match result {
-            Err(SpannerError::Conversion(message)) => {
-                assert!(
-                    message.contains("ARRAY<STRUCT> child count"),
-                    "message: {message}"
-                );
-                assert!(
-                    message.contains("ARRAY field 'values'"),
-                    "message: {message}"
-                );
-                assert!(
-                    message.contains("column 'items', row 0"),
-                    "message: {message}"
-                );
+    fn array_of_struct_array_fields_reserve_more_than_one_standard_vector() {
+        fn proto_list(values: Vec<prost_types::Value>) -> prost_types::Value {
+            prost_types::Value {
+                kind: Some(ProtoKind::ListValue(prost_types::ListValue { values })),
             }
-            other => panic!("expected Conversion error, got {other:?}"),
         }
 
-        let list = chunk.list_vector(0);
-        assert_eq!(list.len(), 0, "failed conversion changed list length");
-        assert_eq!(
-            list.get_entry(0),
-            LIST_ENTRY_SENTINEL,
-            "failed conversion overwrote the parent list entry"
-        );
-    }
-
-    #[test]
-    fn array_of_nested_struct_with_array_field_rejects_before_writing() {
         let count = rows_capacity_hint() + 1;
         let nested_struct_type = struct_type_proto(vec![(
             "values",
             array_type_proto(scalar_type(TypeCode::Int64)),
         )]);
-        let struct_type = struct_type_proto(vec![("payload", nested_struct_type)]);
+        let struct_type = struct_type_proto(vec![
+            ("direct", array_type_proto(scalar_type(TypeCode::Int64))),
+            ("nested", nested_struct_type),
+        ]);
         let logical_nested_struct = LogicalTypeHandle::struct_type(&[(
             "values",
             LogicalTypeHandle::list(&LogicalTypeId::Bigint.into()),
         )]);
-        let logical_struct = LogicalTypeHandle::struct_type(&[("payload", logical_nested_struct)]);
+        let logical_struct = LogicalTypeHandle::struct_type(&[
+            (
+                "direct",
+                LogicalTypeHandle::list(&LogicalTypeId::Bigint.into()),
+            ),
+            ("nested", logical_nested_struct),
+        ]);
         let struct_value = prost_types::Value {
             kind: Some(ProtoKind::ListValue(prost_types::ListValue {
-                values: vec![prost_types::Value {
-                    kind: Some(ProtoKind::ListValue(prost_types::ListValue {
-                        values: vec![prost_types::Value {
-                            kind: Some(ProtoKind::ListValue(prost_types::ListValue {
-                                values: Vec::new(),
-                            })),
-                        }],
-                    })),
-                }],
+                values: vec![
+                    proto_list(Vec::new()),
+                    proto_list(vec![proto_list(Vec::new())]),
+                ],
             })),
         };
         let value = value_of(ProtoKind::ListValue(prost_types::ListValue {
             values: vec![struct_value; count],
         }));
 
-        let (chunk, result) =
-            write_list_one_with_sentinel_entry(logical_struct, struct_type, value, "items");
-        match result {
-            Err(SpannerError::Conversion(message)) => {
-                assert!(
-                    message.contains("ARRAY<STRUCT> child count"),
-                    "message: {message}"
-                );
-                assert!(
-                    message.contains("ARRAY field 'payload.values'"),
-                    "message: {message}"
-                );
-                assert!(
-                    message.contains("column 'items', row 0"),
-                    "message: {message}"
-                );
-            }
-            other => panic!("expected Conversion error, got {other:?}"),
-        }
+        let (chunk, result) = write_list_one(logical_struct, struct_type, value, "items");
+        result.unwrap();
 
-        let list = chunk.list_vector(0);
-        assert_eq!(list.len(), 0, "failed conversion changed list length");
-        assert_eq!(
-            list.get_entry(0),
-            LIST_ENTRY_SENTINEL,
-            "failed conversion overwrote the parent list entry"
-        );
+        let outer = chunk.list_vector(0);
+        assert_eq!(outer.get_entry(0), (0, count));
+        let structs = outer.struct_child(count);
+        let direct = structs.list_vector_child(0);
+        assert_eq!(direct.len(), 0);
+        assert_eq!(direct.get_entry(count - 1), (0, 0));
+        let nested_struct = structs.struct_vector_child(1);
+        let nested = nested_struct.list_vector_child(0);
+        assert_eq!(nested.len(), 0);
+        assert_eq!(nested.get_entry(count - 1), (0, 0));
     }
 
     #[test]
-    fn deep_nested_array_cap_error_leaves_parent_list_unpublished() {
+    fn deep_nested_array_reserves_more_than_one_standard_vector() {
         let count = rows_capacity_hint() + 1;
         let inner_arrays = (0..count)
             .map(|_| prost_types::Value {
@@ -2265,27 +2151,21 @@ mod tests {
         let logical_inner =
             LogicalTypeHandle::list(&LogicalTypeHandle::list(&LogicalTypeId::Bigint.into()));
 
-        let (chunk, result) = write_list_one_with_sentinel_entry(
+        let (chunk, result) = write_list_one(
             logical_inner,
             array_type_proto(array_type_proto(scalar_type(TypeCode::Int64))),
             value,
             "nested",
         );
-        match result {
-            Err(SpannerError::Conversion(message)) => {
-                assert!(
-                    message.contains("nested ARRAY flattened list-entry count"),
-                    "message: {message}"
-                );
-                assert!(
-                    message.contains("column 'nested', row 0, array element 0"),
-                    "message: {message}"
-                );
-            }
-            other => panic!("expected Conversion error, got {other:?}"),
-        }
+        result.unwrap();
 
-        assert_sentinel_list_unpublished(&chunk);
+        let outer = chunk.list_vector(0);
+        assert_eq!(outer.get_entry(0), (0, 1));
+        let middle = outer.list_child();
+        assert_eq!(middle.get_entry(0), (0, count));
+        let inner = middle.list_child();
+        assert_eq!(inner.len(), 0);
+        assert_eq!(inner.get_entry(count - 1), (0, 0));
     }
 
     #[test]
@@ -2362,6 +2242,24 @@ mod tests {
                 assert!(msg.contains("BOOL"), "message: {msg}");
                 assert!(msg.contains("String"), "message: {msg}");
                 assert!(msg.contains("column 'flag', row 0"), "message: {msg}");
+            }
+            other => panic!("expected Conversion error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn numeric_rejects_i128_value_outside_decimal_38_domain() {
+        let value = "100000000000000000000000000000.000000000";
+        let (_chunk, result) = write_scalar_one(
+            LogicalTypeHandle::decimal(38, 9),
+            scalar_type(TypeCode::Numeric),
+            value_of(ProtoKind::StringValue(value.to_string())),
+            "amount",
+        );
+        match result {
+            Err(SpannerError::Conversion(message)) => {
+                assert!(message.contains("DECIMAL(38,9)"), "message: {message}");
+                assert!(message.contains("39 digits"), "message: {message}");
             }
             other => panic!("expected Conversion error, got {other:?}"),
         }

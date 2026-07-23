@@ -1,6 +1,6 @@
 [package]
 name = "duckdb-spanner"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "DuckDB extension for querying Google Cloud Spanner databases"
 repository = "https://github.com/apstndb/duckdb-spanner"
@@ -19,7 +19,7 @@ default = []
 loadable-extension = ["duckdb/loadable-extension"]
 
 [dependencies]
-duckdb = { version = "=1.10504.0", features = ["vtab", "vscalar"] }
+duckdb = { version = "=1.10505.0", features = ["vtab", "vscalar"] }
 google-cloud-spanner = { git = "https://github.com/googleapis/google-cloud-rust", rev = "ac6f8259e708abd471b63e3fad4b4f3b5f08de1c", default-features = false }
 google-cloud-auth = { git = "https://github.com/googleapis/google-cloud-rust", rev = "ac6f8259e708abd471b63e3fad4b4f3b5f08de1c", default-features = false }
 google-cloud-gax = { git = "https://github.com/googleapis/google-cloud-rust", rev = "ac6f8259e708abd471b63e3fad4b4f3b5f08de1c", default-features = false }
@@ -44,4 +44,4 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 [dev-dependencies]
 testcontainers = "0.23"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
-duckdb = { version = "=1.10504.0", features = ["bundled", "vtab", "vscalar", "json"] }
+duckdb = { version = "=1.10505.0", features = ["bundled", "vtab", "vscalar", "json"] }

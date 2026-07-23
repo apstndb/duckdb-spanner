@@ -25,7 +25,7 @@ METADATA_SCRIPT := extension-ci-tools/scripts/append_extension_metadata.py
 DUCKDB_VERSION_CHECK := scripts/check-duckdb-version.sh
 EMULATOR_NAME := spanner-emulator
 # This is the compile-time ABI target, not a caller-selectable metadata value.
-override DUCKDB_TARGET_VERSION := v1.5.4
+override DUCKDB_TARGET_VERSION := v1.5.5
 DUCKDB_BIN ?= duckdb
 DUCKDB_CLI_VERSION := $(shell "$(DUCKDB_BIN)" --version 2>/dev/null | sed -nE 's/^v?([0-9]+\.[0-9]+\.[0-9]+).*/v\1/p')
 
@@ -171,7 +171,11 @@ include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
 
 # Always refresh extension version from Cargo.toml (avoid stale git-hash file).
 extension_version:
+	@mkdir -p configure
 	@echo "$(EXTENSION_VERSION)" > configure/extension_version.txt
+
+# Metadata builds must refresh the version even when configure/ already exists.
+build_extension_with_metadata_debug build_extension_with_metadata_release: extension_version
 
 # duckdb-spanner gates loadable-extension behind a crate feature (integration tests use rlib mode).
 build_extension_library_debug: check_configure check-target-duckdb-version

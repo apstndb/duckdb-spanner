@@ -215,7 +215,7 @@ unsafe fn prepare_varchar_option(
     let c_desc = CString::new(description).unwrap();
     ffi::duckdb_config_option_set_description(option.as_raw(), c_desc.as_ptr());
 
-    // DuckDB 1.5.4's config_options-c.cpp copies this builder's fields into
+    // DuckDB 1.5.5's config_options-c.cpp copies this builder's fields into
     // AddExtensionOption and never takes or deletes the CConfigOption. The C API
     // header also requires callers to destroy every duckdb_create_config_option
     // result, so keep the guard armed on both success and failure.

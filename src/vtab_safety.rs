@@ -83,6 +83,7 @@ mod tests {
     const FUNC_PANIC: u8 = 3;
     const BIND_NUL_ERROR: u8 = 4;
     const BIND_NUL_NAME: u8 = 5;
+    const UPSTREAM_BIND_PANIC: u8 = 6;
 
     struct FailingVTab<const FAILURE: u8>;
 
@@ -91,6 +92,9 @@ mod tests {
         type InitData = ();
 
         fn bind(bind: &BindInfo) -> CallbackResult<Self::BindData> {
+            if FAILURE == UPSTREAM_BIND_PANIC {
+                panic!("unwrapped table bind callback panic");
+            }
             guard_callback("FailingVTab", "bind", || {
                 if FAILURE == BIND_PANIC {
                     panic!("deliberate bind panic");
@@ -149,6 +153,15 @@ mod tests {
             assert!(error.contains("callback panicked"), "{error}");
             assert!(error.contains("deliberate"), "{error}");
         }
+    }
+
+    #[test]
+    fn duckdb_rs_contains_unwrapped_callback_panics() {
+        let error = query_error::<UPSTREAM_BIND_PANIC>("upstream_bind_panic");
+        assert!(
+            error.contains("unwrapped table bind callback panic"),
+            "{error}"
+        );
     }
 
     #[test]

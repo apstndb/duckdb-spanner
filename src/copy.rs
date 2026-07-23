@@ -549,7 +549,7 @@ unsafe fn copy_sink_inner(
     if state_ptr.is_null() {
         return Err(copy_failure_message("sink", "global state is null", 0));
     }
-    // DuckDB 1.5.4's C COPY adapter leaves execution_mode unset, so this
+    // DuckDB 1.5.5's C COPY adapter leaves execution_mode unset, so this
     // PhysicalCopyToFile sink is serial and the global state is not aliased.
     let state = &mut *state_ptr.cast::<CopyGlobalState>();
     if let Some(failure) = &state.failure {

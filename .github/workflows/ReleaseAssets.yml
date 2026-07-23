@@ -22,7 +22,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  DUCKDB_VERSION: v1.5.4
+  DUCKDB_VERSION: v1.5.5
   EXTENSION_NAME: spanner
 
 jobs:
@@ -103,12 +103,12 @@ jobs:
           fi
 
           expected=$(printf '%s\n' \
-            spanner-v1.5.4-extension-linux_amd64 \
-            spanner-v1.5.4-extension-linux_arm64 \
-            spanner-v1.5.4-extension-osx_amd64 \
-            spanner-v1.5.4-extension-osx_arm64 \
-            spanner-v1.5.4-extension-windows_amd64 \
-            spanner-v1.5.4-extension-windows_amd64_mingw | sort)
+            spanner-v1.5.5-extension-linux_amd64 \
+            spanner-v1.5.5-extension-linux_arm64 \
+            spanner-v1.5.5-extension-osx_amd64 \
+            spanner-v1.5.5-extension-osx_arm64 \
+            spanner-v1.5.5-extension-windows_amd64 \
+            spanner-v1.5.5-extension-windows_amd64_mingw | sort)
           artifacts_json=$(gh api \
             "repos/$GH_REPO/actions/runs/$SOURCE_RUN_ID/artifacts?per_page=100")
           active_artifacts=$(jq -c \
@@ -134,7 +134,7 @@ jobs:
 
           artifact_ids=$(jq -c '
             map({
-              key: (.name | sub("^spanner-v1\\.5\\.4-extension-"; "")),
+              key: (.name | sub("^spanner-v1\\.5\\.5-extension-"; "")),
               value: (.id | tostring)
             }) | from_entries
           ' <<<"$active_artifacts")
@@ -197,10 +197,10 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ inputs.source_run_id }}
 
-      - name: Install DuckDB v1.5.4
+      - name: Install DuckDB v1.5.5
         if: matrix.validation == 'load'
         shell: bash
-        run: python -m pip install --disable-pip-version-check 'duckdb==1.5.4'
+        run: python -m pip install --disable-pip-version-check 'duckdb==1.5.5'
 
       - name: Load and exercise the exact release bytes
         if: matrix.validation == 'load'
