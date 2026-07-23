@@ -278,7 +278,7 @@ fn register_extension_functions(con: &Connection) -> Result<(), RegistrationErro
 }
 
 fn preflight_autocommit(con: &Connection) -> Result<(), RegistrationError> {
-    // duckdb-rs 1.10504.0 hardcodes Connection::is_autocommit() to true. DuckDB
+    // duckdb-rs 1.10505.0 hardcodes Connection::is_autocommit() to true. DuckDB
     // assigns each autocommit statement a new transaction ID, while consecutive
     // statements inside an explicit transaction retain the same ID.
     let current_id = || {
@@ -1095,7 +1095,7 @@ HRVeBmUqB9ZvD2iFzjibxg==
             let handles = open_registration_handles();
             let raw_con = handles.raw_connection();
 
-            // DuckDB 1.5.4 accepts duplicate COPY names. Both success statuses
+            // DuckDB 1.5.5 accepts duplicate COPY names. Both success statuses
             // are checked; this is why config is the production retry barrier.
             register_copy_function(raw_con, false).unwrap();
             register_copy_function(raw_con, false).unwrap();

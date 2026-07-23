@@ -108,7 +108,7 @@ jobs:
     if: ${{ needs.changes.outputs.run_distribution == 'true' }}
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@e1fff3981c714851d54fd856237769ec6cbaa957 # e1fff3981c714851d54fd856237769ec6cbaa957
     with:
-      duckdb_version: v1.5.4
+      duckdb_version: v1.5.5
       ci_tools_version: e1fff3981c714851d54fd856237769ec6cbaa957
       extension_name: spanner
       extra_toolchains: rust;python3
