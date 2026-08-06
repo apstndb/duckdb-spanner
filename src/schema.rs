@@ -618,8 +618,8 @@ fn build_columns_query(dialect: DatabaseDialect, schema_name: &str, table_name: 
     let (sql, schema_param, table_param) = columns_query_template(dialect.clone());
     let schema_value = schema_value_for_table(dialect, schema_name).to_string();
     Statement::builder(sql)
-        .add_param(schema_param, &schema_value)
-        .add_param(table_param, &table_name.to_string())
+        .add_param(schema_param, schema_value)
+        .add_param(table_param, table_name.to_string())
         .build()
 }
 

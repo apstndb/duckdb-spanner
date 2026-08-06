@@ -3,12 +3,14 @@ use std::time::{Duration, Instant};
 
 use google_cloud_auth::credentials::anonymous::Builder as Anonymous;
 use google_cloud_gax::options::RequestOptions;
-use google_cloud_gax::retry_policy::{Aip194Strict, RetryPolicyExt};
+use google_cloud_gax::retry_policy::RetryPolicyExt;
+use google_cloud_spanner::builder::{InstanceType, SpannerBuilderExt};
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
+use google_cloud_spanner::retry_policy::SpannerRetryPolicy;
 use tokio::sync::OnceCell;
 
 use crate::cache::LruCache;
-use crate::connection::{AuthenticationMode, ConnectionIdentity, ConnectionProfile};
+use crate::connection::{AuthenticationMode, ConnectionIdentity, ConnectionProfile, EndpointMode};
 use crate::error::SpannerError;
 use crate::runtime;
 
@@ -140,6 +142,9 @@ async fn create_client_inner(
     if let Some(endpoint) = profile.data_endpoint() {
         builder = builder.with_endpoint(endpoint);
     }
+    if profile.endpoint_mode() == EndpointMode::Omni {
+        builder = builder.with_instance_type(InstanceType::Omni);
+    }
     if profile.authentication() == AuthenticationMode::Anonymous {
         builder = builder.with_credentials(Anonymous::new().build());
     }
@@ -148,13 +153,7 @@ async fn create_client_inner(
 
     // Bound session-create retries so connection refused / unreachable hosts
     // fail within CLIENT_CONNECT_TIMEOUT instead of retrying for minutes.
-    let mut session_options = RequestOptions::default();
-    session_options.set_attempt_timeout(SESSION_CREATE_ATTEMPT_TIMEOUT);
-    session_options.set_retry_policy(
-        Aip194Strict
-            .with_time_limit(CLIENT_CONNECT_TIMEOUT)
-            .with_attempt_limit(3),
-    );
+    let session_options = session_request_options();
 
     let client = spanner
         .database_client(profile.database_path())
@@ -162,6 +161,19 @@ async fn create_client_inner(
         .build()
         .await?;
     Ok(Arc::new(client))
+}
+
+fn session_request_options() -> RequestOptions {
+    let mut options = RequestOptions::default();
+    options.set_attempt_timeout(SESSION_CREATE_ATTEMPT_TIMEOUT);
+    // This follows the SDK's idempotent CreateSession behavior: an ambiguous
+    // post-send failure may orphan a session, but only within these bounds.
+    options.set_retry_policy(
+        SpannerRetryPolicy::new()
+            .with_time_limit(CLIENT_CONNECT_TIMEOUT)
+            .with_attempt_limit(3),
+    );
+    options
 }
 
 #[cfg(test)]
@@ -186,5 +198,23 @@ mod tests {
             Reclaim::StillShared => assert_eq!(*_keepalive, 42),
             Reclaim::Sole(_) => panic!("should not have reclaimed while shared"),
         }
+    }
+
+    #[test]
+    fn session_retry_policy_retries_idempotent_io_errors() {
+        use google_cloud_gax::error::Error;
+        use google_cloud_gax::retry_state::RetryState;
+
+        let options = session_request_options();
+        let policy = options
+            .retry_policy()
+            .as_ref()
+            .expect("session retry policy");
+        let error = Error::io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset",
+        ));
+
+        assert!(policy.on_error(&RetryState::new(true), error).is_continue());
     }
 }
