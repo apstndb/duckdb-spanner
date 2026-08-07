@@ -1252,8 +1252,8 @@ fn test_spanner_query_params() {
         let stmt = Statement::builder(
             "SELECT Id, StringCol FROM ScalarTypes WHERE Id = @id AND StringCol = @name",
         )
-        .add_param("id", &1_i64)
-        .add_param("name", &"hello".to_string())
+        .add_param("id", 1_i64)
+        .add_param("name", "hello".to_string())
         .build();
         let mut iter = tx.execute_query(stmt).await.unwrap();
         let mut rows = Vec::new();

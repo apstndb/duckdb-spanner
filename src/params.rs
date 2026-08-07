@@ -81,9 +81,9 @@ fn add_plain_param(
         serde_json::Value::Bool(b) => builder.add_param(key, b),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                builder.add_param(key, &i)
+                builder.add_param(key, i)
             } else if let Some(f) = n.as_f64() {
-                builder.add_param(key, &f)
+                builder.add_param(key, f)
             } else {
                 return Err(SpannerError::Other(format!(
                     "Unsupported number value for parameter '{key}': {n}"
@@ -157,13 +157,13 @@ fn add_scalar_param(
             let b = value
                 .as_bool()
                 .ok_or_else(|| param_err(key, "BOOL", value))?;
-            builder.add_typed_param(key, &b, spanner_type)
+            builder.add_typed_param(key, b, spanner_type)
         }
         TypeCode::Int64 => {
             let i = value
                 .as_i64()
                 .ok_or_else(|| param_err(key, "INT64", value))?;
-            builder.add_typed_param(key, &i, spanner_type)
+            builder.add_typed_param(key, i, spanner_type)
         }
         TypeCode::Float32 => {
             let value = float_param_value(key, "FLOAT32", value, true)?;
@@ -179,19 +179,19 @@ fn add_scalar_param(
             } else {
                 json_to_string_coerce(value)
             };
-            builder.add_typed_param(key, &s, spanner_type)
+            builder.add_typed_param(key, s, spanner_type)
         }
         TypeCode::Bytes => {
             let s = require_string(key, "BYTES", value)?;
-            builder.add_typed_param(key, &s, spanner_type)
+            builder.add_typed_param(key, s, spanner_type)
         }
         TypeCode::Date => {
             let s = require_string(key, "DATE", value)?;
-            builder.add_typed_param(key, &s, spanner_type)
+            builder.add_typed_param(key, s, spanner_type)
         }
         TypeCode::Timestamp => {
             let s = require_string(key, "TIMESTAMP", value)?;
-            builder.add_typed_param(key, &s, spanner_type)
+            builder.add_typed_param(key, s, spanner_type)
         }
         TypeCode::Numeric => {
             let s = match value {
@@ -199,7 +199,7 @@ fn add_scalar_param(
                 serde_json::Value::Number(n) => n.to_string(),
                 _ => return Err(param_err(key, "NUMERIC", value)),
             };
-            builder.add_typed_param(key, &s, spanner_type)
+            builder.add_typed_param(key, s, spanner_type)
         }
         TypeCode::Json => {
             let s = if json_text_transport {
@@ -207,15 +207,15 @@ fn add_scalar_param(
             } else {
                 json_param_string(key, value, "JSON param")?
             };
-            builder.add_typed_param(key, &s, spanner_type)
+            builder.add_typed_param(key, s, spanner_type)
         }
         TypeCode::Uuid => {
             let s = require_string(key, "UUID", value)?;
-            builder.add_typed_param(key, &s, spanner_type)
+            builder.add_typed_param(key, s, spanner_type)
         }
         TypeCode::Interval => {
             let s = require_string(key, "INTERVAL", value)?;
-            builder.add_typed_param(key, &s, spanner_type)
+            builder.add_typed_param(key, s, spanner_type)
         }
         other => {
             return Err(SpannerError::Other(format!(

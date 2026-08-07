@@ -20,15 +20,16 @@ loadable-extension = ["duckdb/loadable-extension"]
 
 [dependencies]
 duckdb = { version = "=1.10505.0", features = ["vtab", "vscalar"] }
-google-cloud-spanner = { git = "https://github.com/googleapis/google-cloud-rust", rev = "ac6f8259e708abd471b63e3fad4b4f3b5f08de1c", default-features = false }
-google-cloud-auth = { git = "https://github.com/googleapis/google-cloud-rust", rev = "ac6f8259e708abd471b63e3fad4b4f3b5f08de1c", default-features = false }
-google-cloud-gax = { git = "https://github.com/googleapis/google-cloud-rust", rev = "ac6f8259e708abd471b63e3fad4b4f3b5f08de1c", default-features = false }
-google-cloud-longrunning = { git = "https://github.com/googleapis/google-cloud-rust", rev = "ac6f8259e708abd471b63e3fad4b4f3b5f08de1c", default-features = false }
-google-cloud-rpc = { git = "https://github.com/googleapis/google-cloud-rust", rev = "ac6f8259e708abd471b63e3fad4b4f3b5f08de1c", default-features = false }
-google-cloud-lro = { git = "https://github.com/googleapis/google-cloud-rust", rev = "ac6f8259e708abd471b63e3fad4b4f3b5f08de1c", default-features = false }
-google-cloud-spanner-admin-database-v1 = { git = "https://github.com/googleapis/google-cloud-rust", rev = "ac6f8259e708abd471b63e3fad4b4f3b5f08de1c", default-features = false }
-google-cloud-spanner-admin-instance-v1 = { git = "https://github.com/googleapis/google-cloud-rust", rev = "ac6f8259e708abd471b63e3fad4b4f3b5f08de1c", default-features = false }
-wkt = { package = "google-cloud-wkt", git = "https://github.com/googleapis/google-cloud-rust", rev = "ac6f8259e708abd471b63e3fad4b4f3b5f08de1c", default-features = false }
+# google-cloud-rust release-20260730. Keep every direct revision aligned.
+google-cloud-spanner = { git = "https://github.com/googleapis/google-cloud-rust", rev = "e65d1417458d9ce7e4ecefc99427c50a5606b68c", default-features = false }
+google-cloud-auth = { git = "https://github.com/googleapis/google-cloud-rust", rev = "e65d1417458d9ce7e4ecefc99427c50a5606b68c", default-features = false }
+google-cloud-gax = { git = "https://github.com/googleapis/google-cloud-rust", rev = "e65d1417458d9ce7e4ecefc99427c50a5606b68c", default-features = false }
+google-cloud-longrunning = { git = "https://github.com/googleapis/google-cloud-rust", rev = "e65d1417458d9ce7e4ecefc99427c50a5606b68c", default-features = false }
+google-cloud-rpc = { git = "https://github.com/googleapis/google-cloud-rust", rev = "e65d1417458d9ce7e4ecefc99427c50a5606b68c", default-features = false }
+google-cloud-lro = { git = "https://github.com/googleapis/google-cloud-rust", rev = "e65d1417458d9ce7e4ecefc99427c50a5606b68c", default-features = false }
+google-cloud-spanner-admin-database-v1 = { git = "https://github.com/googleapis/google-cloud-rust", rev = "e65d1417458d9ce7e4ecefc99427c50a5606b68c", default-features = false }
+google-cloud-spanner-admin-instance-v1 = { git = "https://github.com/googleapis/google-cloud-rust", rev = "e65d1417458d9ce7e4ecefc99427c50a5606b68c", default-features = false }
+wkt = { package = "google-cloud-wkt", git = "https://github.com/googleapis/google-cloud-rust", rev = "e65d1417458d9ce7e4ecefc99427c50a5606b68c", default-features = false }
 prost-types = "0.14"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }

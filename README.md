@@ -170,7 +170,7 @@ For emulator access, no authentication is required. Either set the environment v
 export SPANNER_EMULATOR_HOST=localhost:9010
 ```
 
-Use `endpoint_mode := 'emulator'` when the profile should be explicit. `custom` requires an HTTPS endpoint and ADC. `omni` uses anonymous credentials and HTTPS unless its endpoint explicitly starts with `http://`. Explicit non-emulator modes (`default`, `custom`, and `omni`) reject `SPANNER_EMULATOR_HOST`; unset it before selecting one. Omni TLS uses the system trust store. Custom CA certificates and mTLS are not currently configurable through the pinned official Rust client builder.
+Use `endpoint_mode := 'emulator'` when the profile should be explicit. `custom` requires an HTTPS endpoint and ADC. `omni` selects the official client's Omni instance type and uses anonymous credentials and HTTPS unless its endpoint explicitly starts with `http://`. Explicit non-emulator modes (`default`, `custom`, and `omni`) reject `SPANNER_EMULATOR_HOST`; unset it before selecting one. Omni TLS uses the system trust store. Custom CA certificates and mTLS are not currently configurable through the pinned official Rust client builder.
 
 `admin_endpoint` (or `spanner_admin_endpoint`) overrides the admin endpoint used by DDL and operation helpers. Emulator mode preserves the data endpoint's scheme and maps the conventional data port `9010` to `9020`; custom and Omni modes use the data endpoint for admin requests by default. Custom admin requests use ADC and HTTPS, while Omni admin requests are anonymous and use the data endpoint's scheme. An explicit admin endpoint must use HTTPS for authenticated `default` and `custom` profiles. Real Spanner uses its authenticated Database Admin client when no emulator admin endpoint applies.
 
@@ -254,7 +254,7 @@ SELECT * FROM spanner_query(
 );
 ```
 
-For Spanner Omni, select anonymous authentication explicitly. DDL and operation
+For Spanner Omni, select the Omni connection profile explicitly. DDL and operation
 helpers use the same endpoint unless `admin_endpoint` is provided:
 
 ```sql
