@@ -673,13 +673,13 @@ fn split_schema_table(qualified_name: &str) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use std::error::Error as _;
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use google_cloud_gax::error::rpc::{Code, Status};
     use google_cloud_gax::error::Error as GaxError;
+    use google_cloud_gax::error::rpc::{Code, Status};
 
     use super::*;
 

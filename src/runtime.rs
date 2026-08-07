@@ -1,7 +1,7 @@
 use std::cell::Cell;
 use std::future::Future;
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::{mpsc as std_mpsc, Mutex, OnceLock};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::{Mutex, OnceLock, mpsc as std_mpsc};
 use std::thread::JoinHandle as ThreadJoinHandle;
 use std::time::{Duration, Instant};
 
@@ -690,9 +690,9 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::mpsc::{sync_channel, SyncSender};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc::{SyncSender, sync_channel};
     use std::task::Poll;
     use std::time::Duration;
     use tokio::sync::oneshot;

@@ -72,9 +72,9 @@ fn panic_payload_message(payload: &(dyn Any + Send)) -> &str {
 mod tests {
     use std::io;
 
+    use duckdb::Connection;
     use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
     use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
-    use duckdb::Connection;
 
     use super::*;
 

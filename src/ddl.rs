@@ -11,10 +11,10 @@ use google_cloud_auth::credentials::anonymous::Builder as Anonymous;
 use google_cloud_gax::options::RequestOptionsBuilder;
 use google_cloud_gax::paginator::Paginator;
 use google_cloud_gax::retry_policy::{Aip194Strict, RetryPolicy, RetryPolicyExt};
-use google_cloud_longrunning::model::{operation, Operation as InternalOperation};
+use google_cloud_longrunning::model::{Operation as InternalOperation, operation};
 use google_cloud_spanner_admin_database_v1::client::DatabaseAdmin;
 use reqwest::{Method, StatusCode};
-use tokio::sync::{watch, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::AbortHandle;
 
 use crate::cache::LruCache;
@@ -459,14 +459,14 @@ fn admin_request_is_ambiguous(error: &AdminRequestError) -> bool {
 
             let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
             while let Some(current) = source {
-                if let Some(error) = current.downcast_ref::<google_cloud_gax::error::Error>() {
-                    if gax_submission_signals_are_ambiguous(
+                if let Some(error) = current.downcast_ref::<google_cloud_gax::error::Error>()
+                    && gax_submission_signals_are_ambiguous(
                         None,
                         error.is_timeout() || error.is_io() || error.is_transport(),
                         error.status().map(|status| status.code),
-                    ) {
-                        return true;
-                    }
+                    )
+                {
+                    return true;
                 }
                 source = current.source();
             }
@@ -1242,13 +1242,13 @@ fn validate_operation(
             "{source} protocol error: operation name is empty"
         )));
     }
-    if let Some(expected_name) = expected_name {
-        if operation.name != expected_name {
-            return Err(SpannerError::Other(format!(
-                "{source} protocol error: expected operation {expected_name}, got {}",
-                operation.name
-            )));
-        }
+    if let Some(expected_name) = expected_name
+        && operation.name != expected_name
+    {
+        return Err(SpannerError::Other(format!(
+            "{source} protocol error: expected operation {expected_name}, got {}",
+            operation.name
+        )));
     }
     if !operation.done && operation.result.is_some() {
         return Err(SpannerError::Other(format!(
@@ -2119,15 +2119,14 @@ mod tests {
     use std::collections::VecDeque;
     use std::ffi::CString;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::mpsc::{sync_channel, SyncSender};
+    use std::sync::mpsc::{SyncSender, sync_channel};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use duckdb::ffi::{
-        duckdb_create_int64, duckdb_create_list_value, duckdb_create_logical_type,
-        duckdb_create_null_value, duckdb_create_varchar, duckdb_destroy_logical_type,
-        duckdb_destroy_value, duckdb_value, DUCKDB_TYPE_DUCKDB_TYPE_BIGINT,
-        DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
+        DUCKDB_TYPE_DUCKDB_TYPE_BIGINT, DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR, duckdb_create_int64,
+        duckdb_create_list_value, duckdb_create_logical_type, duckdb_create_null_value,
+        duckdb_create_varchar, duckdb_destroy_logical_type, duckdb_destroy_value, duckdb_value,
     };
     use google_cloud_gax::error::rpc::{Code, Status};
     use google_cloud_longrunning::model::Operation as InternalOperation;
@@ -2137,6 +2136,8 @@ mod tests {
     use crate::runtime::test_support::TestRuntimeOwner;
 
     use super::{
+        AdminRequestError, ClientCache, ClientCacheLookup, ClientFlight, DdlTimeouts,
+        EmulatorResponse, EmulatorTransport, FlightCleanupGuard, HttpFuture,
         admin_request_is_ambiguous, cached_init_result, database_operation_prefix,
         ddl_operation_error, ddl_statements_from_values, fetch_emulator_operation,
         gax_submission_signals_are_ambiguous, get_or_create_cached_client,
@@ -2145,9 +2146,7 @@ mod tests {
         list_emulator_database_operations_with, lookup_cached_client, operation_from_json,
         recover_ambiguous_submission, spawn_client_initialization,
         spawn_client_initialization_with, update_emulator_database_ddl_with,
-        wait_emulator_operation_with, wait_with_operation_deadline, AdminRequestError, ClientCache,
-        ClientCacheLookup, ClientFlight, DdlTimeouts, EmulatorResponse, EmulatorTransport,
-        FlightCleanupGuard, HttpFuture,
+        wait_emulator_operation_with, wait_with_operation_deadline,
     };
 
     struct DropSignal(Option<SyncSender<()>>);
@@ -2421,11 +2420,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(*client, 42);
-        assert!(cache
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .in_flight
-            .is_empty());
+        assert!(
+            cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .in_flight
+                .is_empty()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2491,11 +2492,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(*client, 43);
-        assert!(cache
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .in_flight
-            .is_empty());
+        assert!(
+            cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .in_flight
+                .is_empty()
+        );
     }
 
     #[test]

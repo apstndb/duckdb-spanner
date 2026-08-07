@@ -947,13 +947,13 @@ impl<'a> PgTypeParser<'a> {
                 self.parse_array_dimension()?;
             }
         }
-        if let Some(vector_pos) = self.parse_vector_length_modifier()? {
-            if parsed.code() != TypeCode::Float64 {
-                return Err(self.error(
-                    vector_pos,
-                    "VECTOR LENGTH is only supported for float8[] and double precision[]",
-                ));
-            }
+        if let Some(vector_pos) = self.parse_vector_length_modifier()?
+            && parsed.code() != TypeCode::Float64
+        {
+            return Err(self.error(
+                vector_pos,
+                "VECTOR LENGTH is only supported for float8[] and double precision[]",
+            ));
         }
         self.finish()?;
         Ok(spanner_types::array(parsed))
@@ -1499,12 +1499,14 @@ mod tests {
         );
 
         let unnamed = parse_spanner_type("STRUCT<INT64, STRING>").unwrap();
-        assert!(unnamed
-            .struct_type()
-            .unwrap()
-            .fields
-            .iter()
-            .all(|field| field.name.is_empty()));
+        assert!(
+            unnamed
+                .struct_type()
+                .unwrap()
+                .fields
+                .iter()
+                .all(|field| field.name.is_empty())
+        );
     }
 
     #[test]
@@ -1537,9 +1539,11 @@ mod tests {
 
     #[test]
     fn unquoted_struct_field_names_reject_googlesql_reserved_keywords() {
-        assert!(GOOGLESQL_RESERVED_KEYWORDS
-            .windows(2)
-            .all(|pair| pair[0] < pair[1]));
+        assert!(
+            GOOGLESQL_RESERVED_KEYWORDS
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        );
 
         for keyword in [
             "SELECT", "from", "GROUP", "ARRAY", "struct", "PROTO", "enum",
@@ -1744,9 +1748,11 @@ mod tests {
 
     #[test]
     fn result_type_conversion_preserves_nested_metadata_context() {
-        let nested = array_type(struct_type(vec![model::struct_type::Field::new()
-            .set_name("payload")
-            .set_type(model::Type::new().set_code(model::TypeCode::from(99)))]));
+        let nested = array_type(struct_type(vec![
+            model::struct_type::Field::new()
+                .set_name("payload")
+                .set_type(model::Type::new().set_code(model::TypeCode::from(99))),
+        ]));
 
         let error = spanner_type_to_logical(&nested).unwrap_err().to_string();
         assert!(error.contains("ARRAY element"), "{error}");
@@ -1757,9 +1763,11 @@ mod tests {
 
     #[test]
     fn result_type_conversion_rejects_nested_struct_field_nul() {
-        let nested = array_type(struct_type(vec![model::struct_type::Field::new()
-            .set_name("payload\0value")
-            .set_type(model::Type::new().set_code(model::TypeCode::Bool))]));
+        let nested = array_type(struct_type(vec![
+            model::struct_type::Field::new()
+                .set_name("payload\0value")
+                .set_type(model::Type::new().set_code(model::TypeCode::Bool)),
+        ]));
 
         let error = spanner_type_to_logical(&nested).unwrap_err().to_string();
         assert!(error.contains("ARRAY element"), "{error}");
@@ -1990,9 +1998,11 @@ mod tests {
 
         let error =
             parse_spanner_type(&struct_type_with_fields(MAX_STRUCT_FIELDS + 1)).unwrap_err();
-        assert!(error
-            .context
-            .contains("STRUCT field count exceeds the limit"));
+        assert!(
+            error
+                .context
+                .contains("STRUCT field count exceeds the limit")
+        );
     }
 
     #[test]

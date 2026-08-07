@@ -92,12 +92,14 @@ impl AllocationFailureGuard {
     fn set(stage: &'static str, occurrence: usize) -> Self {
         assert!(occurrence > 0);
         ALLOCATION_FAILURE.with(|failure| {
-            assert!(failure
-                .replace(Some(FailurePoint {
-                    stage,
-                    remaining: occurrence,
-                }))
-                .is_none());
+            assert!(
+                failure
+                    .replace(Some(FailurePoint {
+                        stage,
+                        remaining: occurrence,
+                    }))
+                    .is_none()
+            );
         });
         Self
     }
@@ -118,12 +120,14 @@ impl StatusFailureGuard {
     fn set(stage: &'static str, occurrence: usize) -> Self {
         assert!(occurrence > 0);
         STATUS_FAILURE.with(|failure| {
-            assert!(failure
-                .replace(Some(FailurePoint {
-                    stage,
-                    remaining: occurrence,
-                }))
-                .is_none());
+            assert!(
+                failure
+                    .replace(Some(FailurePoint {
+                        stage,
+                        remaining: occurrence,
+                    }))
+                    .is_none()
+            );
         });
         Self
     }
@@ -958,9 +962,11 @@ HRVeBmUqB9ZvD2iFzjibxg==
             })
         });
         assert!(!called.get());
-        assert!(take_reported_extension_error()
-            .unwrap()
-            .contains("duckdb_extension_access.get_api"));
+        assert!(
+            take_reported_extension_error()
+                .unwrap()
+                .contains("duckdb_extension_access.get_api")
+        );
     }
 
     #[tokio::test]
