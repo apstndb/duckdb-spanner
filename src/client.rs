@@ -201,20 +201,34 @@ mod tests {
     }
 
     #[test]
-    fn session_retry_policy_retries_idempotent_io_errors() {
+    fn session_retry_policy_retries_only_bounded_idempotent_transport_errors() {
         use google_cloud_gax::error::Error;
         use google_cloud_gax::retry_state::RetryState;
+
+        fn connection_reset() -> Error {
+            Error::transport(
+                Default::default(),
+                std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset"),
+            )
+        }
 
         let options = session_request_options();
         let policy = options
             .retry_policy()
             .as_ref()
             .expect("session retry policy");
-        let error = Error::io(std::io::Error::new(
-            std::io::ErrorKind::ConnectionReset,
-            "connection reset",
-        ));
 
-        assert!(policy.on_error(&RetryState::new(true), error).is_continue());
+        assert!(policy
+            .on_error(&RetryState::new(true), connection_reset())
+            .is_continue());
+        assert!(policy
+            .on_error(&RetryState::new(false), connection_reset())
+            .is_permanent());
+        assert!(policy
+            .on_error(
+                &RetryState::new(true).set_attempt_count(3_u32),
+                connection_reset(),
+            )
+            .is_exhausted());
     }
 }
