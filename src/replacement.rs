@@ -5,7 +5,7 @@
 //! existing `spanner_*` config options so plain table names never trigger
 //! remote reads by accident.
 
-use std::ffi::{c_void, CStr, CString};
+use std::ffi::{CStr, CString, c_void};
 use std::ptr;
 
 use duckdb::ffi;
@@ -58,36 +58,40 @@ unsafe fn replacement_scan_inner(
     info: ffi::duckdb_replacement_scan_info,
     table_name: *const std::os::raw::c_char,
 ) {
-    if table_name.is_null() {
-        return;
-    }
+    unsafe {
+        if table_name.is_null() {
+            return;
+        }
 
-    let name = CStr::from_ptr(table_name).to_string_lossy();
-    let Some(spanner_table) = name.strip_prefix(SPANNER_TABLE_PREFIX) else {
-        return;
-    };
-    if spanner_table.is_empty() {
-        set_replacement_error(info, "spanner: replacement scan requires a table name");
-        return;
-    }
+        let name = CStr::from_ptr(table_name).to_string_lossy();
+        let Some(spanner_table) = name.strip_prefix(SPANNER_TABLE_PREFIX) else {
+            return;
+        };
+        if spanner_table.is_empty() {
+            set_replacement_error(info, "spanner: replacement scan requires a table name");
+            return;
+        }
 
-    let function_name = c"spanner_scan";
-    ffi::duckdb_replacement_scan_set_function_name(info, function_name.as_ptr());
+        let function_name = c"spanner_scan";
+        ffi::duckdb_replacement_scan_set_function_name(info, function_name.as_ptr());
 
-    let value = OwnedDuckDbValue::from_raw(ffi::duckdb_create_varchar_length(
-        spanner_table.as_ptr().cast(),
-        spanner_table.len() as u64,
-    ));
-    if value.as_raw().is_null() {
-        set_replacement_error(info, "failed to create replacement scan table parameter");
-        return;
+        let value = OwnedDuckDbValue::from_raw(ffi::duckdb_create_varchar_length(
+            spanner_table.as_ptr().cast(),
+            spanner_table.len() as u64,
+        ));
+        if value.as_raw().is_null() {
+            set_replacement_error(info, "failed to create replacement scan table parameter");
+            return;
+        }
+        // DuckDB copies the parameter into the replacement-scan input.
+        ffi::duckdb_replacement_scan_add_parameter(info, value.as_raw());
     }
-    // DuckDB copies the parameter into the replacement-scan input.
-    ffi::duckdb_replacement_scan_add_parameter(info, value.as_raw());
 }
 
 unsafe fn set_replacement_error(info: ffi::duckdb_replacement_scan_info, msg: &str) {
-    if let Ok(c_msg) = CString::new(msg) {
-        ffi::duckdb_replacement_scan_set_error(info, c_msg.as_ptr());
+    unsafe {
+        if let Ok(c_msg) = CString::new(msg) {
+            ffi::duckdb_replacement_scan_set_error(info, c_msg.as_ptr());
+        }
     }
 }

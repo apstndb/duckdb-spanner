@@ -753,10 +753,11 @@ fn test_spanner_null_scalar() {
     assert!(row.column::<Option<time::Date>>(0).unwrap().is_none());
 
     let row = exec_spanner_one("SELECT CAST(NULL AS TIMESTAMP) AS col");
-    assert!(row
-        .column::<Option<time::OffsetDateTime>>(0)
-        .unwrap()
-        .is_none());
+    assert!(
+        row.column::<Option<time::OffsetDateTime>>(0)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -1879,7 +1880,9 @@ fn test_pg_vtab_query_numeric_special_values() {
 #[test]
 fn test_pg_vtab_query_null() {
     let conn = create_pg_duckdb_connection();
-    let sql = pg_vtab_query_sql("SELECT bool_col IS NULL AS b_null, int_col IS NULL AS i_null FROM pgsql_types WHERE id = 2");
+    let sql = pg_vtab_query_sql(
+        "SELECT bool_col IS NULL AS b_null, int_col IS NULL AS i_null FROM pgsql_types WHERE id = 2",
+    );
     let (b_null, i_null): (bool, bool) = conn
         .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
         .unwrap();
@@ -2099,7 +2102,7 @@ fn test_copy_to_basic() {
     let sql = String::from(
         "COPY (SELECT CAST(Id AS BIGINT) AS Id, Name, Value \
          FROM (VALUES (100, 'alice', 1.5), (101, 'bob', 2.5), (102, 'charlie', 3.5)) AS t(Id, Name, Value)) \
-         TO 'CopyTarget' (FORMAT spanner)"
+         TO 'CopyTarget' (FORMAT spanner)",
     );
     conn.execute_batch(&sql).unwrap();
 
@@ -2170,7 +2173,7 @@ fn test_copy_to_types() {
 
     // Read back and verify types
     let read_sql = vtab_query_sql(
-        "SELECT Id, BoolCol, Int64Col, Float64Col, StringCol, DateCol, TimestampCol FROM CopyTypes WHERE Id = 1"
+        "SELECT Id, BoolCol, Int64Col, Float64Col, StringCol, DateCol, TimestampCol FROM CopyTypes WHERE Id = 1",
     );
     let (id, b, i, f, s): (i64, bool, i64, f64, String) = conn
         .query_row(&read_sql, [], |r| {
@@ -2419,8 +2422,9 @@ fn test_pg_ddl_operations() {
     let conn = create_pg_duckdb_connection();
 
     // 1. CREATE TABLE
-    let sql = make_ddl_sql(db,
-        "CREATE TABLE pgsql_ddl_test (id bigint NOT NULL, name character varying(256), PRIMARY KEY (id))"
+    let sql = make_ddl_sql(
+        db,
+        "CREATE TABLE pgsql_ddl_test (id bigint NOT NULL, name character varying(256), PRIMARY KEY (id))",
     );
     let (op_name, done): (String, bool) = conn
         .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?)))

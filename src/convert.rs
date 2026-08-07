@@ -28,13 +28,15 @@ const MAX_FLATTENED_CHILDREN: usize =
 /// lifetime marker. We read the first pointer-sized value and debug-check it
 /// against the public data-pointer accessor.
 unsafe fn flat_vector_raw(vector: &FlatVector<'_>) -> ffi::duckdb_vector {
-    let candidate = *(vector as *const _ as *const ffi::duckdb_vector);
-    debug_assert_eq!(
-        ffi::duckdb_vector_get_data(candidate) as usize,
-        vector.as_mut_ptr::<u8>() as usize,
-        "FlatVector field layout assumption violated — ptr is not at offset 0"
-    );
-    candidate
+    unsafe {
+        let candidate = *(vector as *const _ as *const ffi::duckdb_vector);
+        debug_assert_eq!(
+            ffi::duckdb_vector_get_data(candidate) as usize,
+            vector.as_mut_ptr::<u8>() as usize,
+            "FlatVector field layout assumption violated — ptr is not at offset 0"
+        );
+        candidate
+    }
 }
 
 /// Assign a string to a FlatVector without UTF-8 validation.
@@ -48,13 +50,15 @@ unsafe fn flat_vector_raw(vector: &FlatVector<'_>) -> ffi::duckdb_vector {
 /// - `idx` and `s.len()` must be representable by DuckDB's `idx_t`
 /// - The caller must guarantee the input bytes are valid UTF-8 (Spanner does this)
 unsafe fn unsafe_assign_string(vector: &mut FlatVector<'_>, idx: usize, s: &str) {
-    let raw_vector = flat_vector_raw(vector);
-    ffi::duckdb_unsafe_vector_assign_string_element_len(
-        raw_vector,
-        idx as u64,
-        s.as_ptr() as *const _,
-        s.len() as u64,
-    );
+    unsafe {
+        let raw_vector = flat_vector_raw(vector);
+        ffi::duckdb_unsafe_vector_assign_string_element_len(
+            raw_vector,
+            idx as u64,
+            s.as_ptr() as *const _,
+            s.len() as u64,
+        );
+    }
 }
 
 fn checked_duckdb_index(
@@ -1549,8 +1553,8 @@ fn rows_capacity_hint() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use time::format_description::well_known::Rfc3339;
     use time::OffsetDateTime;
+    use time::format_description::well_known::Rfc3339;
 
     #[test]
     fn pre_epoch_timestamp_fractional_seconds() {
@@ -2012,7 +2016,8 @@ mod tests {
             assert_eq!(direct.get_entry(2), (2, 1));
             assert_eq!(direct.len(), 3);
             assert!(direct_validity.row_is_null(1));
-            assert_eq!(unsafe { direct.child(3).as_slice::<i64>() }, &[10, 11, 20]);
+            let direct_values = direct.child(3);
+            assert_eq!(unsafe { direct_values.as_slice::<i64>() }, &[10, 11, 20]);
 
             let nested_struct = structs.struct_vector_child(1);
             let nested_validity = nested_struct.child(0, 3);
@@ -2022,10 +2027,8 @@ mod tests {
             assert_eq!(nested.get_entry(2), (1, 2));
             assert_eq!(nested.len(), 3);
             assert!(nested_validity.row_is_null(1));
-            assert_eq!(
-                unsafe { nested.child(3).as_slice::<i64>() },
-                &[100, 200, 201]
-            );
+            let nested_values = nested.child(3);
+            assert_eq!(unsafe { nested_values.as_slice::<i64>() }, &[100, 200, 201]);
         }
 
         // Reuse the same output storage for a shorter batch. The write path must
@@ -2064,7 +2067,8 @@ mod tests {
         assert_eq!(direct.get_entry(1), (1, 0));
         assert_eq!(direct.len(), 1);
         assert!(direct_validity.row_is_null(1));
-        assert_eq!(unsafe { direct.child(1).as_slice::<i64>() }, &[30]);
+        let direct_values = direct.child(1);
+        assert_eq!(unsafe { direct_values.as_slice::<i64>() }, &[30]);
 
         let nested_struct = structs.struct_vector_child(1);
         let nested_validity = nested_struct.child(0, 2);
@@ -2073,7 +2077,8 @@ mod tests {
         assert_eq!(nested.get_entry(1), (2, 0));
         assert_eq!(nested.len(), 2);
         assert!(nested_validity.row_is_null(1));
-        assert_eq!(unsafe { nested.child(2).as_slice::<i64>() }, &[300, 301]);
+        let nested_values = nested.child(2);
+        assert_eq!(unsafe { nested_values.as_slice::<i64>() }, &[300, 301]);
     }
 
     #[test]
@@ -2212,7 +2217,8 @@ mod tests {
         let nested = vector.list_vector_child(0);
         assert_eq!(nested.get_entry(0), (0, 1));
         assert_eq!(nested.len(), 1);
-        assert_eq!(unsafe { nested.child(1).as_slice::<i64>() }[0], 20);
+        let nested_values = nested.child(1);
+        assert_eq!(unsafe { nested_values.as_slice::<i64>() }[0], 20);
     }
 
     #[test]

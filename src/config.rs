@@ -10,10 +10,10 @@ use std::ptr;
 use duckdb::ffi;
 use duckdb::vtab::BindInfo;
 
-use crate::streaming::{
-    StreamTimeoutPolicy, DEFAULT_STREAM_IDLE_TIMEOUT_SECS, MAX_STREAM_IDLE_TIMEOUT_SECS,
-};
 use crate::RegistrationError;
+use crate::streaming::{
+    DEFAULT_STREAM_IDLE_TIMEOUT_SECS, MAX_STREAM_IDLE_TIMEOUT_SECS, StreamTimeoutPolicy,
+};
 
 pub(crate) const STREAM_IDLE_TIMEOUT_OPTION: &str = "spanner_stream_idle_timeout_secs";
 
@@ -164,62 +164,67 @@ unsafe fn prepare_varchar_option(
     name: &str,
     description: &str,
 ) -> Result<OwnedDuckDbConfigOption, RegistrationError> {
-    let option = OwnedDuckDbConfigOption::from_raw(ffi::duckdb_create_config_option());
-    if option.as_raw().is_null() || crate::should_fail_allocation("config option") {
-        return Err(RegistrationError::new(
-            "allocate config option",
-            name,
-            "duckdb_create_config_option returned null",
-        ));
-    }
-
-    let c_name = CString::new(name).unwrap();
-    ffi::duckdb_config_option_set_name(option.as_raw(), c_name.as_ptr());
-
-    // Type: VARCHAR
-    {
-        let varchar_type = OwnedDuckDbLogicalType::from_raw(ffi::duckdb_create_logical_type(
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
-        ));
-        if varchar_type.as_raw().is_null() || crate::should_fail_allocation("config option type") {
+    unsafe {
+        let option = OwnedDuckDbConfigOption::from_raw(ffi::duckdb_create_config_option());
+        if option.as_raw().is_null() || crate::should_fail_allocation("config option") {
             return Err(RegistrationError::new(
-                "allocate config option type",
+                "allocate config option",
                 name,
-                "duckdb_create_logical_type returned null",
+                "duckdb_create_config_option returned null",
             ));
         }
-        ffi::duckdb_config_option_set_type(option.as_raw(), varchar_type.as_raw());
-    }
 
-    // Default: empty string (treated as unset)
-    {
-        let default_val =
-            OwnedDuckDbValue::from_raw(ffi::duckdb_create_varchar_length(c"".as_ptr(), 0));
-        if default_val.as_raw().is_null() || crate::should_fail_allocation("config option default")
+        let c_name = CString::new(name).unwrap();
+        ffi::duckdb_config_option_set_name(option.as_raw(), c_name.as_ptr());
+
+        // Type: VARCHAR
         {
-            return Err(RegistrationError::new(
-                "allocate config option default",
-                name,
-                "duckdb_create_varchar_length returned null",
+            let varchar_type = OwnedDuckDbLogicalType::from_raw(ffi::duckdb_create_logical_type(
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
             ));
+            if varchar_type.as_raw().is_null()
+                || crate::should_fail_allocation("config option type")
+            {
+                return Err(RegistrationError::new(
+                    "allocate config option type",
+                    name,
+                    "duckdb_create_logical_type returned null",
+                ));
+            }
+            ffi::duckdb_config_option_set_type(option.as_raw(), varchar_type.as_raw());
         }
-        ffi::duckdb_config_option_set_default_value(option.as_raw(), default_val.as_raw());
+
+        // Default: empty string (treated as unset)
+        {
+            let default_val =
+                OwnedDuckDbValue::from_raw(ffi::duckdb_create_varchar_length(c"".as_ptr(), 0));
+            if default_val.as_raw().is_null()
+                || crate::should_fail_allocation("config option default")
+            {
+                return Err(RegistrationError::new(
+                    "allocate config option default",
+                    name,
+                    "duckdb_create_varchar_length returned null",
+                ));
+            }
+            ffi::duckdb_config_option_set_default_value(option.as_raw(), default_val.as_raw());
+        }
+
+        // Scope: SESSION
+        ffi::duckdb_config_option_set_default_scope(
+            option.as_raw(),
+            ffi::duckdb_config_option_scope_DUCKDB_CONFIG_OPTION_SCOPE_SESSION,
+        );
+
+        let c_desc = CString::new(description).unwrap();
+        ffi::duckdb_config_option_set_description(option.as_raw(), c_desc.as_ptr());
+
+        // DuckDB 1.5.5's config_options-c.cpp copies this builder's fields into
+        // AddExtensionOption and never takes or deletes the CConfigOption. The C API
+        // header also requires callers to destroy every duckdb_create_config_option
+        // result, so keep the guard armed on both success and failure.
+        Ok(option)
     }
-
-    // Scope: SESSION
-    ffi::duckdb_config_option_set_default_scope(
-        option.as_raw(),
-        ffi::duckdb_config_option_scope_DUCKDB_CONFIG_OPTION_SCOPE_SESSION,
-    );
-
-    let c_desc = CString::new(description).unwrap();
-    ffi::duckdb_config_option_set_description(option.as_raw(), c_desc.as_ptr());
-
-    // DuckDB 1.5.5's config_options-c.cpp copies this builder's fields into
-    // AddExtensionOption and never takes or deletes the CConfigOption. The C API
-    // header also requires callers to destroy every duckdb_create_config_option
-    // result, so keep the guard armed on both success and failure.
-    Ok(option)
 }
 
 unsafe fn prepare_bigint_option(
@@ -227,56 +232,60 @@ unsafe fn prepare_bigint_option(
     description: &str,
     default_value: i64,
 ) -> Result<OwnedDuckDbConfigOption, RegistrationError> {
-    let option = OwnedDuckDbConfigOption::from_raw(ffi::duckdb_create_config_option());
-    if option.as_raw().is_null() || crate::should_fail_allocation("config option") {
-        return Err(RegistrationError::new(
-            "allocate config option",
-            name,
-            "duckdb_create_config_option returned null",
-        ));
-    }
-
-    let c_name = CString::new(name).unwrap();
-    ffi::duckdb_config_option_set_name(option.as_raw(), c_name.as_ptr());
-
-    {
-        let bigint_type = OwnedDuckDbLogicalType::from_raw(ffi::duckdb_create_logical_type(
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT,
-        ));
-        if bigint_type.as_raw().is_null() || crate::should_fail_allocation("config option type") {
+    unsafe {
+        let option = OwnedDuckDbConfigOption::from_raw(ffi::duckdb_create_config_option());
+        if option.as_raw().is_null() || crate::should_fail_allocation("config option") {
             return Err(RegistrationError::new(
-                "allocate config option type",
+                "allocate config option",
                 name,
-                "duckdb_create_logical_type returned null",
+                "duckdb_create_config_option returned null",
             ));
         }
-        ffi::duckdb_config_option_set_type(option.as_raw(), bigint_type.as_raw());
-    }
 
-    {
-        let default_val = OwnedDuckDbValue::from_raw(ffi::duckdb_create_int64(default_value));
-        if default_val.as_raw().is_null() || crate::should_fail_allocation("config option default")
+        let c_name = CString::new(name).unwrap();
+        ffi::duckdb_config_option_set_name(option.as_raw(), c_name.as_ptr());
+
         {
-            return Err(RegistrationError::new(
-                "allocate config option default",
-                name,
-                "duckdb_create_int64 returned null",
+            let bigint_type = OwnedDuckDbLogicalType::from_raw(ffi::duckdb_create_logical_type(
+                ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT,
             ));
+            if bigint_type.as_raw().is_null() || crate::should_fail_allocation("config option type")
+            {
+                return Err(RegistrationError::new(
+                    "allocate config option type",
+                    name,
+                    "duckdb_create_logical_type returned null",
+                ));
+            }
+            ffi::duckdb_config_option_set_type(option.as_raw(), bigint_type.as_raw());
         }
-        ffi::duckdb_config_option_set_default_value(option.as_raw(), default_val.as_raw());
+
+        {
+            let default_val = OwnedDuckDbValue::from_raw(ffi::duckdb_create_int64(default_value));
+            if default_val.as_raw().is_null()
+                || crate::should_fail_allocation("config option default")
+            {
+                return Err(RegistrationError::new(
+                    "allocate config option default",
+                    name,
+                    "duckdb_create_int64 returned null",
+                ));
+            }
+            ffi::duckdb_config_option_set_default_value(option.as_raw(), default_val.as_raw());
+        }
+
+        ffi::duckdb_config_option_set_default_scope(
+            option.as_raw(),
+            ffi::duckdb_config_option_scope_DUCKDB_CONFIG_OPTION_SCOPE_SESSION,
+        );
+
+        let c_desc = CString::new(description).unwrap();
+        ffi::duckdb_config_option_set_description(option.as_raw(), c_desc.as_ptr());
+
+        // DuckDB copies the builder fields during registration; the caller still
+        // owns and must destroy the CConfigOption on both success and failure.
+        Ok(option)
     }
-
-    ffi::duckdb_config_option_set_default_scope(
-        option.as_raw(),
-        ffi::duckdb_config_option_scope_DUCKDB_CONFIG_OPTION_SCOPE_SESSION,
-    );
-
-    let c_desc = CString::new(description).unwrap();
-    ffi::duckdb_config_option_set_description(option.as_raw(), c_desc.as_ptr());
-
-    // DuckDB copies the builder fields during registration; the caller still
-    // owns and must destroy the CConfigOption on both success and failure.
-    Ok(option)
 }
 
 /// Read a spanner config option from a raw client context.
@@ -309,11 +318,7 @@ pub unsafe fn get_config_string_from_context(
             let s = CStr::from_ptr(c_str.as_ptr())
                 .to_string_lossy()
                 .into_owned();
-            if s.is_empty() {
-                None
-            } else {
-                Some(s)
-            }
+            if s.is_empty() { None } else { Some(s) }
         }
     }
 }

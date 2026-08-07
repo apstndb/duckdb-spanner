@@ -11,8 +11,8 @@ use duckdb::ffi::{
 };
 use duckdb::types::DuckString;
 use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
-use duckdb::vtab::arrow::{write_arrow_array_to_vector, WritableVector};
-use serde_json::{json, Map, Value};
+use duckdb::vtab::arrow::{WritableVector, write_arrow_array_to_vector};
+use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
 
 use crate::RegistrationError;
@@ -135,128 +135,132 @@ unsafe fn prepare_nullable_scalar<S: VScalar>(
 where
     S::State: Default,
 {
-    use std::ffi::CString;
+    unsafe {
+        use std::ffi::CString;
 
-    use duckdb::core::DataChunkHandle;
-    use duckdb::ffi::{
-        duckdb_add_scalar_function_to_set, duckdb_create_logical_type,
-        duckdb_create_scalar_function, duckdb_create_scalar_function_set, duckdb_data_chunk,
-        duckdb_function_info, duckdb_scalar_function_add_parameter,
-        duckdb_scalar_function_set_error, duckdb_scalar_function_set_extra_info,
-        duckdb_scalar_function_set_function, duckdb_scalar_function_set_name,
-        duckdb_scalar_function_set_return_type, duckdb_scalar_function_set_special_handling,
-        duckdb_scalar_function_set_volatile, duckdb_vector, DuckDBSuccess,
-        DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
-    };
+        use duckdb::core::DataChunkHandle;
+        use duckdb::ffi::{
+            DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR, DuckDBSuccess, duckdb_add_scalar_function_to_set,
+            duckdb_create_logical_type, duckdb_create_scalar_function,
+            duckdb_create_scalar_function_set, duckdb_data_chunk, duckdb_function_info,
+            duckdb_scalar_function_add_parameter, duckdb_scalar_function_set_error,
+            duckdb_scalar_function_set_extra_info, duckdb_scalar_function_set_function,
+            duckdb_scalar_function_set_name, duckdb_scalar_function_set_return_type,
+            duckdb_scalar_function_set_special_handling, duckdb_scalar_function_set_volatile,
+            duckdb_vector,
+        };
 
-    unsafe extern "C" fn drop_scalar_state<T>(ptr: *mut std::ffi::c_void) {
-        let _ = unsafe { Box::from_raw(ptr.cast::<T>()) };
-    }
+        unsafe extern "C" fn drop_scalar_state<T>(ptr: *mut std::ffi::c_void) {
+            let _ = unsafe { Box::from_raw(ptr.cast::<T>()) };
+        }
 
-    unsafe extern "C" fn scalar_invoke<S: VScalar>(
-        info: duckdb_function_info,
-        input: duckdb_data_chunk,
-        mut output: duckdb_vector,
-    ) where
-        S::State: Default,
-    {
-        unsafe {
-            let extra = duckdb::ffi::duckdb_scalar_function_get_extra_info(info) as *const S::State;
-            let state = if extra.is_null() {
-                &S::State::default()
-            } else {
-                &*extra
-            };
-            #[repr(C)]
-            struct UnownedChunk {
-                ptr: duckdb_data_chunk,
-                owned: bool,
-            }
-            let mut chunk: DataChunkHandle = std::mem::transmute(UnownedChunk {
-                ptr: input,
-                owned: false,
-            });
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                S::invoke(state, &mut chunk, &mut output)
-            }));
-            // DataChunkHandle's layout is private in duckdb-rs. This wrapper is borrowed
-            // from DuckDB, so it must never run Drop, including after a caught panic.
-            std::mem::forget(chunk);
+        unsafe extern "C" fn scalar_invoke<S: VScalar>(
+            info: duckdb_function_info,
+            input: duckdb_data_chunk,
+            mut output: duckdb_vector,
+        ) where
+            S::State: Default,
+        {
+            unsafe {
+                let extra =
+                    duckdb::ffi::duckdb_scalar_function_get_extra_info(info) as *const S::State;
+                let state = if extra.is_null() {
+                    &S::State::default()
+                } else {
+                    &*extra
+                };
+                #[repr(C)]
+                struct UnownedChunk {
+                    ptr: duckdb_data_chunk,
+                    owned: bool,
+                }
+                let mut chunk: DataChunkHandle = std::mem::transmute(UnownedChunk {
+                    ptr: input,
+                    owned: false,
+                });
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    S::invoke(state, &mut chunk, &mut output)
+                }));
+                // DataChunkHandle's layout is private in duckdb-rs. This wrapper is borrowed
+                // from DuckDB, so it must never run Drop, including after a caught panic.
+                std::mem::forget(chunk);
 
-            let error = match result {
-                Ok(Ok(())) => None,
-                Ok(Err(e)) => Some(e.to_string()),
-                Err(payload) => Some(format!(
-                    "Rust panic in DuckDB scalar function: {}",
-                    panic_payload_message(payload.as_ref())
-                )),
-            };
-            if let Some(error) = error {
-                let msg = CString::new(error.replace('\0', "\\0"))
-                    .expect("escaped scalar error cannot contain NUL");
-                duckdb_scalar_function_set_error(info, msg.as_ptr());
+                let error = match result {
+                    Ok(Ok(())) => None,
+                    Ok(Err(e)) => Some(e.to_string()),
+                    Err(payload) => Some(format!(
+                        "Rust panic in DuckDB scalar function: {}",
+                        panic_payload_message(payload.as_ref())
+                    )),
+                };
+                if let Some(error) = error {
+                    let msg = CString::new(error.replace('\0', "\\0"))
+                        .expect("escaped scalar error cannot contain NUL");
+                    duckdb_scalar_function_set_error(info, msg.as_ptr());
+                }
             }
         }
-    }
 
-    let c_name = CString::new(name).expect("scalar name must be valid UTF-8");
-    let set = OwnedScalarFunctionSet(duckdb_create_scalar_function_set(c_name.as_ptr()));
-    if set.0.is_null() || crate::should_fail_allocation("scalar function set") {
-        return Err(RegistrationError::new(
-            "allocate scalar function set",
-            name,
-            "duckdb_create_scalar_function_set returned null",
-        ));
-    }
-    let scalar_function = OwnedScalarFunction(duckdb_create_scalar_function());
-    if scalar_function.0.is_null() || crate::should_fail_allocation("scalar function") {
-        return Err(RegistrationError::new(
-            "allocate scalar function",
-            name,
-            "duckdb_create_scalar_function returned null",
-        ));
-    }
-    duckdb_scalar_function_set_name(scalar_function.0, c_name.as_ptr());
-    let return_type = OwnedLogicalType(duckdb_create_logical_type(DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR));
-    if return_type.0.is_null() || crate::should_fail_allocation("scalar return type") {
-        return Err(RegistrationError::new(
-            "allocate scalar return type",
-            name,
-            "duckdb_create_logical_type returned null",
-        ));
-    }
-    duckdb_scalar_function_set_return_type(scalar_function.0, return_type.0);
-    for type_id in param_type_ids {
-        let param_type = OwnedLogicalType(duckdb_create_logical_type(*type_id));
-        if param_type.0.is_null() || crate::should_fail_allocation("scalar parameter type") {
+        let c_name = CString::new(name).expect("scalar name must be valid UTF-8");
+        let set = OwnedScalarFunctionSet(duckdb_create_scalar_function_set(c_name.as_ptr()));
+        if set.0.is_null() || crate::should_fail_allocation("scalar function set") {
             return Err(RegistrationError::new(
-                "allocate scalar parameter type",
+                "allocate scalar function set",
                 name,
-                format!("duckdb_create_logical_type returned null for type {type_id}"),
+                "duckdb_create_scalar_function_set returned null",
             ));
         }
-        duckdb_scalar_function_add_parameter(scalar_function.0, param_type.0);
+        let scalar_function = OwnedScalarFunction(duckdb_create_scalar_function());
+        if scalar_function.0.is_null() || crate::should_fail_allocation("scalar function") {
+            return Err(RegistrationError::new(
+                "allocate scalar function",
+                name,
+                "duckdb_create_scalar_function returned null",
+            ));
+        }
+        duckdb_scalar_function_set_name(scalar_function.0, c_name.as_ptr());
+        let return_type =
+            OwnedLogicalType(duckdb_create_logical_type(DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR));
+        if return_type.0.is_null() || crate::should_fail_allocation("scalar return type") {
+            return Err(RegistrationError::new(
+                "allocate scalar return type",
+                name,
+                "duckdb_create_logical_type returned null",
+            ));
+        }
+        duckdb_scalar_function_set_return_type(scalar_function.0, return_type.0);
+        for type_id in param_type_ids {
+            let param_type = OwnedLogicalType(duckdb_create_logical_type(*type_id));
+            if param_type.0.is_null() || crate::should_fail_allocation("scalar parameter type") {
+                return Err(RegistrationError::new(
+                    "allocate scalar parameter type",
+                    name,
+                    format!("duckdb_create_logical_type returned null for type {type_id}"),
+                ));
+            }
+            duckdb_scalar_function_add_parameter(scalar_function.0, param_type.0);
+        }
+        duckdb_scalar_function_set_function(scalar_function.0, Some(scalar_invoke::<S>));
+        duckdb_scalar_function_set_special_handling(scalar_function.0);
+        if S::volatile() {
+            duckdb_scalar_function_set_volatile(scalar_function.0);
+        }
+        let state = Box::new(S::State::default());
+        duckdb_scalar_function_set_extra_info(
+            scalar_function.0,
+            Box::into_raw(state) as *mut std::ffi::c_void,
+            Some(drop_scalar_state::<S::State>),
+        );
+        let rc = duckdb_add_scalar_function_to_set(set.0, scalar_function.0);
+        if rc != DuckDBSuccess {
+            return Err(RegistrationError::new(
+                "add scalar overload",
+                name,
+                format!("DuckDB returned status {rc}"),
+            ));
+        }
+        Ok(set)
     }
-    duckdb_scalar_function_set_function(scalar_function.0, Some(scalar_invoke::<S>));
-    duckdb_scalar_function_set_special_handling(scalar_function.0);
-    if S::volatile() {
-        duckdb_scalar_function_set_volatile(scalar_function.0);
-    }
-    let state = Box::new(S::State::default());
-    duckdb_scalar_function_set_extra_info(
-        scalar_function.0,
-        Box::into_raw(state) as *mut std::ffi::c_void,
-        Some(drop_scalar_state::<S::State>),
-    );
-    let rc = duckdb_add_scalar_function_to_set(set.0, scalar_function.0);
-    if rc != DuckDBSuccess {
-        return Err(RegistrationError::new(
-            "add scalar overload",
-            name,
-            format!("DuckDB returned status {rc}"),
-        ));
-    }
-    Ok(set)
 }
 
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
@@ -943,11 +947,17 @@ unsafe fn read_decimal_raw(
     row_idx: usize,
     internal_type: u32,
 ) -> i128 {
-    match internal_type {
-        duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT => *data.cast::<i16>().add(row_idx) as i128,
-        duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER => *data.cast::<i32>().add(row_idx) as i128,
-        duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT => *data.cast::<i64>().add(row_idx) as i128,
-        _ => hugeint_to_i128(*data.cast::<duckdb_hugeint>().add(row_idx)),
+    unsafe {
+        match internal_type {
+            duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT => {
+                *data.cast::<i16>().add(row_idx) as i128
+            }
+            duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER => {
+                *data.cast::<i32>().add(row_idx) as i128
+            }
+            duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT => *data.cast::<i64>().add(row_idx) as i128,
+            _ => hugeint_to_i128(*data.cast::<duckdb_hugeint>().add(row_idx)),
+        }
     }
 }
 
@@ -970,15 +980,16 @@ fn struct_field_to_param_json(value: Value, ty: &LogicalTypeHandle, is_json: boo
         return typed_param_envelope(value, "JSON", true);
     }
 
-    if ty.id() == LogicalTypeId::Varchar {
-        if let Value::String(s) = value {
-            if let Ok(parsed) = serde_json::from_str::<Value>(&s) {
-                if parsed.get("type").is_some() && parsed.get("value").is_some() {
-                    return parsed;
-                }
-            }
-            return Value::String(s);
+    if ty.id() == LogicalTypeId::Varchar
+        && let Value::String(s) = value
+    {
+        if let Ok(parsed) = serde_json::from_str::<Value>(&s)
+            && parsed.get("type").is_some()
+            && parsed.get("value").is_some()
+        {
+            return parsed;
         }
+        return Value::String(s);
     }
 
     if matches!(

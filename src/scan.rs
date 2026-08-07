@@ -1,12 +1,12 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::key::KeySet;
-use google_cloud_spanner::model::request_options::Priority;
 use google_cloud_spanner::model::PartitionOptions;
+use google_cloud_spanner::model::request_options::Priority;
 use google_cloud_spanner::read::ReadRequest;
 use google_cloud_spanner::result::Row;
 use tokio::sync::mpsc;
@@ -187,7 +187,9 @@ impl VTab for SpannerScanVTab {
                                     &cancellation,
                                 ) =>
                             {
-                                eprintln!("[duckdb-spanner] Partitioned read failed: {e}, falling back to single read");
+                                eprintln!(
+                                    "[duckdb-spanner] Partitioned read failed: {e}, falling back to single read"
+                                );
                             }
                             Err(e) => return Err(e),
                         }

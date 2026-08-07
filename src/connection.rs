@@ -424,15 +424,21 @@ mod tests {
 
     #[test]
     fn explicit_modes_validate_their_endpoint_and_environment_contracts() {
-        assert!(resolve(Some("localhost:9010"), Some("default"), None, None)
-            .unwrap_err()
-            .contains("cannot be combined"));
-        assert!(resolve(None, Some("emulator"), None, None)
-            .unwrap_err()
-            .contains("requires endpoint or SPANNER_EMULATOR_HOST"));
-        assert!(resolve(None, Some("custom"), None, None)
-            .unwrap_err()
-            .contains("requires endpoint"));
+        assert!(
+            resolve(Some("localhost:9010"), Some("default"), None, None)
+                .unwrap_err()
+                .contains("cannot be combined")
+        );
+        assert!(
+            resolve(None, Some("emulator"), None, None)
+                .unwrap_err()
+                .contains("requires endpoint or SPANNER_EMULATOR_HOST")
+        );
+        assert!(
+            resolve(None, Some("custom"), None, None)
+                .unwrap_err()
+                .contains("requires endpoint")
+        );
         let environment_error = resolve(
             Some("localhost:443"),
             Some("omni"),
@@ -444,12 +450,16 @@ mod tests {
             environment_error,
             "endpoint_mode 'omni' cannot be used while SPANNER_EMULATOR_HOST is set; the official client would force anonymous emulator credentials"
         );
-        assert!(resolve(None, Some("default"), None, Some("localhost:9010"))
-            .unwrap_err()
-            .contains("cannot be used while SPANNER_EMULATOR_HOST"));
-        assert!(resolve(None, None, None, Some("   "))
-            .unwrap_err()
-            .contains("must include a host"));
+        assert!(
+            resolve(None, Some("default"), None, Some("localhost:9010"))
+                .unwrap_err()
+                .contains("cannot be used while SPANNER_EMULATOR_HOST")
+        );
+        assert!(
+            resolve(None, None, None, Some("   "))
+                .unwrap_err()
+                .contains("must include a host")
+        );
         assert!(resolve(Some("localhost:443"), Some("custom"), None, Some("")).is_ok());
     }
 
@@ -547,13 +557,15 @@ mod tests {
             custom_default_admin.admin_endpoint().as_deref(),
             Some("https://data.example:443")
         );
-        assert!(resolve(
-            Some("data.example:443"),
-            Some("custom"),
-            Some("http://admin.example"),
-            None,
-        )
-        .unwrap_err()
-        .contains("require https"));
+        assert!(
+            resolve(
+                Some("data.example:443"),
+                Some("custom"),
+                Some("http://admin.example"),
+                None,
+            )
+            .unwrap_err()
+            .contains("require https")
+        );
     }
 }

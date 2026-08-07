@@ -218,17 +218,23 @@ mod tests {
             .as_ref()
             .expect("session retry policy");
 
-        assert!(policy
-            .on_error(&RetryState::new(true), connection_reset())
-            .is_continue());
-        assert!(policy
-            .on_error(&RetryState::new(false), connection_reset())
-            .is_permanent());
-        assert!(policy
-            .on_error(
-                &RetryState::new(true).set_attempt_count(3_u32),
-                connection_reset(),
-            )
-            .is_exhausted());
+        assert!(
+            policy
+                .on_error(&RetryState::new(true), connection_reset())
+                .is_continue()
+        );
+        assert!(
+            policy
+                .on_error(&RetryState::new(false), connection_reset())
+                .is_permanent()
+        );
+        assert!(
+            policy
+                .on_error(
+                    &RetryState::new(true).set_attempt_count(3_u32),
+                    connection_reset(),
+                )
+                .is_exhausted()
+        );
     }
 }

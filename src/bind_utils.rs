@@ -316,7 +316,7 @@ pub(crate) fn resolve_connection_profile(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_parallelism_mode, validate_parallelism_options, ParallelismMode};
+    use super::{ParallelismMode, resolve_parallelism_mode, validate_parallelism_options};
 
     #[test]
     fn parallelism_mode_accepts_documented_values_case_insensitively() {
@@ -397,8 +397,9 @@ mod tests {
         assert!(negative.to_string().contains("greater than zero"));
 
         let off = validate_parallelism_options(ParallelismMode::Off, false, Some(1)).unwrap_err();
-        assert!(off
-            .to_string()
-            .contains("parallelism_mode='auto' or 'required'"));
+        assert!(
+            off.to_string()
+                .contains("parallelism_mode='auto' or 'required'")
+        );
     }
 }

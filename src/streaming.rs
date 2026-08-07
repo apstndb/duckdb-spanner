@@ -1,4 +1,4 @@
-use std::sync::{mpsc as std_mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -22,9 +22,7 @@ impl StreamTimeoutPolicy {
                 "spanner_stream_idle_timeout_secs must be non-negative, got {seconds}"
             )),
             0 => Ok(Self(None)),
-            1..=MAX_STREAM_IDLE_TIMEOUT_SECS => {
-                Ok(Self(Some(Duration::from_secs(seconds as u64))))
-            }
+            1..=MAX_STREAM_IDLE_TIMEOUT_SECS => Ok(Self(Some(Duration::from_secs(seconds as u64)))),
             _ => Err(format!(
                 "spanner_stream_idle_timeout_secs must not exceed {MAX_STREAM_IDLE_TIMEOUT_SECS}, got {seconds}"
             )),
@@ -450,8 +448,8 @@ async fn send_terminal_error<T>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc::{sync_channel, SyncSender};
     use std::sync::Arc;
+    use std::sync::mpsc::{SyncSender, sync_channel};
     use std::time::Duration;
 
     use super::*;
@@ -619,11 +617,13 @@ mod tests {
         dropped_rx
             .recv_timeout(Duration::from_secs(1))
             .expect("idle timeout did not abort the producer");
-        assert!(state
-            .next_batch()
-            .unwrap_err()
-            .to_string()
-            .contains("stream idle timed out"));
+        assert!(
+            state
+                .next_batch()
+                .unwrap_err()
+                .to_string()
+                .contains("stream idle timed out")
+        );
     }
 
     #[test]
