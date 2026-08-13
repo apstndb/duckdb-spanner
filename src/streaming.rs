@@ -354,30 +354,32 @@ where
             "{operation} timed out after {}s; stream was cancelled",
             timeout.as_secs_f64()
         );
-        let mut timeout_error = self
-            .timeout_error
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if timeout_error.is_none() {
-            *timeout_error = Some(message);
-            self.cancellation.cancel();
+        let (message, first_timeout) = {
+            let mut timeout_error = self
+                .timeout_error
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let first_timeout = timeout_error.is_none();
+            if first_timeout {
+                *timeout_error = Some(message);
+            }
+            (
+                timeout_error
+                    .as_ref()
+                    .expect("timeout error must be set")
+                    .clone(),
+                first_timeout,
+            )
+        };
+
+        if first_timeout && !self.cancel_and_wait() {
             self.producer_abort.abort();
             self.reporter_abort.abort();
         }
-        SpannerError::Other(
-            timeout_error
-                .as_ref()
-                .expect("timeout error must be set")
-                .clone(),
-        )
+        SpannerError::Other(message)
     }
-}
 
-impl<T: Send + 'static> Drop for StreamingState<T> {
-    fn drop(&mut self) {
-        // Cancellation must begin before any teardown work. Closing the locally
-        // owned receiver then unblocks a reporter waiting behind buffered rows
-        // without submitting work to a runtime whose workers may be saturated.
+    fn cancel_and_wait(&self) -> bool {
         self.cancellation.cancel();
         if let Some(receiver) = self
             .receiver
@@ -390,16 +392,24 @@ impl<T: Send + 'static> Drop for StreamingState<T> {
 
         let reporter_done = self
             .reporter_done
-            .get_mut()
+            .lock()
             .unwrap_or_else(|error| error.into_inner())
             .take();
-        let completed = reporter_done.is_none_or(|receiver| {
+        reporter_done.is_none_or(|receiver| {
             matches!(
                 receiver.recv_timeout(self.shutdown_timeout),
                 Ok(()) | Err(std_mpsc::RecvTimeoutError::Disconnected)
             )
-        });
-        if !completed {
+        })
+    }
+}
+
+impl<T: Send + 'static> Drop for StreamingState<T> {
+    fn drop(&mut self) {
+        // Cancellation must begin before any teardown work. Closing the locally
+        // owned receiver then unblocks a reporter waiting behind buffered rows
+        // without submitting work to a runtime whose workers may be saturated.
+        if !self.cancel_and_wait() {
             // A producer that does not observe cancellation cannot block
             // DuckDB teardown indefinitely. Abort only after the cooperative
             // shutdown window has elapsed. Tokio applies abort when the future
@@ -452,6 +462,10 @@ mod tests {
     use std::sync::mpsc::{SyncSender, sync_channel};
     use std::time::Duration;
 
+    use duckdb::Connection;
+    use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
+    use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
+
     use super::*;
 
     struct DropSignal(Option<SyncSender<()>>);
@@ -461,6 +475,111 @@ mod tests {
             if let Some(sender) = self.0.take() {
                 let _ = sender.send(());
             }
+        }
+    }
+
+    struct QuiescenceSignal(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for QuiescenceSignal {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Clone)]
+    struct SyntheticVTabProbes {
+        partition_started: SyncSender<()>,
+        partition_quiesced: Arc<std::sync::atomic::AtomicBool>,
+        init_drop_result: SyncSender<bool>,
+    }
+
+    struct SyntheticStreamingVTab;
+
+    struct SyntheticStreamingInitData {
+        streaming: Option<StreamingState<i64>>,
+        partition_quiesced: Arc<std::sync::atomic::AtomicBool>,
+        init_drop_result: SyncSender<bool>,
+    }
+
+    impl Drop for SyntheticStreamingInitData {
+        fn drop(&mut self) {
+            // Keep the observable boundary after StreamingState's synchronous
+            // teardown: DuckDB must not report this init data destroyed while
+            // a partition child can still outlive the stream.
+            drop(self.streaming.take());
+            let _ = self.init_drop_result.send(
+                self.partition_quiesced
+                    .load(std::sync::atomic::Ordering::SeqCst),
+            );
+        }
+    }
+
+    impl VTab for SyntheticStreamingVTab {
+        type BindData = ();
+        type InitData = SyntheticStreamingInitData;
+
+        fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
+            bind.add_result_column("value", LogicalTypeHandle::from(LogicalTypeId::Bigint));
+            Ok(())
+        }
+
+        fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
+            let probes = unsafe { (*init.get_extra_info::<SyntheticVTabProbes>()).clone() };
+            let producer_partition_quiesced = Arc::clone(&probes.partition_quiesced);
+            let streaming = StreamingState::spawn(
+                1,
+                StreamTimeoutPolicy::default(),
+                move |tx, cancellation| async move {
+                    runtime::run_bounded_partitions(
+                        [()],
+                        1,
+                        cancellation,
+                        move |_, cancellation| {
+                            let tx = tx.clone();
+                            let partition_started = probes.partition_started.clone();
+                            let partition_quiesced = Arc::clone(&producer_partition_quiesced);
+                            async move {
+                                let _quiescence_signal = QuiescenceSignal(partition_quiesced);
+                                partition_started.send(()).unwrap();
+                                tx.send(Ok(1)).await.unwrap();
+                                cancellation.cancelled().await;
+                                Ok(())
+                            }
+                        },
+                    )
+                    .await
+                },
+            )?;
+
+            init.set_max_threads(1);
+            Ok(SyntheticStreamingInitData {
+                streaming: Some(streaming),
+                partition_quiesced: probes.partition_quiesced,
+                init_drop_result: probes.init_drop_result,
+            })
+        }
+
+        fn func(
+            func: &TableFunctionInfo<Self>,
+            output: &mut DataChunkHandle,
+        ) -> Result<(), Box<dyn std::error::Error>> {
+            let init_data = func.get_init_data();
+            let Some(batch) = init_data
+                .streaming
+                .as_ref()
+                .expect("DuckDB called the VTab after destroying its init data")
+                .next_batch()?
+            else {
+                output.set_len(0);
+                return Ok(());
+            };
+
+            let mut values = output.flat_vector(0);
+            // SAFETY: bind registers `value` as BIGINT, and this batch holds
+            // exactly one i64 because its StreamState batch size is one.
+            unsafe { values.as_mut_slice::<i64>()[0] = batch[0] };
+            output.set_len(1);
+            Ok(())
         }
     }
 
@@ -737,7 +856,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_state_quiesces_partition_children_before_returning() {
+    fn dropping_stream_quiesces_partition_children_before_returning() {
         let (started_tx, started_rx) = sync_channel(1);
         let (dropped_tx, dropped_rx) = sync_channel(1);
         let state = StreamingState::<usize>::spawn(
@@ -765,6 +884,114 @@ mod tests {
         dropped_rx
             .try_recv()
             .expect("stream drop returned before its partition child was quiescent");
+    }
+
+    #[test]
+    fn consumer_stop_quiesces_partition_children() {
+        let (started_tx, started_rx) = sync_channel(1);
+        let (dropped_tx, dropped_rx) = sync_channel(1);
+        let state = StreamingState::spawn(
+            1,
+            StreamTimeoutPolicy::default(),
+            move |tx, cancellation| async move {
+                // A LIMIT consumer receives this first batch, then destroys the
+                // table-function state without asking for another batch.
+                tx.send(Ok(1)).await.unwrap();
+                runtime::run_bounded_partitions([()], 1, cancellation, move |_, _| {
+                    let started_tx = started_tx.clone();
+                    let dropped_tx = dropped_tx.clone();
+                    async move {
+                        let _drop_signal = DropSignal(Some(dropped_tx));
+                        started_tx.send(()).unwrap();
+                        std::future::pending::<Result<(), SpannerError>>().await
+                    }
+                })
+                .await
+            },
+        )
+        .unwrap();
+
+        assert_eq!(state.next_batch().unwrap(), Some(vec![1]));
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("partition child did not start after the first batch");
+
+        drop(state);
+        dropped_rx
+            .try_recv()
+            .expect("LIMIT-like consumer stop returned before its partition child was quiescent");
+    }
+
+    #[test]
+    fn duckdb_limit_quiesces_partition_before_vtab_init_drop_returns() {
+        let connection = Connection::open_in_memory().unwrap();
+        let (started_tx, started_rx) = sync_channel(1);
+        let partition_quiesced = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (init_drop_result_tx, init_drop_result_rx) = sync_channel(1);
+        connection
+            .register_table_function_with_extra_info::<SyntheticStreamingVTab, _>(
+                "synthetic_streaming_vtab",
+                &SyntheticVTabProbes {
+                    partition_started: started_tx,
+                    partition_quiesced,
+                    init_drop_result: init_drop_result_tx,
+                },
+            )
+            .unwrap();
+
+        let mut statement = connection
+            .prepare("SELECT value FROM synthetic_streaming_vtab() LIMIT 1")
+            .unwrap();
+        let value: i64 = statement.query_row([], |row| row.get(0)).unwrap();
+        assert_eq!(value, 1);
+        started_rx
+            .try_recv()
+            .expect("DuckDB returned a VTab row before its partition child started");
+
+        let quiesced_at_init_drop = init_drop_result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("DuckDB did not destroy the VTab init state after LIMIT");
+        assert!(
+            quiesced_at_init_drop,
+            "DuckDB destroyed VTab init data before its partition child quiesced"
+        );
+        drop(statement);
+    }
+
+    #[test]
+    fn idle_timeout_quiesces_partition_children() {
+        let (started_tx, started_rx) = sync_channel(1);
+        let (dropped_tx, dropped_rx) = sync_channel(1);
+        let state = StreamingState::<usize>::spawn_with_idle_timeout(
+            1,
+            move |_tx, cancellation| async move {
+                runtime::run_bounded_partitions([()], 1, cancellation, move |_, _| {
+                    let started_tx = started_tx.clone();
+                    let dropped_tx = dropped_tx.clone();
+                    async move {
+                        let _drop_signal = DropSignal(Some(dropped_tx));
+                        started_tx.send(()).unwrap();
+                        std::future::pending::<Result<(), SpannerError>>().await
+                    }
+                })
+                .await
+            },
+            Duration::from_millis(10),
+        )
+        .unwrap();
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("partition child did not start");
+        let error = state.next_batch().unwrap_err();
+        assert!(
+            error.to_string().contains("stream idle timed out"),
+            "{error}"
+        );
+
+        dropped_rx
+            .try_recv()
+            .expect("idle timeout returned before its partition child quiesced");
     }
 
     #[test]
