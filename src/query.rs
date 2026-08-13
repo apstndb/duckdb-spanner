@@ -31,6 +31,7 @@ pub struct QueryBindData {
 
 pub struct QueryInitData {
     streaming: streaming::StreamingState<Row>,
+    projected_columns: Vec<usize>,
 }
 
 pub struct SpannerQueryVTab;
@@ -122,6 +123,18 @@ impl VTab for SpannerQueryVTab {
             let bind_data = unsafe { &*init.get_bind_data::<QueryBindData>() };
             let vector_size = vector_size::runtime_vector_size();
 
+            let projected_columns = init
+                .get_column_indices()
+                .into_iter()
+                .map(|index| {
+                    usize::try_from(index).map_err(|_| {
+                        SpannerError::Conversion(format!(
+                            "projected query column index {index} exceeds usize range"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
             // Clone bind data fields for the spawned task ('static requirement)
             let profile = bind_data.profile.clone();
             let sql = bind_data.sql.clone();
@@ -192,7 +205,10 @@ impl VTab for SpannerQueryVTab {
 
             init.set_max_threads(1);
 
-            Ok(QueryInitData { streaming })
+            Ok(QueryInitData {
+                streaming,
+                projected_columns,
+            })
         })
     }
 
@@ -212,7 +228,12 @@ impl VTab for SpannerQueryVTab {
                 }
             };
 
-            convert::write_rows_to_chunk(output, &batch, &bind_data.columns)?;
+            write_projected_rows(
+                output,
+                &batch,
+                &bind_data.columns,
+                &init_data.projected_columns,
+            )?;
             Ok(())
         })
     }
@@ -295,6 +316,52 @@ impl VTab for SpannerQueryVTab {
             ),
         ])
     }
+
+    fn supports_pushdown() -> bool {
+        true
+    }
+}
+
+fn write_projected_rows<R: convert::ConversionRow>(
+    output: &mut DataChunkHandle,
+    rows: &[R],
+    all_columns: &[ColumnInfo],
+    projected_columns: &[usize],
+) -> Result<(), SpannerError> {
+    for &source_column in projected_columns {
+        let column = all_columns.get(source_column).ok_or_else(|| {
+            SpannerError::Conversion(format!(
+                "projected query column index {source_column} exceeds result schema with {} columns",
+                all_columns.len()
+            ))
+        })?;
+        convert::preflight_column_from_rows(
+            rows,
+            source_column,
+            &column.spanner_type,
+            &column.name,
+        )?;
+    }
+
+    if rows.is_empty() {
+        output.set_len(0);
+        return Ok(());
+    }
+
+    for (output_column, &source_column) in projected_columns.iter().enumerate() {
+        let column = &all_columns[source_column];
+        convert::write_preflighted_column_from_rows(
+            output,
+            output_column,
+            rows,
+            source_column,
+            &column.spanner_type,
+            &column.name,
+        )?;
+    }
+
+    output.set_len(rows.len());
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -425,6 +492,23 @@ fn should_fallback_after_partition_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use google_cloud_spanner::model;
+    use google_cloud_spanner::types::{Type, TypeCode};
+    use google_cloud_spanner::value::{ToValue, Value as SpannerValue};
+
+    struct TestRow(Vec<SpannerValue>);
+
+    impl convert::ConversionRow for TestRow {
+        fn conversion_values(&self) -> &[SpannerValue] {
+            &self.0
+        }
+    }
+
+    fn scalar_type(code: TypeCode) -> Type {
+        model::Type::new()
+            .set_code(model::TypeCode::from(i32::from(code)))
+            .into()
+    }
 
     #[test]
     fn cancellation_prevents_auto_query_fallback() {
@@ -441,5 +525,66 @@ mod tests {
             false,
             &cancellation,
         ));
+    }
+
+    #[test]
+    fn projected_query_conversion_skips_unselected_invalid_column() {
+        let columns = vec![
+            ColumnInfo {
+                name: "id".to_string(),
+                spanner_type: scalar_type(TypeCode::Int64),
+                is_generated: false,
+            },
+            ColumnInfo {
+                name: "invalid_bool".to_string(),
+                spanner_type: scalar_type(TypeCode::Bool),
+                is_generated: false,
+            },
+        ];
+        let rows = vec![TestRow(vec![7_i64.to_value(), "not-a-bool".to_value()])];
+        let mut output = DataChunkHandle::new(&[LogicalTypeId::Bigint.into()]);
+
+        write_projected_rows(&mut output, &rows, &columns, &[0]).unwrap();
+
+        assert_eq!(output.len(), 1);
+        let values = output.flat_vector(0);
+        assert_eq!(unsafe { values.as_slice_with_len::<i64>(1) }, &[7]);
+    }
+
+    #[test]
+    fn empty_query_projection_preserves_cardinality() {
+        let columns = vec![ColumnInfo {
+            name: "id".to_string(),
+            spanner_type: scalar_type(TypeCode::Int64),
+            is_generated: false,
+        }];
+        let rows = vec![TestRow(vec![7_i64.to_value()])];
+        let mut output = DataChunkHandle::new(&[]);
+
+        write_projected_rows(&mut output, &rows, &columns, &[]).unwrap();
+
+        assert_eq!(output.len(), 1);
+        assert_eq!(output.num_columns(), 0);
+    }
+
+    #[test]
+    fn invalid_query_projection_index_is_a_conversion_error() {
+        let columns = vec![ColumnInfo {
+            name: "id".to_string(),
+            spanner_type: scalar_type(TypeCode::Int64),
+            is_generated: false,
+        }];
+        let rows = vec![TestRow(vec![7_i64.to_value()])];
+        let mut output = DataChunkHandle::new(&[]);
+
+        let error = write_projected_rows(&mut output, &rows, &columns, &[1]).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("index 1 exceeds result schema with 1 columns"),
+            "{error}"
+        );
+        assert_eq!(output.len(), 0);
     }
 }

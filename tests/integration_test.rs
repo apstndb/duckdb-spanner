@@ -886,6 +886,32 @@ fn test_vtab_query_basic() {
 }
 
 #[test]
+fn test_vtab_query_projection_pushdown() {
+    let conn = create_duckdb_connection();
+    let base = vtab_query_sql("SELECT Id, StringCol, Int64Col FROM ScalarTypes WHERE Id = 1");
+    let projected: (i64, i64) = conn
+        .query_row(&format!("SELECT Int64Col, Id FROM ({base})"), [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(projected, (42, 1));
+
+    let duplicated: (i64, i64) = conn
+        .query_row(&format!("SELECT Id, Id FROM ({base})"), [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(duplicated, (1, 1));
+
+    let count: i64 = conn
+        .query_row(&format!("SELECT COUNT(*) FROM ({base})"), [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 1);
+}
+
+#[test]
 fn test_vtab_query_types() {
     let conn = create_duckdb_connection();
     let sql = vtab_query_sql(
