@@ -24,10 +24,11 @@ use std::time::Duration;
 
 use duckdb::ffi;
 use google_cloud_gax::error::rpc::Code;
-use google_cloud_gax::retry_policy::{Aip194Strict, RetryPolicyExt};
+use google_cloud_gax::retry_policy::RetryPolicyExt;
 use google_cloud_spanner::Error as SpannerClientError;
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::mutation::Mutation;
+use google_cloud_spanner::retry_policy::SpannerRetryPolicy;
 use google_cloud_spanner::transaction::{BasicTransactionRetryPolicy, WriteOnlyTransaction};
 use google_cloud_spanner::types::{Type, TypeCode};
 use google_cloud_spanner_admin_database_v1::model::DatabaseDialect;
@@ -213,6 +214,24 @@ struct CopyGlobalState {
     buffer: Vec<Mutation>,
     rows_written: u64,
     failure: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct CopyBatchContext {
+    confirmed_rows: u64,
+    batch_rows: usize,
+}
+
+impl CopyBatchContext {
+    fn append_to(self, message: &mut String) {
+        let first_row = self.confirmed_rows.saturating_add(1);
+        let last_row = self.confirmed_rows.saturating_add(self.batch_rows as u64);
+        message.push_str(&format!(
+            "; batch_rows={}; batch_row_range={first_row}..={last_row}; \
+             confirmed_rows_before_batch={}",
+            self.batch_rows, self.confirmed_rows
+        ));
+    }
 }
 
 // ─── Registration ───────────────────────────────────────────────────────────
@@ -418,7 +437,8 @@ unsafe fn copy_bind_inner(info: ffi::duckdb_copy_function_bind_info) -> Result<(
             let logical_type = OwnedDuckDbLogicalType::from_raw(
                 ffi::duckdb_copy_function_bind_get_column_type(info, i as u64),
             );
-            let column = column_meta_from_logical_type(logical_type.as_raw())?;
+            let column = column_meta_from_logical_type(logical_type.as_raw())
+                .map_err(|error| format!("COPY source column {}: {error}", i + 1))?;
             columns.push(column);
         }
 
@@ -513,8 +533,14 @@ unsafe fn copy_global_init_inner(
 
         // Enrich DuckDB column metadata with Spanner target type codes
         let mut columns = bind_data.columns.clone();
-        for (col, target) in columns.iter_mut().zip(targets.iter()) {
-            apply_spanner_type(col, &target.spanner_type)?;
+        for (source_idx, (col, target)) in columns.iter_mut().zip(targets.iter()).enumerate() {
+            apply_spanner_type(col, &target.spanner_type).map_err(|error| {
+                format!(
+                    "COPY source column {} targeting Spanner column '{}': {error}",
+                    source_idx + 1,
+                    target.name
+                )
+            })?;
         }
 
         let emulator_retry_route = if bind_data.profile.endpoint_mode() == EndpointMode::Emulator {
@@ -674,6 +700,7 @@ unsafe fn column_meta_from_logical_type(
         }
 
         let type_id = ffi::duckdb_get_type_id(logical_type);
+        validate_copy_source_type(type_id)?;
         let (decimal_scale, decimal_internal_type) =
             if type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL {
                 (
@@ -741,8 +768,39 @@ unsafe fn column_meta_from_logical_type(
     }
 }
 
+fn validate_copy_source_type(type_id: ffi::duckdb_type) -> Result<(), String> {
+    if type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTERVAL {
+        return Err(
+            "DuckDB INTERVAL source values are not supported by COPY TO Spanner: \
+             Spanner INTERVAL is query-only and cannot be stored in table columns. \
+             To preserve the value as text, use interval_to_iso8601(column) and copy \
+             the resulting VARCHAR to a Spanner STRING column"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn apply_spanner_type(col: &mut ColumnMeta, spanner_type: &Type) -> Result<(), String> {
     col.spanner_type_code = spanner_type.code();
+    if matches!(
+        col.type_id,
+        ffi::DUCKDB_TYPE_DUCKDB_TYPE_FLOAT | ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE
+    ) && spanner_type.code() == TypeCode::Numeric
+    {
+        let source_type = if col.type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_FLOAT {
+            "FLOAT"
+        } else {
+            "DOUBLE"
+        };
+        return Err(format!(
+            "DuckDB {source_type} source values cannot be copied to a Spanner NUMERIC target \
+             exactly: binary floating-point values cannot be guaranteed to fit the target \
+             precision and scale. Explicitly cast the source to an appropriate DECIMAL type \
+             after choosing the required rounding and overflow policy"
+        ));
+    }
+
     let source_is_array = col.type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST
         || col.type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_ARRAY;
 
@@ -1154,14 +1212,22 @@ fn flush_buffer(state: &mut CopyGlobalState) -> Result<(), String> {
 
     let mutations = std::mem::take(&mut state.buffer);
     let count = mutations.len();
+    let context = CopyBatchContext {
+        confirmed_rows: state.rows_written,
+        batch_rows: count,
+    };
 
     runtime::run(write_mutations(
         Arc::clone(&state.client),
         mutations,
         state.emulator_retry_route,
+        context,
     ))
     .map_err(|e| {
-        format!("Runtime error: {e}; the final batch's commit outcome may be unknown")
+        let mut message =
+            format!("Runtime error: {e}; the final batch's write outcome may be unknown");
+        context.append_to(&mut message);
+        message
     })??;
 
     state.rows_written += count as u64;
@@ -1172,6 +1238,7 @@ async fn write_mutations(
     client: Arc<DatabaseClient>,
     mutations: Vec<Mutation>,
     emulator_retry_route: EmulatorRetryRoute,
+    context: CopyBatchContext,
 ) -> Result<(), String> {
     let mut attempt = 1;
     loop {
@@ -1188,7 +1255,7 @@ async fn write_mutations(
                 attempt += 1;
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            Err(e) => return Err(format_spanner_write_error(&e)),
+            Err(e) => return Err(format_spanner_write_error(&e, context)),
         }
     }
 }
@@ -1205,31 +1272,40 @@ fn build_copy_write_transaction(client: &DatabaseClient) -> WriteOnlyTransaction
         .with_retry_policy(copy_transaction_retry_policy())
         .with_begin_attempt_timeout(WRITE_BEGIN_ATTEMPT_TIMEOUT)
         .with_begin_retry_policy(
-            Aip194Strict
+            SpannerRetryPolicy::new()
                 .with_time_limit(WRITE_RPC_RETRY_TIMEOUT)
                 .with_attempt_limit(WRITE_RPC_RETRY_MAX_ATTEMPTS),
         )
         .with_commit_attempt_timeout(WRITE_COMMIT_ATTEMPT_TIMEOUT)
+        // The SDK's write path marks Commit idempotent and documents replay
+        // protection. Keep those RPC retries bounded; after they are exhausted,
+        // the transaction layer retries only explicit ABORTED results.
         .with_commit_retry_policy(
-            Aip194Strict
+            SpannerRetryPolicy::new()
                 .with_time_limit(WRITE_RPC_RETRY_TIMEOUT)
                 .with_attempt_limit(WRITE_RPC_RETRY_MAX_ATTEMPTS),
         )
         .build()
 }
 
-fn format_spanner_write_error(err: &SpannerClientError) -> String {
+fn format_spanner_write_error(err: &SpannerClientError, context: CopyBatchContext) -> String {
     let mut message = format!("Spanner write error: {err}");
     if is_ambiguous_write_error(err) {
-        message.push_str("; the final batch's commit outcome is unknown");
+        message.push_str("; the final batch's write outcome is unknown");
     }
+    context.append_to(&mut message);
     message
 }
 
 fn is_ambiguous_write_error(err: &SpannerClientError) -> bool {
+    if is_internal_emulator_schema_error(err) {
+        return false;
+    }
+
     err.is_timeout()
         || err.is_exhausted()
         || err.is_deserialization()
+        || err.is_transport()
         || err.is_io()
         || err.status().is_some_and(|status| {
             matches!(
@@ -1847,7 +1923,145 @@ unsafe extern "C" fn drop_box<T>(ptr: *mut c_void) {
 mod tests {
     use super::*;
     use google_cloud_gax::error::rpc::Status;
+    use google_cloud_gax::options::RequestOptions;
+    use google_cloud_gax::response::Response;
+    use google_cloud_spanner::client::Spanner;
+    use google_cloud_spanner::model as spanner_model;
+    use google_cloud_spanner::stub::Spanner as SpannerStub;
     use google_cloud_spanner::types as spanner_types;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const DIRECT_STUB_TEST_TIMEOUT: Duration = Duration::from_secs(5);
+    const FAKE_DATABASE: &str = "projects/p/instances/i/databases/d";
+    const FAKE_SESSION: &str = "projects/p/instances/i/databases/d/sessions/copy-test";
+
+    #[derive(Clone, Copy, Debug)]
+    enum CommitBehavior {
+        AbortedThenSuccess,
+        Unavailable,
+    }
+
+    #[derive(Debug, Default)]
+    struct StubCallCounts {
+        create_session: AtomicUsize,
+        begin_transaction: AtomicUsize,
+        commit: AtomicUsize,
+    }
+
+    #[derive(Clone, Debug)]
+    struct FakeSpannerStub {
+        behavior: CommitBehavior,
+        calls: Arc<StubCallCounts>,
+    }
+
+    impl FakeSpannerStub {
+        fn new(behavior: CommitBehavior) -> Self {
+            Self {
+                behavior,
+                calls: Arc::new(StubCallCounts::default()),
+            }
+        }
+
+        fn assert_rpc_options(options: &RequestOptions, expected_timeout: Duration) {
+            assert_eq!(options.idempotent(), Some(true));
+            assert_eq!(options.attempt_timeout(), &Some(expected_timeout));
+            assert!(options.retry_policy().is_some());
+        }
+    }
+
+    impl SpannerStub for FakeSpannerStub {
+        fn create_session(
+            &self,
+            req: spanner_model::CreateSessionRequest,
+            options: RequestOptions,
+        ) -> impl Future<Output = google_cloud_spanner::Result<Response<spanner_model::Session>>> + Send
+        {
+            let calls = Arc::clone(&self.calls);
+            async move {
+                assert_eq!(req.database, FAKE_DATABASE);
+                assert_eq!(options.idempotent(), Some(true));
+                assert!(options.retry_policy().is_some());
+                assert_eq!(
+                    calls.create_session.fetch_add(1, Ordering::SeqCst),
+                    0,
+                    "database client must create exactly one session"
+                );
+                Ok(Response::from(
+                    spanner_model::Session::new().set_name(FAKE_SESSION),
+                ))
+            }
+        }
+
+        fn begin_transaction(
+            &self,
+            req: spanner_model::BeginTransactionRequest,
+            options: RequestOptions,
+        ) -> impl Future<
+            Output = google_cloud_spanner::Result<Response<spanner_model::Transaction>>,
+        > + Send {
+            let calls = Arc::clone(&self.calls);
+            async move {
+                assert_eq!(req.session, FAKE_SESSION);
+                Self::assert_rpc_options(&options, WRITE_BEGIN_ATTEMPT_TIMEOUT);
+                let attempt = calls.begin_transaction.fetch_add(1, Ordering::SeqCst) + 1;
+                Ok(Response::from(
+                    spanner_model::Transaction::new().set_id(vec![attempt as u8]),
+                ))
+            }
+        }
+
+        fn commit(
+            &self,
+            req: spanner_model::CommitRequest,
+            options: RequestOptions,
+        ) -> impl Future<
+            Output = google_cloud_spanner::Result<Response<spanner_model::CommitResponse>>,
+        > + Send {
+            let behavior = self.behavior;
+            let calls = Arc::clone(&self.calls);
+            async move {
+                assert_eq!(req.session, FAKE_SESSION);
+                Self::assert_rpc_options(&options, WRITE_COMMIT_ATTEMPT_TIMEOUT);
+                let attempt = calls.commit.fetch_add(1, Ordering::SeqCst);
+                match (behavior, attempt) {
+                    (CommitBehavior::AbortedThenSuccess, 0) => Err(SpannerClientError::service(
+                        Status::default()
+                            .set_code(Code::Aborted)
+                            .set_message("transaction aborted"),
+                    )),
+                    (CommitBehavior::AbortedThenSuccess, _) => {
+                        Ok(Response::from(spanner_model::CommitResponse::new()))
+                    }
+                    (CommitBehavior::Unavailable, _) => Err(SpannerClientError::service(
+                        Status::default()
+                            .set_code(Code::Unavailable)
+                            .set_message("write response unavailable"),
+                    )),
+                }
+            }
+        }
+    }
+
+    async fn fake_database_client(stub: FakeSpannerStub) -> Arc<DatabaseClient> {
+        let spanner = Spanner::from_stub(stub);
+        let client = spanner
+            .database_client(FAKE_DATABASE)
+            .build()
+            .await
+            .expect("build fake database client");
+        Arc::new(client)
+    }
+
+    fn fake_mutations(count: usize) -> Vec<Mutation> {
+        (0..count)
+            .map(|id| {
+                Mutation::new_insert_or_update_builder("CopyTarget")
+                    .set("Id")
+                    .to(id as i64)
+                    .build()
+            })
+            .collect()
+    }
 
     #[test]
     fn copy_callback_error_message_sanitizes_nul() {
@@ -1873,6 +2087,48 @@ mod tests {
 
     fn names(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn logical_type(type_id: ffi::duckdb_type) -> OwnedDuckDbLogicalType {
+        unsafe {
+            let logical_type =
+                OwnedDuckDbLogicalType::from_raw(ffi::duckdb_create_logical_type(type_id));
+            assert!(!logical_type.as_raw().is_null());
+            logical_type
+        }
+    }
+
+    fn list_type(child: &OwnedDuckDbLogicalType) -> OwnedDuckDbLogicalType {
+        unsafe {
+            let logical_type =
+                OwnedDuckDbLogicalType::from_raw(ffi::duckdb_create_list_type(child.as_raw()));
+            assert!(!logical_type.as_raw().is_null());
+            logical_type
+        }
+    }
+
+    fn array_type(child: &OwnedDuckDbLogicalType, size: u64) -> OwnedDuckDbLogicalType {
+        unsafe {
+            let logical_type = OwnedDuckDbLogicalType::from_raw(ffi::duckdb_create_array_type(
+                child.as_raw(),
+                size,
+            ));
+            assert!(!logical_type.as_raw().is_null());
+            logical_type
+        }
+    }
+
+    fn column_from_logical_type(
+        logical_type: &OwnedDuckDbLogicalType,
+    ) -> Result<ColumnMeta, String> {
+        unsafe { column_meta_from_logical_type(logical_type.as_raw()) }
+    }
+
+    fn column_error_from_logical_type(logical_type: &OwnedDuckDbLogicalType) -> String {
+        match column_from_logical_type(logical_type) {
+            Ok(_) => panic!("logical type unexpectedly passed COPY metadata validation"),
+            Err(err) => err,
+        }
     }
 
     fn options(values: &[(&str, &str)]) -> std::collections::HashMap<String, Vec<String>> {
@@ -2204,7 +2460,176 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_write_error_reports_unknown_commit_outcome() {
+    fn interval_source_is_rejected_with_string_workaround() {
+        let interval = logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTERVAL);
+        let err = column_error_from_logical_type(&interval);
+
+        assert!(err.contains("Spanner INTERVAL is query-only"), "{err}");
+        assert!(err.contains("interval_to_iso8601(column)"), "{err}");
+        assert!(err.contains("Spanner STRING"), "{err}");
+    }
+
+    #[test]
+    fn float_and_double_to_numeric_are_rejected_before_conversion() {
+        for type_id in [
+            ffi::DUCKDB_TYPE_DUCKDB_TYPE_FLOAT,
+            ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE,
+        ] {
+            let logical_type = logical_type(type_id);
+            let mut source = column_from_logical_type(&logical_type).unwrap();
+            let err = apply_spanner_type(&mut source, &spanner_types::numeric()).unwrap_err();
+
+            assert!(
+                err.contains("cannot be copied to a Spanner NUMERIC"),
+                "{err}"
+            );
+            assert!(err.contains("cannot be guaranteed"), "{err}");
+            assert!(err.contains("Explicitly cast"), "{err}");
+            assert!(err.contains("DECIMAL"), "{err}");
+        }
+    }
+
+    #[test]
+    fn fixed_array_float_to_numeric_is_rejected_during_preflight() {
+        let float = logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_FLOAT);
+        let array = array_type(&float, 3);
+        let mut source = column_from_logical_type(&array).unwrap();
+
+        assert_eq!(source.type_id, ffi::DUCKDB_TYPE_DUCKDB_TYPE_ARRAY);
+        assert_eq!(source.array_size, 3);
+        assert_eq!(
+            source.child.as_deref().unwrap().type_id,
+            ffi::DUCKDB_TYPE_DUCKDB_TYPE_FLOAT
+        );
+
+        let err = apply_spanner_type(&mut source, &spanner_types::array(spanner_types::numeric()))
+            .unwrap_err();
+
+        assert!(err.contains("DuckDB FLOAT"), "{err}");
+        assert!(err.contains("Spanner NUMERIC"), "{err}");
+    }
+
+    #[test]
+    fn nested_container_double_to_numeric_is_rejected_during_preflight() {
+        let double = logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE);
+        let array = array_type(&double, 2);
+        let list = list_type(&array);
+        let mut source = column_from_logical_type(&list).unwrap();
+
+        assert_eq!(source.type_id, ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST);
+        let array_meta = source.child.as_deref().unwrap();
+        assert_eq!(array_meta.type_id, ffi::DUCKDB_TYPE_DUCKDB_TYPE_ARRAY);
+        assert_eq!(array_meta.array_size, 2);
+        assert_eq!(
+            array_meta.child.as_deref().unwrap().type_id,
+            ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE
+        );
+
+        let err = apply_spanner_type(
+            &mut source,
+            &spanner_types::array(spanner_types::array(spanner_types::numeric())),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("DuckDB DOUBLE"), "{err}");
+        assert!(err.contains("Spanner NUMERIC"), "{err}");
+    }
+
+    #[test]
+    fn nested_interval_is_rejected_while_collecting_logical_type_metadata() {
+        let interval = logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTERVAL);
+        let list = list_type(&interval);
+        let array = array_type(&list, 2);
+
+        let err = column_error_from_logical_type(&array);
+
+        assert!(err.contains("DuckDB INTERVAL"), "{err}");
+        assert!(err.contains("interval_to_iso8601(column)"), "{err}");
+    }
+
+    #[test]
+    fn float_to_float_target_remains_supported() {
+        let float = logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_FLOAT);
+        let mut source = column_from_logical_type(&float).unwrap();
+
+        apply_spanner_type(&mut source, &spanner_types::float64()).unwrap();
+
+        assert_eq!(source.spanner_type_code, TypeCode::Float64);
+    }
+
+    #[tokio::test]
+    async fn direct_stub_aborted_write_retries_complete_transaction() {
+        tokio::time::timeout(DIRECT_STUB_TEST_TIMEOUT, aborted_write_retry_scenario())
+            .await
+            .expect("ABORTED direct-stub test exceeded five seconds");
+    }
+
+    async fn aborted_write_retry_scenario() {
+        let stub = FakeSpannerStub::new(CommitBehavior::AbortedThenSuccess);
+        let calls = Arc::clone(&stub.calls);
+        let client = fake_database_client(stub).await;
+        let context = CopyBatchContext {
+            confirmed_rows: 12,
+            batch_rows: 2,
+        };
+        write_mutations(
+            client,
+            fake_mutations(context.batch_rows),
+            EmulatorRetryRoute::None,
+            context,
+        )
+        .await
+        .expect("ABORTED write should retry and succeed");
+
+        assert_eq!(calls.create_session.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.begin_transaction.load(Ordering::SeqCst), 2);
+        assert_eq!(calls.commit.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn direct_stub_ambiguous_write_is_not_replayed_as_a_new_transaction() {
+        tokio::time::timeout(DIRECT_STUB_TEST_TIMEOUT, ambiguous_write_scenario())
+            .await
+            .expect("ambiguous-write direct-stub test exceeded five seconds");
+    }
+
+    async fn ambiguous_write_scenario() {
+        let stub = FakeSpannerStub::new(CommitBehavior::Unavailable);
+        let calls = Arc::clone(&stub.calls);
+        let client = fake_database_client(stub).await;
+        let context = CopyBatchContext {
+            confirmed_rows: 7,
+            batch_rows: 3,
+        };
+        let error = write_mutations(
+            client,
+            fake_mutations(context.batch_rows),
+            EmulatorRetryRoute::None,
+            context,
+        )
+        .await
+        .unwrap_err();
+
+        // A direct stub sees one logical RPC call because transport retries are
+        // executed below this boundary. It still exercises the SDK's real
+        // WriteOnlyTransaction layer and proves Unavailable does not start a
+        // second transaction after an ambiguous write result.
+        assert_eq!(calls.create_session.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.begin_transaction.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.commit.load(Ordering::SeqCst), 1);
+        assert!(error.contains("write response unavailable"), "{error}");
+        assert!(error.contains("write outcome is unknown"), "{error}");
+        assert!(error.contains("batch_rows=3"), "{error}");
+        assert!(error.contains("batch_row_range=8..=10"), "{error}");
+        assert!(error.contains("confirmed_rows_before_batch=7"), "{error}");
+    }
+
+    #[test]
+    fn ambiguous_write_error_reports_unknown_batch_outcome() {
+        let context = CopyBatchContext {
+            confirmed_rows: 0,
+            batch_rows: 1,
+        };
         let err = SpannerClientError::service(
             Status::default()
                 .set_code(Code::DeadlineExceeded)
@@ -2212,9 +2637,9 @@ mod tests {
         );
         assert!(is_ambiguous_write_error(&err));
         assert!(
-            format_spanner_write_error(&err).contains("commit outcome is unknown"),
+            format_spanner_write_error(&err, context).contains("write outcome is unknown"),
             "{}",
-            format_spanner_write_error(&err)
+            format_spanner_write_error(&err, context)
         );
 
         let err = SpannerClientError::service(
@@ -2223,13 +2648,25 @@ mod tests {
                 .set_message("already exists"),
         );
         assert!(!is_ambiguous_write_error(&err));
-        assert!(!format_spanner_write_error(&err).contains("unknown"));
+        assert!(!format_spanner_write_error(&err, context).contains("unknown"));
 
         let err = SpannerClientError::timeout(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "commit response timed out",
         ));
         assert!(is_ambiguous_write_error(&err));
+
+        let err = SpannerClientError::transport(
+            Default::default(),
+            std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "commit response connection reset",
+            ),
+        );
+        assert!(err.is_transport());
+        assert!(!err.is_io());
+        assert!(is_ambiguous_write_error(&err));
+        assert!(format_spanner_write_error(&err, context).contains("write outcome is unknown"));
     }
 
     #[test]
@@ -2239,6 +2676,17 @@ mod tests {
                 "INTERNAL: Schema generation 0 was not registered with the Action Manager",
             ));
         assert!(is_internal_emulator_schema_error(&err));
+        assert!(!is_ambiguous_write_error(&err));
+        assert!(
+            !format_spanner_write_error(
+                &err,
+                CopyBatchContext {
+                    confirmed_rows: 0,
+                    batch_rows: 1,
+                }
+            )
+            .contains("unknown")
+        );
 
         let err = SpannerClientError::service(
             Status::default()

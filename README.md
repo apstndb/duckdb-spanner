@@ -530,7 +530,9 @@ Options:
 
 `batch_size` must be between 1 and 80,000. The upper bound matches Spanner's absolute mutations-per-commit ceiling, not a generally safe row count: each affected cell and secondary index entry counts toward that ceiling. Wide or indexed tables need a lower value. The mutation buffer grows with actual input rather than reserving the requested size up front.
 
-Each batch commits independently; COPY is not atomic across batches. After writing begins, an error reports `rows_written` for confirmed commits and states that earlier batches remain committed. A cancellation or deadline can leave the final batch's commit outcome unknown. The default `insert_or_update` mode is idempotent and remains the safest choice when retrying after a partial failure.
+Each batch commits independently; COPY is not atomic across batches. After writing begins, an error reports `rows_written` for confirmed commits and states that earlier batches remain committed. A cancellation or deadline can leave the final batch's write outcome unknown. The default `insert_or_update` mode is idempotent and remains the safest choice when retrying after a partial failure.
+
+Within one batch, the SDK's replay-protected Commit RPC retries transient failures for up to three attempts, with a 30-second retry-policy threshold and a 30-second timeout for each attempt. An explicit Spanner `ABORTED` result retries the whole replay-protected transaction up to five attempts. Its 60-second total-time setting stops scheduling another transaction after the threshold is observed between attempts; it is not a hard wall-clock deadline for an already-running Begin or Commit RPC. When a retry budget is exhausted, or a cancellation, deadline, transport, or service error can leave the result uncertain, COPY reports the batch's write outcome as unknown rather than starting another transaction. The emulator's definitive schema-registration race retains its existing bounded retry and is not reported as ambiguous. Write errors report the attempted batch size, its COPY row range, and the number of rows confirmed before that batch.
 
 The file path argument specifies the target Spanner table name. Source columns are mapped to the table's **writable** Spanner columns by position. Generated columns (`INFORMATION_SCHEMA.IS_GENERATED != 'NEVER'`) are computed by Spanner and reject writes, so they are excluded from the target column list — the source column count must match the number of non-generated columns, not the total column count.
 
@@ -546,6 +548,13 @@ COPY (SELECT source_value, source_id, source_name) TO 'Users' (
 DuckDB's COPY C API exposes source types but not automatically discovered source aliases, so aliases cannot currently drive mapping automatically. Use `columns [...]` whenever source aliases or ordering differ from the writable Spanner columns.
 
 `COPY TO ... FORMAT spanner` supports scalar columns, DuckDB LIST/ARRAY source columns mapped to Spanner ARRAY targets, and DuckDB STRUCT source columns mapped to Spanner JSON targets.
+
+Two source/target combinations are rejected before the first mutation is created:
+
+- DuckDB `INTERVAL` source values are unsupported. Spanner `INTERVAL` is a query-only type and cannot be stored in table columns, while DuckDB's physical interval domain is also wider than Spanner's interval domain. To preserve an interval as text, select `interval_to_iso8601(column)` and copy the resulting `VARCHAR` to a Spanner `STRING` column.
+- DuckDB `FLOAT` or `DOUBLE` source values mapped to Spanner `NUMERIC` (also inside `ARRAY`) are rejected. Binary floating-point values cannot be guaranteed to fit the target's exact precision and scale without rounding, and non-finite values are not valid `NUMERIC` values. Cast the source explicitly to an appropriate DuckDB `DECIMAL` type after choosing the desired rounding and overflow policy.
+
+These conversions are not delegated to Spanner, and COPY does not implicitly round or stringify floating-point values.
 
 ```sql
 -- Write query results to a Spanner table
