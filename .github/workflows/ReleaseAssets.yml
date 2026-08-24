@@ -45,7 +45,7 @@ jobs:
       SOURCE_RUN_ID: ${{ inputs.source_run_id }}
     steps:
       - name: Check out the release tag
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/tags/${{ inputs.release_tag }}
           fetch-depth: 0
@@ -182,13 +182,13 @@ jobs:
       contents: read
     steps:
       - name: Check out the immutable dispatch commit
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Download exact main-run artifact
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           artifact-ids: ${{ fromJSON(needs.preflight.outputs.artifact_ids)[matrix.platform] }}
           path: release-candidate
@@ -223,13 +223,13 @@ jobs:
       contents: write
     steps:
       - name: Check out the immutable dispatch commit
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Download all verified artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           # Keep artifact-name directories because every artifact has the same filename.
           artifact-ids: ${{ needs.preflight.outputs.artifact_ids_csv }}
