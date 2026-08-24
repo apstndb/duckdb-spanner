@@ -68,6 +68,9 @@ jobs:
                 test/*|tests/*)
                   run_emulator=true
                   ;;
+                scripts/check_extension_load_order.py|scripts/check_extension_rejects_mismatched_host.py|scripts/run_sqllogictest_with_peg_parser.py|scripts/test_check_extension_load_order.py|scripts/test_check_extension_rejects_mismatched_host.py|scripts/test_run_sqllogictest_with_peg_parser.py|scripts/test_makefile_test_profiles.py)
+                  run_emulator=true
+                  ;;
               esac
             done < changed-files.txt
           fi
@@ -99,6 +102,10 @@ jobs:
       - run: make check-google-cloud-rust
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_check_release_asset_metadata.py
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_package_release_assets.py
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_run_sqllogictest_with_peg_parser.py
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_check_extension_load_order.py
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_check_extension_rejects_mismatched_host.py
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_makefile_test_profiles.py
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --features loadable-extension -- -D warnings
       - run: cargo test --lib
@@ -146,6 +153,12 @@ jobs:
 
       - name: SQLLogicTest (make test_release)
         run: make configure release test_release
+
+      - name: SQLLogicTest with opt-in PEG parser
+        run: make test_peg_parser
+
+      - name: Exact DuckDB extension compatibility checks
+        run: make test_duckdb_compatibility
 
   rust-integration-tests:
     name: Rust integration tests
