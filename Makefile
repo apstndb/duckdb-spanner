@@ -1,4 +1,4 @@
-.PHONY: build build-sweep build-release check-google-cloud-rust check-duckdb-version check-duckdb-cli-version check-target-duckdb-version extension duckdb emulator-start emulator-stop emulator-status test test_debug test_release clean sweep sweep-dry-run ensure-cargo-sweep configure debug release clean_all
+.PHONY: build build-sweep build-release check-google-cloud-rust check-duckdb-version check-duckdb-cli-version check-target-duckdb-version extension duckdb emulator-start emulator-stop emulator-status test test_debug test_release community_smoke clean sweep sweep-dry-run ensure-cargo-sweep configure debug release clean_all
 
 # Detect OS for library extension
 UNAME := $(shell uname)
@@ -170,6 +170,17 @@ endif
 
 include extension-ci-tools/makefiles/c_api_extensions/rust.Makefile
 
+# Keep extension-ci-tools' copy step aligned with Cargo when callers isolate
+# artifacts through CARGO_TARGET_DIR (for example, an isolated distribution CI
+# job).
+CARGO_TARGET_PATH ?= $(TARGET_PATH)
+ifneq ($(strip $(CARGO_TARGET_DIR)),)
+CARGO_TARGET_PATH := $(CARGO_TARGET_DIR)
+ifneq ($(strip $(TARGET)),)
+CARGO_TARGET_PATH := $(CARGO_TARGET_DIR)/$(TARGET)
+endif
+endif
+
 # Always refresh extension version from Cargo.toml (avoid stale git-hash file).
 extension_version:
 	@mkdir -p configure
@@ -182,17 +193,26 @@ build_extension_with_metadata_debug build_extension_with_metadata_release: exten
 build_extension_library_debug: check_configure check-target-duckdb-version
 	DUCKDB_EXTENSION_NAME=$(EXTENSION_NAME) DUCKDB_EXTENSION_MIN_DUCKDB_VERSION=$(TARGET_DUCKDB_VERSION) cargo build --features loadable-extension $(CARGO_OVERRIDE_DUCKDB_RS_FLAG) $(TARGET_INFO)
 	$(PYTHON_VENV_BIN) -c "from pathlib import Path;Path('$(EXTENSION_BUILD_PATH)/debug/extension/$(EXTENSION_NAME)').mkdir(parents=True, exist_ok=True)"
-	$(PYTHON_VENV_BIN) -c "import shutil;shutil.copyfile('$(TARGET_PATH)/debug$(IS_EXAMPLE)/$(EXTENSION_LIB_FILENAME)', '$(EXTENSION_BUILD_PATH)/debug/$(EXTENSION_LIB_FILENAME)')"
+	$(PYTHON_VENV_BIN) -c "import shutil;shutil.copyfile('$(CARGO_TARGET_PATH)/debug$(IS_EXAMPLE)/$(EXTENSION_LIB_FILENAME)', '$(EXTENSION_BUILD_PATH)/debug/$(EXTENSION_LIB_FILENAME)')"
 
 build_extension_library_release: check_configure check-target-duckdb-version
 	DUCKDB_EXTENSION_NAME=$(EXTENSION_NAME) DUCKDB_EXTENSION_MIN_DUCKDB_VERSION=$(TARGET_DUCKDB_VERSION) cargo build --features loadable-extension $(CARGO_OVERRIDE_DUCKDB_RS_FLAG) --release $(TARGET_INFO)
 	$(PYTHON_VENV_BIN) -c "from pathlib import Path;Path('$(EXTENSION_BUILD_PATH)/release/extension/$(EXTENSION_NAME)').mkdir(parents=True, exist_ok=True)"
-	$(PYTHON_VENV_BIN) -c "import shutil;shutil.copyfile('$(TARGET_PATH)/release$(IS_EXAMPLE)/$(EXTENSION_LIB_FILENAME)', '$(EXTENSION_BUILD_PATH)/release/$(EXTENSION_LIB_FILENAME)')"
+	$(PYTHON_VENV_BIN) -c "import shutil;shutil.copyfile('$(CARGO_TARGET_PATH)/release$(IS_EXAMPLE)/$(EXTENSION_LIB_FILENAME)', '$(EXTENSION_BUILD_PATH)/release/$(EXTENSION_LIB_FILENAME)')"
 
 configure: venv platform extension_version
 
 debug: check-target-duckdb-version build_extension_library_debug build_extension_with_metadata_debug
 release: check-target-duckdb-version build_extension_library_release build_extension_with_metadata_release
+
+# Offline smoke profile used by extension distribution validation. It exercises
+# extension loading without requiring Docker, a Spanner emulator, or an
+# external repository submission.
+COMMUNITY_SMOKE_TEST_FILE ?= test/sql/spanner_smoke.test
+COMMUNITY_SMOKE_TEST_DIR ?= $(dir $(COMMUNITY_SMOKE_TEST_FILE))
+community_smoke: configure release
+	@echo "Running offline release smoke test: $(COMMUNITY_SMOKE_TEST_FILE)"
+	@$(TEST_RUNNER) --test-dir "$(COMMUNITY_SMOKE_TEST_DIR)" --file-path "$(COMMUNITY_SMOKE_TEST_FILE)" --external-extension build/release/$(EXTENSION_NAME).duckdb_extension
 
 # SQLLogicTest (test/sql/*.test) needs a running Spanner emulator and seeded database.
 EMULATOR_HOST ?= localhost:9010

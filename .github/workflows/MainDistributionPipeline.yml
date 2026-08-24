@@ -139,6 +139,11 @@ jobs:
         with:
           cache-on-failure: true
 
+      - name: Offline release smoke profile
+        env:
+          DUCKDB_TEST_VERSION: 1.5.5
+        run: make community_smoke
+
       - name: SQLLogicTest (make test_release)
         run: make configure release test_release
 

@@ -197,6 +197,14 @@ jobs:
           repository: ${{ github.repository }}
           run-id: ${{ inputs.source_run_id }}
 
+      - name: Validate exact release asset metadata
+        shell: bash
+        env:
+          EXPECTED_EXTENSION_TAG: ${{ inputs.release_tag }}
+        run: >-
+          python scripts/check-release-asset-metadata.py
+          release-candidate/spanner.duckdb_extension ${{ matrix.platform }}
+
       - name: Install DuckDB v1.5.5
         if: matrix.validation == 'load'
         shell: bash
@@ -207,20 +215,18 @@ jobs:
         shell: bash
         run: python scripts/smoke-release-asset.py release-candidate/spanner.duckdb_extension
 
-      - name: Validate MinGW metadata and static runtime imports
-        if: matrix.validation == 'metadata'
-        shell: bash
-        env:
-          EXPECTED_EXTENSION_TAG: ${{ inputs.release_tag }}
-        run: python scripts/check-release-asset-metadata.py release-candidate/spanner.duckdb_extension
-
   stage-draft:
     name: Attach verified assets to draft release
     needs: [preflight, smoke-assets]
     runs-on: ubuntu-24.04
     permissions:
       actions: read
+      # The release files are GitHub release assets, not OCI registry objects.
+      # Keep storage-record creation disabled below, so artifact-metadata is
+      # intentionally not granted to this upload job.
+      attestations: write
       contents: write
+      id-token: write
     steps:
       - name: Check out the immutable dispatch commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -249,6 +255,15 @@ jobs:
             exit 1
           fi
           (cd staged-assets && sha256sum -- ./*.zip > SHA256SUMS)
+
+      - name: Attest final staged release files
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: staged-assets/*
+          # Storage records require an OCI registry push and subject-name;
+          # these are GitHub release assets, so provenance is the intended
+          # product and artifact-metadata: write is not needed.
+          create-storage-record: false
 
       - name: Upload only to the still-draft release
         shell: bash

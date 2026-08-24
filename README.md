@@ -98,7 +98,13 @@ requires its dispatch ref, tag, source run, and empty draft release to agree on
 that commit, smoke-loads five platform artifacts on matching native DuckDB
 `v1.5.5` runners, packages each verified binary as the sole canonical member of
 a platform ZIP, generates `SHA256SUMS` for those archives, and attaches them to
-the draft. The additional `windows_amd64_mingw` artifact is best-effort, matching
+the draft. Before upload, it creates GitHub/Sigstore build-provenance
+attestations for the six final ZIPs and `SHA256SUMS`. These attestations bind the
+published bytes to this staging workflow; they do not create a GitHub artifact
+storage record and do not turn the contained binary into a DuckDB-signed
+extension. Storage records are intentionally disabled because this flow
+publishes GitHub release assets rather than pushing OCI images. The additional
+`windows_amd64_mingw` artifact is best-effort, matching
 [DuckDB's upstream support tier](https://duckdb.org/docs/stable/dev/building/overview#platforms-with-best-effort-support).
 GitHub's Windows runner and Python DuckDB wheel use the incompatible MSVC
 platform, so CI validates the MinGW artifact's metadata and PE import table
@@ -114,6 +120,16 @@ file named `spanner.duckdb_extension`. Keep that canonical filename when
 extracting it: DuckDB derives the extension initialization symbol from the
 filename. Verify the ZIP against `SHA256SUMS`, extract it into an empty
 directory, and load that sole member without renaming it.
+
+Verify a downloaded release ZIP's GitHub provenance against this repository:
+
+```bash
+gh attestation verify --repo apstndb/duckdb-spanner spanner-v1.5.5-linux_amd64.zip
+```
+
+This provenance attestation is separate from DuckDB extension signing. The
+extension remains unsigned and must still be loaded with DuckDB's unsigned
+extension opt-in described below.
 
 ### Loading the Extension
 
