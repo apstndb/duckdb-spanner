@@ -8,7 +8,6 @@ use google_cloud_spanner::value::{Kind, Value as SpannerValue};
 use time::OffsetDateTime;
 
 use crate::error::SpannerError;
-use crate::schema::ColumnInfo;
 use crate::types::is_pg_numeric;
 
 const EPOCH_DATE: time::Date = time::macros::date!(1970 - 01 - 01);
@@ -457,42 +456,6 @@ fn row_value<'a, R: ConversionRow>(
             "column '{column_name}', row {row_idx}: Spanner column index {spanner_col_idx} out of range"
         ))
     })
-}
-
-/// Write a batch of Spanner Rows into a DuckDB DataChunkHandle.
-/// All columns are written at matching indices (col 0 → output col 0, etc.).
-pub fn write_rows_to_chunk(
-    output: &mut DataChunkHandle,
-    rows: &[Row],
-    columns: &[ColumnInfo],
-) -> Result<(), SpannerError> {
-    ensure_row_count(rows.len(), &|| "result batch".to_string())?;
-
-    // Validate every column before publishing any part of the batch. Calling
-    // the public single-column entry point here would validate too late, after
-    // earlier columns had already been written.
-    for (col_idx, col) in columns.iter().enumerate() {
-        preflight_column_from_rows(rows, col_idx, &col.spanner_type, &col.name)?;
-    }
-
-    if rows.is_empty() {
-        output.set_len(0);
-        return Ok(());
-    }
-
-    for (col_idx, col) in columns.iter().enumerate() {
-        write_preflighted_column_from_rows(
-            output,
-            col_idx,
-            rows,
-            col_idx,
-            &col.spanner_type,
-            &col.name,
-        )?;
-    }
-
-    output.set_len(rows.len());
-    Ok(())
 }
 
 pub(crate) fn write_preflighted_column_from_rows<R: ConversionRow>(
