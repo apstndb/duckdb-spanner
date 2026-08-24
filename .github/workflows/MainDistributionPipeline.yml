@@ -30,7 +30,7 @@ jobs:
       run_emulator: ${{ steps.changed.outputs.run_emulator }}
       reduced_ci_mode: ${{ steps.changed.outputs.reduced_ci_mode }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -83,15 +83,15 @@ jobs:
     # arm64 pool: same 4/16 as ubuntu-latest, separate queue from linux_amd64 builds.
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
 
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
 
@@ -106,10 +106,10 @@ jobs:
     name: Build extension binaries
     needs: changes
     if: ${{ needs.changes.outputs.run_distribution == 'true' }}
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@e1fff3981c714851d54fd856237769ec6cbaa957 # e1fff3981c714851d54fd856237769ec6cbaa957
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@401cc753a9251216567652ed06b456a20f74c9b0 # 401cc753a9251216567652ed06b456a20f74c9b0
     with:
       duckdb_version: v1.5.5
-      ci_tools_version: e1fff3981c714851d54fd856237769ec6cbaa957
+      ci_tools_version: 401cc753a9251216567652ed06b456a20f74c9b0
       extension_name: spanner
       extra_toolchains: rust;python3
       reduced_ci_mode: ${{ needs.changes.outputs.reduced_ci_mode }}
@@ -126,13 +126,13 @@ jobs:
     # Spanner emulator is multi-arch; run on arm to leave x64 for linux_amd64 builds.
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
 
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
 
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
 
@@ -146,11 +146,11 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           submodules: recursive
 
-      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable
 
       - name: Free disk space
         run: |
@@ -166,7 +166,7 @@ jobs:
       - name: Pre-pull Spanner emulator image
         run: docker pull gcr.io/cloud-spanner-emulator/emulator:1.5.56@sha256:18a56fd557011e50e1733a9232e8d17ec9bdd7e51f6cf7660f14c234479f4f36
 
-      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-on-failure: true
 
