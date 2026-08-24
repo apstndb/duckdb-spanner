@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use duckdb::core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId};
@@ -1404,21 +1404,124 @@ fn validate_ddl_statement(statement: &str) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+enum CachedInitState<T> {
+    NotStarted,
+    Running,
+    Complete(Result<T, String>),
+}
+
+struct CachedInit<T> {
+    state: Mutex<CachedInitState<T>>,
+    complete: Condvar,
+    #[cfg(test)]
+    waiter_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
+}
+
+impl<T> CachedInit<T> {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(CachedInitState::NotStarted),
+            complete: Condvar::new(),
+            #[cfg(test)]
+            waiter_barrier: Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    fn set_waiter_barrier(&self, barrier: Arc<std::sync::Barrier>) {
+        *self
+            .waiter_barrier
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(barrier);
+    }
+
+    #[cfg(test)]
+    fn rendezvous_waiter(&self) {
+        let barrier = self
+            .waiter_barrier
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(barrier) = barrier {
+            barrier.wait();
+        }
+    }
+}
+
+fn replay_cached_init_result<T>(result: &Result<T, String>) -> Result<T, Box<dyn std::error::Error>>
+where
+    T: Clone,
+{
+    match result {
+        Ok(value) => Ok(value.clone()),
+        Err(err) => Err(err.clone().into()),
+    }
+}
+
+fn cached_init_panic_error(payload: &(dyn std::any::Any + Send)) -> String {
+    let detail = if let Some(message) = payload.downcast_ref::<&str>() {
+        *message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "non-string panic payload"
+    };
+    format!("spanner_ddl initialization panicked: {detail}")
+}
+
 fn cached_init_result<T>(
-    cache: &Mutex<Option<Result<T, String>>>,
+    cache: &CachedInit<T>,
     run: impl FnOnce() -> Result<T, Box<dyn std::error::Error>>,
 ) -> Result<T, Box<dyn std::error::Error>>
 where
     T: Clone,
 {
-    let mut cached = cache.lock().unwrap_or_else(|e| e.into_inner());
-    if cached.is_none() {
-        *cached = Some(run().map_err(|e| e.to_string()));
+    let mut state = cache.state.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        match &*state {
+            CachedInitState::Complete(result) => return replay_cached_init_result(result),
+            CachedInitState::Running => {
+                #[cfg(test)]
+                {
+                    // Publication cannot acquire `state` after this rendezvous until
+                    // `wait` atomically releases it and parks this caller.
+                    cache.rendezvous_waiter();
+                }
+                state = cache
+                    .complete
+                    .wait(state)
+                    .unwrap_or_else(|e| e.into_inner());
+            }
+            CachedInitState::NotStarted => {
+                *state = CachedInitState::Running;
+                break;
+            }
+        }
     }
+    drop(state);
 
-    match cached.as_ref().expect("cache populated above") {
-        Ok(value) => Ok(value.clone()),
-        Err(err) => Err(err.clone().into()),
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run().map_err(|e| e.to_string())
+    })) {
+        Ok(result) => {
+            let mut state = cache.state.lock().unwrap_or_else(|e| e.into_inner());
+            *state = CachedInitState::Complete(result);
+            cache.complete.notify_all();
+
+            let CachedInitState::Complete(result) = &*state else {
+                unreachable!("the cache result was just completed");
+            };
+            replay_cached_init_result(result)
+        }
+        Err(payload) => {
+            let mut state = cache.state.lock().unwrap_or_else(|e| e.into_inner());
+            // A panic may happen after DDL submission. Publish a terminal error before
+            // rethrowing so waiting or later init calls cannot submit it again.
+            *state = CachedInitState::Complete(Err(cached_init_panic_error(payload.as_ref())));
+            cache.complete.notify_all();
+            drop(state);
+            std::panic::resume_unwind(payload);
+        }
     }
 }
 
@@ -1433,7 +1536,7 @@ pub struct DdlBindData {
     // DuckDB may call init() more than once for one bound table function.
     // Cache the full init outcome so repeated callers do not resend DDL and
     // see the same success or error from the first execution.
-    cached_result: Arc<Mutex<Option<Result<DdlResult, String>>>>,
+    cached_result: Arc<CachedInit<DdlResult>>,
 }
 
 pub struct DdlInitData {
@@ -1471,7 +1574,7 @@ impl VTab for SpannerDdlVTab {
             Ok(DdlBindData {
                 profile,
                 statements,
-                cached_result: Arc::new(Mutex::new(None)),
+                cached_result: Arc::new(CachedInit::new()),
             })
         })
     }
@@ -1579,7 +1682,7 @@ pub struct DdlAsyncBindData {
     profile: ConnectionProfile,
     statements: Vec<String>,
     // See the comment on `DdlBindData::cached_result`.
-    cached_result: Arc<Mutex<Option<Result<DdlAsyncResult, String>>>>,
+    cached_result: Arc<CachedInit<DdlAsyncResult>>,
 }
 
 pub struct DdlAsyncInitData {
@@ -1612,7 +1715,7 @@ impl VTab for SpannerDdlAsyncVTab {
             Ok(DdlAsyncBindData {
                 profile,
                 statements,
-                cached_result: Arc::new(Mutex::new(None)),
+                cached_result: Arc::new(CachedInit::new()),
             })
         })
     }
@@ -2118,9 +2221,11 @@ fn instance_path_from_database_path(database_path: &str) -> Result<&str, Spanner
 mod tests {
     use std::collections::VecDeque;
     use std::ffi::CString;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{SyncSender, sync_channel};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Barrier, Mutex};
+    use std::thread;
     use std::time::Duration;
 
     use duckdb::ffi::{
@@ -2136,17 +2241,18 @@ mod tests {
     use crate::runtime::test_support::TestRuntimeOwner;
 
     use super::{
-        AdminRequestError, ClientCache, ClientCacheLookup, ClientFlight, DdlTimeouts,
-        EmulatorResponse, EmulatorTransport, FlightCleanupGuard, HttpFuture,
-        admin_request_is_ambiguous, cached_init_result, database_operation_prefix,
-        ddl_operation_error, ddl_statements_from_values, fetch_emulator_operation,
-        gax_submission_signals_are_ambiguous, get_or_create_cached_client,
-        google_error_code_and_message, instance_path_from_database_path,
-        is_emulator_replay_conflict, is_emulator_schema_change_rejection,
-        list_emulator_database_operations_with, lookup_cached_client, operation_from_json,
-        recover_ambiguous_submission, spawn_client_initialization,
-        spawn_client_initialization_with, update_emulator_database_ddl_with,
-        wait_emulator_operation_with, wait_with_operation_deadline,
+        AdminRequestError, CachedInit, CachedInitState, ClientCache, ClientCacheLookup,
+        ClientFlight, DdlTimeouts, EmulatorResponse, EmulatorTransport, FlightCleanupGuard,
+        HttpFuture, admin_request_is_ambiguous, cached_init_panic_error, cached_init_result,
+        database_operation_prefix, ddl_operation_error, ddl_statements_from_values,
+        fetch_emulator_operation, gax_submission_signals_are_ambiguous,
+        get_or_create_cached_client, google_error_code_and_message,
+        instance_path_from_database_path, is_emulator_replay_conflict,
+        is_emulator_schema_change_rejection, list_emulator_database_operations_with,
+        lookup_cached_client, operation_from_json, recover_ambiguous_submission,
+        spawn_client_initialization, spawn_client_initialization_with,
+        update_emulator_database_ddl_with, wait_emulator_operation_with,
+        wait_with_operation_deadline,
     };
 
     struct DropSignal(Option<SyncSender<()>>);
@@ -2209,7 +2315,7 @@ mod tests {
 
     #[test]
     fn test_cached_init_result_replays_success_without_rerun() {
-        let cache = Mutex::new(None);
+        let cache = CachedInit::new();
         let calls = AtomicUsize::new(0);
 
         let first = cached_init_result(&cache, || {
@@ -2230,7 +2336,7 @@ mod tests {
 
     #[test]
     fn test_cached_init_result_replays_error_without_rerun() {
-        let cache = Mutex::new(None);
+        let cache = CachedInit::new();
         let calls = AtomicUsize::new(0);
 
         let first = cached_init_result::<String>(&cache, || {
@@ -2249,6 +2355,158 @@ mod tests {
         assert_eq!(first, "first init failed");
         assert_eq!(second, "first init failed");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_cached_init_result_coalesces_concurrent_success_without_holding_cache_lock() {
+        let cache = Arc::new(CachedInit::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (run_started_tx, run_started_rx) = sync_channel(0);
+        let (complete_tx, complete_rx) = sync_channel(0);
+
+        let first_cache = Arc::clone(&cache);
+        let first_calls = Arc::clone(&calls);
+        let first = thread::spawn(move || {
+            let run_cache = Arc::clone(&first_cache);
+            cached_init_result(&first_cache, || {
+                first_calls.fetch_add(1, Ordering::SeqCst);
+                assert!(
+                    run_cache.state.try_lock().is_ok(),
+                    "initializer held the cache mutex while running"
+                );
+                run_started_tx.send(()).unwrap();
+                complete_rx.recv().unwrap();
+                Ok("operation-1".to_string())
+            })
+            .unwrap()
+        });
+        run_started_rx.recv().unwrap();
+
+        let second_cache = Arc::clone(&cache);
+        let second_calls = Arc::clone(&calls);
+        let waiter_entered = Arc::new(Barrier::new(2));
+        cache.set_waiter_barrier(Arc::clone(&waiter_entered));
+        let second = thread::spawn(move || {
+            cached_init_result(&second_cache, || {
+                second_calls.fetch_add(1, Ordering::SeqCst);
+                Ok("operation-2".to_string())
+            })
+            .unwrap()
+        });
+        waiter_entered.wait();
+        complete_tx.send(()).unwrap();
+
+        assert_eq!(first.join().unwrap(), "operation-1");
+        assert_eq!(second.join().unwrap(), "operation-1");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_cached_init_result_wakes_waiter_after_panic_without_rerun() {
+        let cache = Arc::new(CachedInit::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (run_started_tx, run_started_rx) = sync_channel(0);
+        let (panic_tx, panic_rx) = sync_channel(0);
+
+        let first_cache = Arc::clone(&cache);
+        let first_calls = Arc::clone(&calls);
+        let first = thread::spawn(move || {
+            let payload = catch_unwind(AssertUnwindSafe(|| {
+                cached_init_result::<String>(&first_cache, || {
+                    first_calls.fetch_add(1, Ordering::SeqCst);
+                    run_started_tx.send(()).unwrap();
+                    panic_rx.recv().unwrap();
+                    panic!("deliberate initialization panic");
+                })
+            }))
+            .unwrap_err();
+            if let Some(message) = payload.downcast_ref::<&str>() {
+                (*message).to_string()
+            } else if let Some(message) = payload.downcast_ref::<String>() {
+                message.clone()
+            } else {
+                "non-string panic payload".to_string()
+            }
+        });
+        run_started_rx.recv().unwrap();
+
+        let second_cache = Arc::clone(&cache);
+        let second_calls = Arc::clone(&calls);
+        let waiter_entered = Arc::new(Barrier::new(2));
+        cache.set_waiter_barrier(Arc::clone(&waiter_entered));
+        let (waiter_result_tx, waiter_result_rx) = sync_channel(0);
+        let second = thread::spawn(move || {
+            let result = cached_init_result(&second_cache, || {
+                second_calls.fetch_add(1, Ordering::SeqCst);
+                Ok("operation-2".to_string())
+            })
+            .map_err(|e| e.to_string());
+            waiter_result_tx.send(result).unwrap();
+        });
+        waiter_entered.wait();
+
+        panic_tx.send(()).unwrap();
+        let initiating_error = first.join().unwrap();
+
+        let waiter_result = waiter_result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("waiter remained blocked after initialization panic")
+            .unwrap_err();
+        second.join().unwrap();
+
+        assert_eq!(initiating_error, "deliberate initialization panic");
+        assert_eq!(
+            waiter_result,
+            format!("spanner_ddl initialization panicked: {initiating_error}")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_cached_init_panic_error_handles_string_and_non_string_payloads() {
+        assert_eq!(
+            cached_init_panic_error(&"borrowed panic detail"),
+            "spanner_ddl initialization panicked: borrowed panic detail"
+        );
+        assert_eq!(
+            cached_init_panic_error(&"owned panic detail".to_string()),
+            "spanner_ddl initialization panicked: owned panic detail"
+        );
+        assert_eq!(
+            cached_init_panic_error(&42_u32),
+            "spanner_ddl initialization panicked: non-string panic payload"
+        );
+    }
+
+    #[test]
+    fn test_cached_init_result_recovers_poisoned_state_mutex() {
+        let cache = CachedInit::new();
+        let calls = AtomicUsize::new(0);
+
+        let poison = catch_unwind(AssertUnwindSafe(|| {
+            let _state = cache.state.lock().unwrap();
+            panic!("deliberately poison cached init state");
+        }));
+        assert!(poison.is_err());
+        assert!(cache.state.is_poisoned());
+
+        let first = cached_init_result(&cache, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok("operation-1".to_string())
+        })
+        .unwrap();
+        let second = cached_init_result(&cache, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok("operation-2".to_string())
+        })
+        .unwrap();
+
+        assert_eq!(first, "operation-1");
+        assert_eq!(second, "operation-1");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let state = cache.state.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(matches!(&*state, CachedInitState::Complete(Ok(_))));
     }
 
     #[tokio::test]
