@@ -734,6 +734,22 @@ make test               # alias for test_release
 
 Requires Docker (Colima on macOS). Emulator tests use `SPANNER_EMULATOR_HOST` (default `localhost:9010`).
 
+`make test_peg_parser` runs the same full SQLLogicTest suite on the exact
+DuckDB `v1.5.5` Python host after `CALL enable_peg_parser()` is applied to
+every test database. It is a separate lane: `make test_release` remains the
+legacy-parser acceptance run. `make test_duckdb_compatibility` verifies both
+load orders in separate processes between this extension and DuckDB's
+versioned core `autocomplete` extension, then proves the `v1.5.5`
+`C_STRUCT_UNSTABLE` artifact is rejected on an exact DuckDB `v1.5.4` host
+without metadata-mismatch opt-in. These
+compatibility targets use pinned DuckDB wheel versions, never a latest host.
+
+Community Extensions builds can set `DUCKDB_SPANNER_OFFLINE_TESTS=1` through
+their descriptor's `test_config`. This keeps the standard `make test_release`
+entrypoint but runs only `spanner_smoke.test`, which verifies extension loading
+without Docker or a Spanner emulator. Project CI continues to run the complete
+emulator-backed suite with this variable unset.
+
 ### Rust Integration Tests
 
 Rust integration tests use testcontainers to start the emulator automatically. You only need a running Docker daemon:

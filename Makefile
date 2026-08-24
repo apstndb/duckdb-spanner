@@ -1,4 +1,4 @@
-.PHONY: build build-sweep build-release check-google-cloud-rust check-duckdb-version check-duckdb-cli-version check-target-duckdb-version extension duckdb emulator-start emulator-stop emulator-status test test_debug test_release community_smoke clean sweep sweep-dry-run ensure-cargo-sweep configure debug release clean_all
+.PHONY: build build-sweep build-release check-google-cloud-rust check-duckdb-version check-duckdb-cli-version check-target-duckdb-version extension duckdb emulator-start emulator-stop emulator-status test test_debug test_release test_peg_parser test_extension_load_order test_extension_loader_rejection test_duckdb_compatibility community_smoke clean sweep sweep-dry-run ensure-cargo-sweep ensure-pinned-duckdb-test-host configure debug release clean_all
 
 # Detect OS for library extension
 UNAME := $(shell uname)
@@ -27,6 +27,8 @@ EMULATOR_NAME := spanner-emulator
 EMULATOR_IMAGE := gcr.io/cloud-spanner-emulator/emulator:1.5.56@sha256:18a56fd557011e50e1733a9232e8d17ec9bdd7e51f6cf7660f14c234479f4f36
 # This is the compile-time ABI target, not a caller-selectable metadata value.
 override DUCKDB_TARGET_VERSION := v1.5.5
+DUCKDB_TEST_HOST_VERSION := $(patsubst v%,%,$(DUCKDB_TARGET_VERSION))
+DUCKDB_MISMATCH_TEST_VERSION := 1.5.4
 DUCKDB_BIN ?= duckdb
 DUCKDB_CLI_VERSION := $(shell "$(DUCKDB_BIN)" --version 2>/dev/null | sed -nE 's/^v?([0-9]+\.[0-9]+\.[0-9]+).*/v\1/p')
 
@@ -125,6 +127,15 @@ test: test_release
 test_debug: test_extension_debug
 test_release: test_extension_release
 
+# These compatibility lanes use explicit DuckDB wheel versions. Do not reuse
+# extension-ci-tools' default (latest) test-host selection for unstable ABI checks.
+ensure-pinned-duckdb-test-host:
+	@if [ ! -x "$(PYTHON_VENV_BIN)" ]; then \
+		$(MAKE) --no-print-directory configure DUCKDB_TEST_VERSION=$(DUCKDB_TEST_HOST_VERSION); \
+	fi
+	@$(PYTHON_VENV_BIN) -m pip install --disable-pip-version-check "duckdb==$(DUCKDB_TEST_HOST_VERSION)"
+	@$(PYTHON_VENV_BIN) -c "import duckdb; assert duckdb.__version__ == '$(DUCKDB_TEST_HOST_VERSION)', duckdb.__version__"
+
 ensure-cargo-sweep:
 	@command -v cargo-sweep >/dev/null 2>&1 || { \
 		echo "cargo-sweep is required for sweep targets. Install it with: brew install cargo-sweep"; \
@@ -214,6 +225,44 @@ community_smoke: configure release
 	@echo "Running offline release smoke test: $(COMMUNITY_SMOKE_TEST_FILE)"
 	@$(TEST_RUNNER) --test-dir "$(COMMUNITY_SMOKE_TEST_DIR)" --file-path "$(COMMUNITY_SMOKE_TEST_FILE)" --external-extension build/release/$(EXTENSION_NAME).duckdb_extension
 
+# Keep this separate from test_release so the existing legacy-parser lane
+# remains a full, independent acceptance run.
+TEST_RUNNER_PEG_RELEASE = $(PYTHON_VENV_BIN) scripts/run_sqllogictest_with_peg_parser.py --test-dir test/sql --external-extension build/release/$(EXTENSION_NAME).duckdb_extension
+test_peg_parser: ensure-pinned-duckdb-test-host release test_extension_release_peg_parser_internal
+
+test_extension_release_peg_parser_internal: check_configure emulator-start
+	@bash tests/setup_sqllogic_db.sh
+	@echo "Running RELEASE tests with the opt-in PEG parser.."
+	@$(TEST_RUNNER_PEG_RELEASE)
+
+# autocomplete is installed once from DuckDB's exact-version core repository,
+# then both orders run in fresh processes with automatic install/load disabled.
+# This target deliberately does not use allow_extensions_metadata_mismatch.
+test_extension_load_order: ensure-pinned-duckdb-test-host release
+	@$(PYTHON_VENV_BIN) scripts/check_extension_load_order.py build/release/$(EXTENSION_NAME).duckdb_extension --expected-duckdb-version $(DUCKDB_TEST_HOST_VERSION)
+
+MISMATCH_DUCKDB_VENV := configure/duckdb-$(DUCKDB_MISMATCH_TEST_VERSION)-mismatch
+ifeq ($(OS),Windows_NT)
+MISMATCH_DUCKDB_PYTHON := $(MISMATCH_DUCKDB_VENV)/Scripts/python.exe
+else
+MISMATCH_DUCKDB_PYTHON := $(MISMATCH_DUCKDB_VENV)/bin/python3
+endif
+test_extension_loader_rejection: ensure-pinned-duckdb-test-host release
+	@$(PYTHON_BIN) -m venv "$(MISMATCH_DUCKDB_VENV)"
+	@$(MISMATCH_DUCKDB_PYTHON) -m pip install --disable-pip-version-check "duckdb==$(DUCKDB_MISMATCH_TEST_VERSION)"
+	@$(MISMATCH_DUCKDB_PYTHON) scripts/check_extension_rejects_mismatched_host.py build/release/$(EXTENSION_NAME).duckdb_extension --expected-host-version $(DUCKDB_MISMATCH_TEST_VERSION) --expected-artifact-version $(DUCKDB_TEST_HOST_VERSION)
+
+test_duckdb_compatibility: test_extension_load_order test_extension_loader_rejection
+
+# Community Extensions builds cannot provision the Spanner emulator. Their
+# descriptor sets this variable through test_config so the standard
+# test_release entrypoint still verifies that the extension loads. Local and
+# project CI runs leave it unset and retain the full emulator-backed suite.
+ifeq ($(DUCKDB_SPANNER_OFFLINE_TESTS),1)
+test_extension_release_internal: check_configure
+	@echo "Running offline release smoke test: $(COMMUNITY_SMOKE_TEST_FILE)"
+	@$(TEST_RUNNER) --test-dir "$(COMMUNITY_SMOKE_TEST_DIR)" --file-path "$(COMMUNITY_SMOKE_TEST_FILE)" --external-extension build/release/$(EXTENSION_NAME).duckdb_extension
+else
 # SQLLogicTest (test/sql/*.test) needs a running Spanner emulator and seeded database.
 EMULATOR_HOST ?= localhost:9010
 export SPANNER_EMULATOR_HOST ?= $(EMULATOR_HOST)
@@ -222,6 +271,7 @@ test_extension_release_internal: check_configure emulator-start
 	@bash tests/setup_sqllogic_db.sh
 	@echo "Running RELEASE tests.."
 	@$(TEST_RUNNER_RELEASE)
+endif
 
 test_extension_debug_internal: check_configure emulator-start
 	@bash tests/setup_sqllogic_db.sh
