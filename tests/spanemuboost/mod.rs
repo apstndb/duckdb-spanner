@@ -24,7 +24,8 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage};
 
 const DEFAULT_IMAGE: &str = "gcr.io/cloud-spanner-emulator/emulator";
-const DEFAULT_TAG: &str = "1.5.51";
+const DEFAULT_TAG: &str =
+    "1.5.56@sha256:18a56fd557011e50e1733a9232e8d17ec9bdd7e51f6cf7660f14c234479f4f36";
 const DEFAULT_PROJECT_ID: &str = "emulator-project";
 const DEFAULT_INSTANCE_ID: &str = "emulator-instance";
 const GRPC_PORT: u16 = 9010;

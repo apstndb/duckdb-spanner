@@ -8,7 +8,7 @@ Both **GoogleSQL** and **PostgreSQL** dialect databases are supported transparen
 
 ## Prerequisites
 
-- [Rust](https://rustup.rs/) (stable)
+- [Rust](https://rustup.rs/) 1.88 or later
 - [DuckDB](https://duckdb.org/docs/installation/) CLI (for running the extension)
 - Python 3 (for `make extension` metadata appending)
 - Make

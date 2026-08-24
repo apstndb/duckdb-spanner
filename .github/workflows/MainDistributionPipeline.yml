@@ -164,7 +164,7 @@ jobs:
           df -h
 
       - name: Pre-pull Spanner emulator image
-        run: docker pull gcr.io/cloud-spanner-emulator/emulator:1.5.51
+        run: docker pull gcr.io/cloud-spanner-emulator/emulator:1.5.56@sha256:18a56fd557011e50e1733a9232e8d17ec9bdd7e51f6cf7660f14c234479f4f36
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
