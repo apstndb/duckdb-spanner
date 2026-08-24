@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::model::execute_sql_request::QueryMode;
@@ -15,6 +16,9 @@ use crate::types;
 
 /// Keep the dialect cache aligned with the client cache in `client.rs`.
 const DIALECT_CACHE_CAPACITY: usize = 8;
+/// A successful cached dialect can remain stale for at most five minutes after
+/// an out-of-process database recreation under the same cache key.
+const DIALECT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 /// Hard cap on distinct concurrent discovery waves. Overload deliberately
 /// fails closed immediately instead of adding potentially indefinite bind-time
 /// backpressure; callers can retry after any active wave completes.
@@ -54,7 +58,13 @@ impl DialectCache {
 struct CompletedDialects {
     capacity: usize,
     tick: u64,
-    entries: HashMap<String, (DatabaseDialect, u64)>,
+    entries: HashMap<String, CompletedDialect>,
+}
+
+struct CompletedDialect {
+    dialect: DatabaseDialect,
+    recency: u64,
+    expires_at: Instant,
 }
 
 impl CompletedDialects {
@@ -71,22 +81,44 @@ impl CompletedDialects {
         self.tick
     }
 
-    fn get(&mut self, key: &str) -> Option<DatabaseDialect> {
+    fn get_at(&mut self, key: &str, now: Instant) -> Option<DatabaseDialect> {
+        if self
+            .entries
+            .get(key)
+            .is_some_and(|entry| now >= entry.expires_at)
+        {
+            self.entries.remove(key);
+            return None;
+        }
+
         let tick = self.next_tick();
-        self.entries.get_mut(key).map(|(dialect, recency)| {
-            *recency = tick;
-            dialect.clone()
+        self.entries.get_mut(key).map(|entry| {
+            entry.recency = tick;
+            entry.dialect.clone()
         })
     }
 
     fn insert(&mut self, key: String, dialect: DatabaseDialect) {
+        self.insert_at(key, dialect, Instant::now());
+    }
+
+    fn insert_at(&mut self, key: String, dialect: DatabaseDialect, now: Instant) {
+        self.entries.retain(|_, entry| now < entry.expires_at);
+
         let tick = self.next_tick();
-        self.entries.insert(key, (dialect, tick));
+        self.entries.insert(
+            key,
+            CompletedDialect {
+                dialect,
+                recency: tick,
+                expires_at: now + DIALECT_CACHE_TTL,
+            },
+        );
         if self.entries.len() > self.capacity {
             let lru_key = self
                 .entries
                 .iter()
-                .min_by_key(|(_, (_, recency))| *recency)
+                .min_by_key(|(_, entry)| entry.recency)
                 .map(|(key, _)| key.clone());
             if let Some(key) = lru_key {
                 self.entries.remove(&key);
@@ -332,9 +364,22 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<DatabaseDialect, SpannerError>>,
 {
+    get_or_detect_dialect_at(cache, key, Instant::now(), detect).await
+}
+
+async fn get_or_detect_dialect_at<F, Fut>(
+    cache: &Mutex<DialectCache>,
+    key: String,
+    now: Instant,
+    detect: F,
+) -> Result<DatabaseDialect, SpannerError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<DatabaseDialect, SpannerError>>,
+{
     let (flight, leader) = {
         let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(dialect) = cache.completed.get(&key) {
+        if let Some(dialect) = cache.completed.get_at(&key, now) {
             return Ok(dialect);
         }
         if let Some(flight) = cache.in_flight.get(&key) {
@@ -945,6 +990,149 @@ mod tests {
         assert_eq!(cached, DatabaseDialect::Postgresql);
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
         assert_eq!(cached_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn completed_dialect_cache_expires_at_controlled_instant() {
+        let mut cache = CompletedDialects::new(2);
+        let inserted_at = Instant::now();
+        cache.insert_at(
+            "database".to_string(),
+            DatabaseDialect::Postgresql,
+            inserted_at,
+        );
+
+        assert_eq!(
+            cache.get_at(
+                "database",
+                inserted_at + DIALECT_CACHE_TTL - Duration::from_nanos(1),
+            ),
+            Some(DatabaseDialect::Postgresql)
+        );
+        assert_eq!(
+            cache.get_at("database", inserted_at + DIALECT_CACHE_TTL),
+            None
+        );
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn completed_dialect_cache_preserves_lru_order_with_ttl() {
+        let mut cache = CompletedDialects::new(2);
+        let now = Instant::now();
+        cache.insert_at(
+            "least-recently-used".to_string(),
+            DatabaseDialect::GoogleStandardSql,
+            now,
+        );
+        cache.insert_at("recent".to_string(), DatabaseDialect::Postgresql, now);
+        assert_eq!(
+            cache.get_at("least-recently-used", now + Duration::from_secs(1)),
+            Some(DatabaseDialect::GoogleStandardSql)
+        );
+
+        cache.insert_at(
+            "new".to_string(),
+            DatabaseDialect::Postgresql,
+            now + Duration::from_secs(1),
+        );
+
+        assert_eq!(
+            cache.get_at("least-recently-used", now + Duration::from_secs(2)),
+            Some(DatabaseDialect::GoogleStandardSql)
+        );
+        assert_eq!(cache.get_at("recent", now + Duration::from_secs(2)), None);
+        assert_eq!(
+            cache.get_at("new", now + Duration::from_secs(2)),
+            Some(DatabaseDialect::Postgresql)
+        );
+    }
+
+    #[test]
+    fn insertion_purges_expired_newer_recency_before_live_lru() {
+        let mut cache = CompletedDialects::new(2);
+        let start = Instant::now();
+        cache.insert_at(
+            "expires-first".to_string(),
+            DatabaseDialect::GoogleStandardSql,
+            start,
+        );
+        cache.insert_at(
+            "live-older-recency".to_string(),
+            DatabaseDialect::Postgresql,
+            start + Duration::from_secs(60),
+        );
+        assert_eq!(
+            cache.get_at("expires-first", start + Duration::from_secs(2 * 60)),
+            Some(DatabaseDialect::GoogleStandardSql)
+        );
+
+        cache.insert_at(
+            "new".to_string(),
+            DatabaseDialect::GoogleStandardSql,
+            start + DIALECT_CACHE_TTL + Duration::from_secs(30),
+        );
+
+        assert_eq!(cache.entries.len(), 2);
+        assert!(!cache.entries.contains_key("expires-first"));
+        assert!(cache.entries.contains_key("live-older-recency"));
+        assert!(cache.entries.contains_key("new"));
+    }
+
+    #[tokio::test]
+    async fn expired_dialect_cache_miss_preserves_single_flight() {
+        const WAITERS: usize = 4;
+        let cache = Arc::new(Mutex::new(DialectCache::new(2, 2)));
+        let inserted_at = Instant::now();
+        cache.lock().unwrap().completed.insert_at(
+            "database".to_string(),
+            DatabaseDialect::GoogleStandardSql,
+            inserted_at,
+        );
+        let lookup_at = inserted_at + DIALECT_CACHE_TTL;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let mut tasks = tokio::task::JoinSet::new();
+
+        for _ in 0..WAITERS {
+            let cache = Arc::clone(&cache);
+            let calls = Arc::clone(&calls);
+            let release = Arc::clone(&release);
+            tasks.spawn(async move {
+                get_or_detect_dialect_at(&cache, "database".to_string(), lookup_at, || async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    release.notified().await;
+                    Ok(DatabaseDialect::Postgresql)
+                })
+                .await
+            });
+        }
+
+        wait_for_count(&calls, 1).await;
+        let flight = active_flight(&cache, "database");
+        wait_for_followers(&flight, WAITERS - 1).await;
+        assert!(
+            !cache
+                .lock()
+                .unwrap()
+                .completed
+                .entries
+                .contains_key("database")
+        );
+
+        release.notify_waiters();
+        while let Some(result) = join_next_bounded(&mut tasks).await {
+            assert_eq!(result.unwrap().unwrap(), DatabaseDialect::Postgresql);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(
+            cache
+                .lock()
+                .unwrap()
+                .completed
+                .entries
+                .contains_key("database")
+        );
     }
 
     #[tokio::test]
