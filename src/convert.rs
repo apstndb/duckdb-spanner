@@ -135,6 +135,51 @@ fn reserve_nested_list_child(
     })
 }
 
+/// Reserve child storage and publish the flattened child length without panicking.
+fn set_list_len_checked(
+    list_vector: &ListVector<'_>,
+    entry_count: usize,
+    context: &dyn Fn() -> String,
+) -> Result<(), SpannerError> {
+    list_vector.try_set_len(entry_count).map_err(|error| {
+        SpannerError::Conversion(format!(
+            "failed to set list child length to {entry_count}: {error} ({})",
+            context()
+        ))
+    })
+}
+
+fn list_flat_child_checked<'a>(
+    list_vector: &ListVector<'a>,
+    capacity: usize,
+    context: &dyn Fn() -> String,
+) -> Result<FlatVector<'a>, SpannerError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| list_vector.child(capacity))).map_err(
+        |_| {
+            SpannerError::Conversion(format!(
+                "failed to access list child after reserving {capacity} elements ({})",
+                context()
+            ))
+        },
+    )
+}
+
+fn list_struct_child_checked<'a>(
+    list_vector: &ListVector<'a>,
+    capacity: usize,
+    context: &dyn Fn() -> String,
+) -> Result<StructVector<'a>, SpannerError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        list_vector.struct_child(capacity)
+    }))
+    .map_err(|_| {
+        SpannerError::Conversion(format!(
+            "failed to access list STRUCT child after reserving {capacity} elements ({})",
+            context()
+        ))
+    })
+}
+
 fn set_list_entry_checked(
     list_vector: &mut ListVector<'_>,
     row_capacity: usize,
@@ -563,6 +608,9 @@ fn write_array_column<R: ConversionRow>(
             format!("column '{column_name}' nested ARRAY child")
         })?;
     }
+    set_list_len_checked(&list_vector, total_children, &|| {
+        format!("column '{column_name}' ARRAY child")
+    })?;
 
     // Parent entries use DuckDB's regular row-vector capacity. Scalar and
     // struct children obtain their requested capacity through public APIs below.
@@ -587,9 +635,11 @@ fn write_array_column<R: ConversionRow>(
         TypeCode::Struct => {
             let struct_type = element_struct_type
                 .expect("STRUCT metadata was validated before writing list entries");
-            let mut child_struct = list_vector.struct_child(total_children);
+            let mut child_struct =
+                list_struct_child_checked(&list_vector, total_children, &|| {
+                    format!("column '{column_name}' ARRAY child")
+                })?;
             reset_struct_list_sizes(&child_struct, struct_type)?;
-            list_vector.set_len(total_children);
             let mut flat_idx = 0usize;
             for (row_idx, values) in raw_values.iter().enumerate() {
                 let Some(values) = values else { continue };
@@ -615,8 +665,9 @@ fn write_array_column<R: ConversionRow>(
                 SpannerError::Conversion("Nested ARRAY without element type".to_string())
             })?;
             let mut child_list = list_vector.list_child();
-            child_list.set_len(0);
-            list_vector.set_len(total_children);
+            set_list_len_checked(&child_list, 0, &|| {
+                format!("column '{column_name}' nested ARRAY child")
+            })?;
             let mut flat_idx = 0usize;
             for (row_idx, values) in raw_values.iter().enumerate() {
                 let Some(values) = values else { continue };
@@ -638,8 +689,9 @@ fn write_array_column<R: ConversionRow>(
             }
         }
         _ => {
-            let mut child = list_vector.child(total_children);
-            list_vector.set_len(total_children);
+            let mut child = list_flat_child_checked(&list_vector, total_children, &|| {
+                format!("column '{column_name}' ARRAY child")
+            })?;
             let mut flat_idx = 0usize;
             for (row_idx, values) in raw_values.iter().enumerate() {
                 let Some(values) = values else { continue };
@@ -715,7 +767,10 @@ fn reset_struct_list_sizes(
                 reset_struct_list_sizes(&child, nested_type)?;
             }
             TypeCode::Array => {
-                struct_vector.list_vector_child(field_idx).set_len(0);
+                let child = struct_vector.list_vector_child(field_idx);
+                set_list_len_checked(&child, 0, &|| {
+                    format!("STRUCT field '{}' ARRAY child reset", field.name)
+                })?;
             }
             _ => {}
         }
@@ -899,6 +954,7 @@ fn write_raw_list_value_prevalidated(
     if elem_type_code == TypeCode::Array {
         reserve_nested_list_child(list_vector, new_len, context)?;
     }
+    set_list_len_checked(list_vector, new_len, context)?;
     set_list_entry_checked(
         list_vector,
         row_capacity,
@@ -912,11 +968,10 @@ fn write_raw_list_value_prevalidated(
         TypeCode::Struct => {
             let struct_type = element_struct_type
                 .expect("STRUCT metadata was validated before writing the list entry");
-            let mut child_struct = list_vector.struct_child(new_len);
+            let mut child_struct = list_struct_child_checked(list_vector, new_len, context)?;
             if current_len == 0 {
                 reset_struct_list_sizes(&child_struct, struct_type)?;
             }
-            list_vector.set_len(new_len);
             for (j, val) in values.iter().enumerate() {
                 let elem_context = || format!("{}, array element {j}", context());
                 write_raw_struct_value_prevalidated(
@@ -935,9 +990,8 @@ fn write_raw_list_value_prevalidated(
             })?;
             let mut child_list = list_vector.list_child();
             if current_len == 0 {
-                child_list.set_len(0);
+                set_list_len_checked(&child_list, 0, context)?;
             }
-            list_vector.set_len(new_len);
             for (j, val) in values.iter().enumerate() {
                 let elem_context = || format!("{}, array element {j}", context());
                 write_raw_list_value_prevalidated(
@@ -951,8 +1005,7 @@ fn write_raw_list_value_prevalidated(
             }
         }
         _ => {
-            let mut child = list_vector.child(new_len);
-            list_vector.set_len(new_len);
+            let mut child = list_flat_child_checked(list_vector, new_len, context)?;
             for (j, val) in values.iter().enumerate() {
                 let elem_context = || format!("{}, array element {j}", context());
                 write_raw_scalar_to_flat(
@@ -1716,6 +1769,63 @@ mod tests {
     use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
     use google_cloud_spanner::value::ToValue;
     use prost_types::value::Kind as ProtoKind;
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn list_resize_error_is_a_contextual_conversion_error() {
+        let child_type: LogicalTypeHandle = LogicalTypeId::Bigint.into();
+        let chunk = DataChunkHandle::new(&[LogicalTypeHandle::list(&child_type)]);
+        let list = chunk.list_vector(0);
+        let entry_count = (1usize << 37) + 1;
+
+        let error =
+            set_list_len_checked(&list, entry_count, &|| "column 'items', row 0".to_string())
+                .expect_err("DuckDB must reject a list length above its maximum");
+
+        match error {
+            SpannerError::Conversion(message) => {
+                assert!(
+                    message.contains(&format!("failed to set list child length to {entry_count}")),
+                    "message: {message}"
+                );
+                assert!(
+                    message.contains("exceeds maximum vector size"),
+                    "message: {message}"
+                );
+                assert!(
+                    message.contains("column 'items', row 0"),
+                    "message: {message}"
+                );
+            }
+            other => panic!("expected Conversion error, got {other:?}"),
+        }
+        assert_eq!(list.len(), 0, "failed resize changed the list length");
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn list_child_accessor_panic_becomes_a_conversion_error() {
+        let child_type: LogicalTypeHandle = LogicalTypeId::Bigint.into();
+        let chunk = DataChunkHandle::new(&[LogicalTypeHandle::list(&child_type)]);
+        let list = chunk.list_vector(0);
+        let entry_count = (1usize << 37) + 1;
+
+        let error = match list_flat_child_checked(&list, entry_count, &|| {
+            "column 'items', row 0".to_string()
+        }) {
+            Ok(_) => panic!("DuckDB child accessor unexpectedly accepted an oversized request"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to access list child after reserving"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("column 'items', row 0"));
+        assert_eq!(list.len(), 0, "failed child access changed list length");
+    }
 
     fn scalar_type(code: TypeCode) -> Type {
         model::Type::new()
