@@ -24,6 +24,7 @@ EXTENSION := spanner.duckdb_extension
 METADATA_SCRIPT := extension-ci-tools/scripts/append_extension_metadata.py
 DUCKDB_VERSION_CHECK := scripts/check-duckdb-version.sh
 EMULATOR_NAME := spanner-emulator
+EMULATOR_IMAGE := gcr.io/cloud-spanner-emulator/emulator:1.5.56@sha256:18a56fd557011e50e1733a9232e8d17ec9bdd7e51f6cf7660f14c234479f4f36
 # This is the compile-time ABI target, not a caller-selectable metadata value.
 override DUCKDB_TARGET_VERSION := v1.5.5
 DUCKDB_BIN ?= duckdb
@@ -106,7 +107,7 @@ emulator-start:
 		echo "Emulator already running"; \
 	else \
 		docker run -d --name $(EMULATOR_NAME) -p 9010:9010 -p 9020:9020 \
-			gcr.io/cloud-spanner-emulator/emulator; \
+			$(EMULATOR_IMAGE); \
 		echo "Waiting for emulator to start..."; \
 		sleep 2; \
 		echo "Emulator started"; \
