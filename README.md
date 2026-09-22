@@ -637,6 +637,8 @@ params := {'id': 1, 'name': spanner_value('Alice')}
 
 ### DuckDB to Spanner (Query Parameters)
 
+`spanner_value()` and `spanner_typed()` return a `STRUCT(tag VARCHAR, envelope VARCHAR)`. `tag` is `spanner-value-v1`. `envelope` is the JSON parameter object that older releases returned directly. Read that JSON with `(spanner_value(expr)).envelope`. A plain `VARCHAR`, including text that looks like an envelope, stays a STRING parameter. Casting the struct to `VARCHAR`, storing it, or combining it with an ordinary string in `CASE` or `UNION` does not turn that string into a typed value. `spanner_params` still accepts the struct from the helpers. The low-level `params := '{"name":{"type":"INT64","value":1}}'` JSON protocol is unchanged.
+
 `spanner_value()` maps DuckDB types to Spanner types. Values are serialized as JSON internally:
 
 | DuckDB Type | Spanner Type | JSON Value |

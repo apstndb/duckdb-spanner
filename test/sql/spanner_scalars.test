@@ -35,23 +35,23 @@ P1D
 
 statement ok
 SELECT IF(
-	strpos(spanner_value(NULL::INTERVAL), '"type":"INTERVAL"') > 0
-	AND strpos(spanner_value(NULL::INTERVAL), '"value":null') > 0,
+	strpos((spanner_value(NULL::INTERVAL)).envelope, '"type":"INTERVAL"') > 0
+	AND strpos((spanner_value(NULL::INTERVAL)).envelope, '"value":null') > 0,
 	1,
 	error('expected null INTERVAL spanner_value JSON')
 );
 
 statement ok
 SELECT IF(
-	spanner_typed(42::BIGINT, NULL) IS NULL,
+	(spanner_typed(42::BIGINT, NULL)).envelope IS NULL,
 	1,
 	error('expected NULL from spanner_typed with NULL type')
 );
 
 statement ok
 SELECT IF(
-	strpos(spanner_value(42::UTINYINT), '"type":"INT64"') > 0
-	AND strpos(spanner_value(42::UTINYINT), '42') > 0,
+	strpos((spanner_value(42::UTINYINT)).envelope, '"type":"INT64"') > 0
+	AND strpos((spanner_value(42::UTINYINT)).envelope, '42') > 0,
 	1,
 	error('expected UTINYINT spanner_value JSON')
 );
@@ -60,54 +60,54 @@ SELECT IF(
 
 statement ok
 SELECT IF(
-	strpos(spanner_value(42::BIGINT), '"type":"INT64"') > 0
-	AND strpos(spanner_value(42::BIGINT), '42') > 0,
+	strpos((spanner_value(42::BIGINT)).envelope, '"type":"INT64"') > 0
+	AND strpos((spanner_value(42::BIGINT)).envelope, '42') > 0,
 	1,
 	error('expected INT64 spanner_value JSON')
 );
 
 statement ok
 SELECT IF(
-	strpos(spanner_value(NULL::BIGINT), '"type":"INT64"') > 0
-	AND strpos(spanner_value(NULL::BIGINT), 'null') > 0,
+	strpos((spanner_value(NULL::BIGINT)).envelope, '"type":"INT64"') > 0
+	AND strpos((spanner_value(NULL::BIGINT)).envelope, 'null') > 0,
 	1,
 	error('expected null INT64 spanner_value JSON')
 );
 
 statement ok
 SELECT IF(
-	strpos(spanner_typed(42, 'INT64'), '"type":"INT64"') > 0,
+	strpos((spanner_typed(42, 'INT64')).envelope, '"type":"INT64"') > 0,
 	1,
 	error('expected spanner_typed INT64 JSON')
 );
 
 query T
-SELECT spanner_value('340282366920938463463374607431768211455'::UHUGEINT);
+SELECT (spanner_value('340282366920938463463374607431768211455'::UHUGEINT)).envelope;
 ----
 {"type":"NUMERIC","value":"340282366920938463463374607431768211455"}
 
 query T
-SELECT spanner_value(UUID '550e8400-e29b-41d4-a716-446655440000');
+SELECT (spanner_value(UUID '550e8400-e29b-41d4-a716-446655440000')).envelope;
 ----
 {"type":"UUID","value":"550e8400-e29b-41d4-a716-446655440000"}
 
 query T
-SELECT spanner_value(TIME '12:34:56.123456');
+SELECT (spanner_value(TIME '12:34:56.123456')).envelope;
 ----
 {"type":"STRING","value":"12:34:56.123456"}
 
 query T
-SELECT spanner_value('2024-01-15 12:34:56'::TIMESTAMP_S);
+SELECT (spanner_value('2024-01-15 12:34:56'::TIMESTAMP_S)).envelope;
 ----
 {"type":"TIMESTAMP","value":"2024-01-15T12:34:56.000000Z"}
 
 query T
-SELECT spanner_value('2024-01-15 12:34:56.123456789'::TIMESTAMP_NS);
+SELECT (spanner_value('2024-01-15 12:34:56.123456789'::TIMESTAMP_NS)).envelope;
 ----
 {"type":"TIMESTAMP","value":"2024-01-15T12:34:56.123456789Z"}
 
 query TTTT
-SELECT spanner_value(NULL::BIGINT[]), spanner_value([]::BIGINT[]), spanner_value(NULL::BIGINT[2]), spanner_value([NULL, NULL]::BIGINT[2]);
+SELECT (spanner_value(NULL::BIGINT[])).envelope, (spanner_value([]::BIGINT[])).envelope, (spanner_value(NULL::BIGINT[2])).envelope, (spanner_value([NULL, NULL]::BIGINT[2])).envelope;
 ----
 {"type":"ARRAY<INT64>","value":null}	{"type":"ARRAY<INT64>","value":[]}	{"type":"ARRAY<INT64>","value":null}	{"type":"ARRAY<INT64>","value":[null,null]}
 
@@ -117,14 +117,14 @@ SELECT spanner_params({'x': '12345678901234567890123456789.123456789'::DECIMAL(3
 {"x":{"type":"NUMERIC","value":"12345678901234567890123456789.123456789"}}
 
 query T
-SELECT spanner_value(value) FROM (VALUES ('NaN'::FLOAT), ('Infinity'::FLOAT), ('-Infinity'::FLOAT)) values_table(value);
+SELECT (spanner_value(value)).envelope FROM (VALUES ('NaN'::FLOAT), ('Infinity'::FLOAT), ('-Infinity'::FLOAT)) values_table(value);
 ----
 {"type":"FLOAT32","value":"NaN"}
 {"type":"FLOAT32","value":"Infinity"}
 {"type":"FLOAT32","value":"-Infinity"}
 
 query T
-SELECT spanner_value(value) FROM (VALUES ('NaN'::DOUBLE), ('Infinity'::DOUBLE), ('-Infinity'::DOUBLE)) values_table(value);
+SELECT (spanner_value(value)).envelope FROM (VALUES ('NaN'::DOUBLE), ('Infinity'::DOUBLE), ('-Infinity'::DOUBLE)) values_table(value);
 ----
 {"type":"FLOAT64","value":"NaN"}
 {"type":"FLOAT64","value":"Infinity"}
@@ -136,7 +136,7 @@ SELECT spanner_params({'x': 'NaN'::DOUBLE});
 {"x":{"type":"FLOAT64","value":"NaN"}}
 
 query T
-SELECT spanner_value(json('{"a":1}'));
+SELECT (spanner_value(json('{"a":1}'))).envelope;
 ----
 {"$duckdb_spanner_json_format":"json-text-v1","type":"JSON","value":"{\"a\":1}"}
 
@@ -151,12 +151,12 @@ SELECT spanner_params({'x': json('{"a":1}')});
 {"x":{"$duckdb_spanner_json_format":"json-text-v1","type":"JSON","value":"{\"a\":1}"}}
 
 query T
-SELECT spanner_value(json('"abc"'));
+SELECT (spanner_value(json('"abc"'))).envelope;
 ----
 {"$duckdb_spanner_json_format":"json-text-v1","type":"JSON","value":"\"abc\""}
 
 query T
-SELECT spanner_value(json('null'));
+SELECT (spanner_value(json('null'))).envelope;
 ----
 {"$duckdb_spanner_json_format":"json-text-v1","type":"JSON","value":"null"}
 
@@ -166,27 +166,27 @@ SELECT spanner_params({'x': spanner_typed(json('"abc"'), 'STRING')});
 {"x":{"$duckdb_spanner_json_format":"json-text-v1","type":"STRING","value":"\"abc\""}}
 
 statement error
-SELECT spanner_value({'a': 1});
+SELECT (spanner_value({'a': 1})).envelope;
 ----
 Unsupported DuckDB type Struct for spanner_value
 
 statement error
-SELECT spanner_value(NULL);
+SELECT (spanner_value(NULL)).envelope;
 ----
 Unsupported DuckDB type SqlNull for spanner_value
 
 statement error
-SELECT spanner_typed({'a': 1}, 'JSON');
+SELECT (spanner_typed({'a': 1}, 'JSON')).envelope;
 ----
 Unsupported DuckDB type Struct for spanner_typed
 
 statement error
-SELECT spanner_value([[1, 2]]);
+SELECT (spanner_value([[1, 2]])).envelope;
 ----
 Unsupported nested DuckDB type List for spanner_value
 
 statement error
-SELECT spanner_value([{'a': 1}]);
+SELECT (spanner_value([{'a': 1}])).envelope;
 ----
 Unsupported nested DuckDB type Struct for spanner_value
 

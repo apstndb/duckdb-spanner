@@ -3,7 +3,8 @@
 use base64::Engine;
 use duckdb::arrow::array::{Array, StringArray};
 use duckdb::core::{
-    DataChunkHandle, FlatVector, ListVector, LogicalTypeHandle, LogicalTypeId, StructVector,
+    DataChunkHandle, FlatVector, Inserter, ListVector, LogicalTypeHandle, LogicalTypeId,
+    StructVector,
 };
 use duckdb::ffi::{
     duckdb_date, duckdb_hugeint, duckdb_interval, duckdb_string_t, duckdb_time, duckdb_time_ns,
@@ -219,8 +220,11 @@ where
             ));
         }
         duckdb_scalar_function_set_name(scalar_function.0, c_name.as_ptr());
-        let return_type =
-            OwnedLogicalType(duckdb_create_logical_type(DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR));
+        let return_type = if name == "spanner_value" || name == "spanner_typed" {
+            spanner_value_return_type()
+        } else {
+            OwnedLogicalType(duckdb_create_logical_type(DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR))
+        };
         if return_type.0.is_null() || crate::should_fail_allocation("scalar return type") {
             return Err(RegistrationError::new(
                 "allocate scalar return type",
@@ -306,7 +310,7 @@ impl VScalar for SpannerValueScalar {
                     strings.push(serde_json::to_string(&obj)?);
                 }
             }
-            return write_string_array(&strings, output);
+            return write_present_envelopes(&strings, output);
         }
 
         write_spanner_value_strings(input, 0, &logical_type, output, |ty| {
@@ -356,7 +360,7 @@ impl VScalar for SpannerTypedScalar {
                     strings.push(serde_json::to_string(&obj)?);
                 }
             }
-            return write_string_array(&strings, output);
+            return write_present_envelopes(&strings, output);
         }
 
         let mut types: Vec<Option<String>> = Vec::with_capacity(len);
@@ -383,8 +387,7 @@ impl VScalar for SpannerTypedScalar {
             strings.push(Some(serde_json::to_string(&obj)?));
         }
 
-        let array: std::sync::Arc<dyn Array> = std::sync::Arc::new(StringArray::from(strings));
-        write_arrow_array_to_vector(&array, output)
+        write_wrapper_envelopes(&strings, output)
     }
 
     fn signatures() -> Vec<ScalarFunctionSignature> {
@@ -482,12 +485,53 @@ impl VScalar for IntervalToIso8601Scalar {
     }
 }
 
-fn write_string_array(
-    strings: &[String],
+const SPANNER_VALUE_TAG: &str = "spanner-value-v1";
+
+fn spanner_value_return_type() -> OwnedLogicalType {
+    use std::ffi::CString;
+    unsafe {
+        let tag =
+            duckdb::ffi::duckdb_create_logical_type(duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR);
+        let envelope =
+            duckdb::ffi::duckdb_create_logical_type(duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR);
+        let mut children = [tag, envelope];
+        let tag_name = CString::new("tag").expect("field name");
+        let envelope_name = CString::new("envelope").expect("field name");
+        let mut names = [tag_name.as_ptr(), envelope_name.as_ptr()];
+        let ptr =
+            duckdb::ffi::duckdb_create_struct_type(children.as_mut_ptr(), names.as_mut_ptr(), 2);
+        duckdb::ffi::duckdb_destroy_logical_type(&mut children[0]);
+        duckdb::ffi::duckdb_destroy_logical_type(&mut children[1]);
+        OwnedLogicalType(ptr)
+    }
+}
+
+fn write_present_envelopes(
+    envelopes: &[String],
     output: &mut dyn WritableVector,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let array: std::sync::Arc<dyn Array> = std::sync::Arc::new(StringArray::from(strings.to_vec()));
-    write_arrow_array_to_vector(&array, output)
+    let wrapped: Vec<Option<String>> = envelopes.iter().cloned().map(Some).collect();
+    write_wrapper_envelopes(&wrapped, output)
+}
+
+fn write_wrapper_envelopes(
+    envelopes: &[Option<String>],
+    output: &mut dyn WritableVector,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut struct_vec = output.struct_vector();
+    let len = envelopes.len();
+    let tags = struct_vec.child(0, len);
+    let payloads = struct_vec.child(1, len);
+    for (row, envelope) in envelopes.iter().enumerate() {
+        match envelope {
+            None => struct_vec.set_null(row),
+            Some(envelope) => {
+                tags.insert(row, SPANNER_VALUE_TAG);
+                payloads.insert(row, envelope.as_str());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn scalar_type_name(id: LogicalTypeId) -> Option<&'static str> {
@@ -586,7 +630,10 @@ fn validate_params_struct_type(ty: &LogicalTypeHandle) -> Result<(), Box<dyn std
     for field_idx in 0..ty.num_children() {
         let name = ty.child_name(field_idx);
         let child = ty.child(field_idx);
-        if logical_scalar_type_name(&child).is_none() && child.id() != LogicalTypeId::SqlNull {
+        if logical_scalar_type_name(&child).is_none()
+            && child.id() != LogicalTypeId::SqlNull
+            && !is_spanner_value_struct(&child)
+        {
             return Err(format!(
                 "Unsupported DuckDB type {:?} for spanner_params field '{name}'; plain fields must be supported scalar values, or use spanner_value/spanner_typed for arrays",
                 child.id()
@@ -616,6 +663,43 @@ struct ParamField {
     is_json: bool,
 }
 
+fn is_spanner_value_struct(ty: &LogicalTypeHandle) -> bool {
+    // Field names identify the wrapper. An alias made DuckDB reject
+    // struct_extract, so the tag value is the fail-closed check instead.
+    ty.id() == LogicalTypeId::Struct
+        && ty.num_children() == 2
+        && ty.child_name(0) == "tag"
+        && ty.child_name(1) == "envelope"
+}
+
+fn wrapper_envelope_at(
+    struct_vec: &StructVector,
+    field_idx: usize,
+    row: usize,
+    cap: usize,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let wrapper = struct_vec.struct_vector_child(field_idx);
+    if wrapper.row_is_null(row as u64) {
+        return Ok(Value::Null);
+    }
+    let tag_vec = wrapper.child(0, cap);
+    let envelope_vec = wrapper.child(1, cap);
+    if tag_vec.row_is_null(row as u64) || envelope_vec.row_is_null(row as u64) {
+        return Err("SPANNER_VALUE wrapper is missing tag or envelope".into());
+    }
+    let tag = read_varchar_at(&tag_vec, row)?;
+    if tag != SPANNER_VALUE_TAG {
+        return Err(format!("SPANNER_VALUE tag '{tag}' is not '{SPANNER_VALUE_TAG}'").into());
+    }
+    let envelope = read_varchar_at(&envelope_vec, row)?;
+    let parsed: Value = serde_json::from_str(&envelope)
+        .map_err(|error| format!("invalid SPANNER_VALUE envelope: {error}"))?;
+    if !parsed.is_object() || parsed.get("type").is_none() || parsed.get("value").is_none() {
+        return Err("SPANNER_VALUE envelope must be an object with type and value".into());
+    }
+    Ok(parsed)
+}
+
 fn struct_row_to_map(
     struct_vec: &StructVector,
     row: usize,
@@ -624,6 +708,13 @@ fn struct_row_to_map(
 ) -> Result<Map<String, Value>, Box<dyn std::error::Error>> {
     let mut map = Map::new();
     for (field_idx, field) in fields.iter().enumerate() {
+        if is_spanner_value_struct(&field.ty) {
+            map.insert(
+                field.name.clone(),
+                wrapper_envelope_at(struct_vec, field_idx, row, cap)?,
+            );
+            continue;
+        }
         let child_vec = struct_vec.child(field_idx, cap);
         let value = flat_vector_to_json_value(&child_vec, row, &field.ty, field.is_json)?;
         map.insert(
@@ -649,7 +740,7 @@ fn write_spanner_value_strings(
         let obj = typed_param_envelope(value, type_name(ty), value_is_json || child_is_json);
         strings.push(serde_json::to_string(&obj)?);
     }
-    write_string_array(&strings, output)
+    write_present_envelopes(&strings, output)
 }
 
 fn typed_param_envelope(
@@ -983,12 +1074,6 @@ fn struct_field_to_param_json(value: Value, ty: &LogicalTypeHandle, is_json: boo
     if ty.id() == LogicalTypeId::Varchar
         && let Value::String(s) = value
     {
-        if let Ok(parsed) = serde_json::from_str::<Value>(&s)
-            && parsed.get("type").is_some()
-            && parsed.get("value").is_some()
-        {
-            return parsed;
-        }
         return Value::String(s);
     }
 
@@ -1158,8 +1243,14 @@ mod tests {
     }
 
     fn query_string(conn: &Connection, expression: &str) -> String {
-        conn.query_row(&format!("SELECT {expression}"), [], |row| row.get(0))
-            .unwrap()
+        let sql = if expression.starts_with("spanner_value(")
+            || expression.starts_with("spanner_typed(")
+        {
+            format!("SELECT ({expression}).envelope")
+        } else {
+            format!("SELECT {expression}")
+        };
+        conn.query_row(&sql, [], |row| row.get(0)).unwrap()
     }
 
     fn assert_query_error(conn: &Connection, expression: &str, expected: &str) {
@@ -1203,7 +1294,9 @@ mod tests {
         let conn = open_test_connection();
 
         let json: String = conn
-            .query_row("SELECT spanner_value(NULL::INTERVAL)", [], |r| r.get(0))
+            .query_row("SELECT (spanner_value(NULL::INTERVAL)).envelope", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["type"], "INTERVAL");
@@ -1228,7 +1321,7 @@ mod tests {
 
         let json: String = conn
             .query_row(
-                "SELECT spanner_value([INTERVAL '1 day', INTERVAL '1 year 3 months'])",
+                "SELECT (spanner_value([INTERVAL '1 day', INTERVAL '1 year 3 months'])).envelope",
                 [],
                 |r| r.get(0),
             )
@@ -1244,7 +1337,9 @@ mod tests {
         let conn = open_test_connection();
 
         let json: String = conn
-            .query_row("SELECT spanner_value(42::UTINYINT)", [], |r| r.get(0))
+            .query_row("SELECT (spanner_value(42::UTINYINT)).envelope", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["type"], "INT64");
@@ -1267,7 +1362,9 @@ mod tests {
         let conn = open_test_connection();
 
         let json: String = conn
-            .query_row("SELECT spanner_value(NULL::BIGINT)", [], |r| r.get(0))
+            .query_row("SELECT (spanner_value(NULL::BIGINT)).envelope", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["type"], "INT64");
@@ -1279,7 +1376,9 @@ mod tests {
         let conn = open_test_connection();
 
         let json: String = conn
-            .query_row("SELECT spanner_value(42::BIGINT)", [], |r| r.get(0))
+            .query_row("SELECT (spanner_value(42::BIGINT)).envelope", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["type"], "INT64");
@@ -1541,5 +1640,91 @@ mod tests {
             })
             .unwrap();
         assert_eq!(s, "P1D");
+    }
+
+    #[test]
+    fn test_varchar_envelope_struct_does_not_promote_literals() {
+        let conn = open_test_connection();
+        let literal = query_string(
+            &conn,
+            r#"spanner_params({'wrapper': '{"type":"INT64","value":1}', 'plain': 'hello', 'value_only': '{"value":1}'})"#,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&literal).unwrap();
+        assert_eq!(parsed["wrapper"], r#"{"type":"INT64","value":1}"#);
+        assert_eq!(parsed["plain"], "hello");
+        assert_eq!(parsed["value_only"], r#"{"value":1}"#);
+
+        let composed = query_string(
+            &conn,
+            "spanner_params({'x': spanner_value(42::BIGINT), 'y': spanner_typed(NULL::INTEGER, 'INT64')})",
+        );
+        let composed: serde_json::Value = serde_json::from_str(&composed).unwrap();
+        assert_eq!(composed["x"], json!({"type": "INT64", "value": 42}));
+        assert_eq!(composed["y"], json!({"type": "INT64", "value": null}));
+
+        let tag = query_string(&conn, "(spanner_value(42::BIGINT)).tag");
+        assert_eq!(tag, "spanner-value-v1");
+
+        let casted = query_string(
+            &conn,
+            r#"spanner_params({'x': CAST(spanner_value(42::BIGINT) AS VARCHAR)})"#,
+        );
+        let casted: serde_json::Value = serde_json::from_str(&casted).unwrap();
+        assert!(
+            casted["x"].is_string(),
+            "VARCHAR cast must stay text, got {casted}"
+        );
+
+        conn.execute_batch(
+            "CREATE TABLE spanner_value_roundtrip AS SELECT spanner_value(7::BIGINT) AS v",
+        )
+        .unwrap();
+        let stored = query_string(&conn, "(v).envelope FROM spanner_value_roundtrip");
+        assert_eq!(stored, r#"{"type":"INT64","value":7}"#);
+        let insert_error = conn
+            .execute(
+                "INSERT INTO spanner_value_roundtrip VALUES (?)",
+                [r#"{"type":"INT64","value":9}"#],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            insert_error.contains("cast") || insert_error.contains("Conversion"),
+            "ordinary string insert must be rejected: {insert_error}"
+        );
+
+        let coalesce = query_string(
+            &conn,
+            r#"CAST(COALESCE(spanner_value(1::BIGINT), '{"type":"INT64","value":2}') AS VARCHAR)"#,
+        );
+        assert!(
+            coalesce.contains("spanner-value-v1"),
+            "present helper must win COALESCE, got {coalesce}"
+        );
+        for sql in [
+            r#"SELECT COALESCE(CASE WHEN false THEN spanner_value(1::BIGINT) END, '{"type":"INT64","value":2}')"#,
+            r#"SELECT CASE WHEN false THEN spanner_value(1::BIGINT) ELSE '{"type":"INT64","value":2}' END"#,
+            r#"SELECT spanner_value(1::BIGINT) UNION ALL SELECT '{"type":"INT64","value":2}'"#,
+        ] {
+            let error = conn
+                .query_row(sql, [], |row| row.get::<_, String>(0))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("can't be cast") || error.contains("Mismatch"),
+                "{sql} must reject the ordinary string, got {error}"
+            );
+        }
+        conn.execute_batch("PREPARE envelope_param AS SELECT spanner_params({'x': $1})")
+            .unwrap();
+        let prepared: String = conn
+            .query_row(
+                r#"EXECUTE envelope_param('{"type":"INT64","value":1}')"#,
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let prepared: serde_json::Value = serde_json::from_str(&prepared).unwrap();
+        assert_eq!(prepared["x"], r#"{"type":"INT64","value":1}"#);
     }
 }
