@@ -657,7 +657,7 @@ params := {'id': 1, 'name': spanner_value('Alice')}
 | JSON | JSON | tagged canonical JSON text (preserves JSON strings and JSON `null` distinctly from SQL `NULL`) |
 | TIME | STRING | string (`HH:MM:SS.ffffff`) |
 | TIME_NS | STRING | string (`HH:MM:SS.nnnnnnnnn`) |
-| BIT | BYTES | string (base64 encoded) |
+| BIT | BYTES | string (base64 of the same bytes as `CAST(bit AS BLOB)`; DuckDB's padding header is omitted) |
 | T[] | ARRAY\<T\> | JSON array (elements follow scalar conversion rules) |
 
 The `$duckdb_spanner_json_format` field versions the parameter envelope, not
