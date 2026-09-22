@@ -106,6 +106,36 @@ SELECT spanner_value('2024-01-15 12:34:56.123456789'::TIMESTAMP_NS);
 ----
 {"type":"TIMESTAMP","value":"2024-01-15T12:34:56.123456789Z"}
 
+query T
+SELECT spanner_value('1969-12-31 23:59:59.123456789'::TIMESTAMP_NS);
+----
+{"type":"TIMESTAMP","value":"1969-12-31T23:59:59.123456789Z"}
+
+query T
+SELECT spanner_value(NULL::TIMESTAMP_NS);
+----
+{"type":"TIMESTAMP","value":null}
+
+statement error
+SELECT spanner_value('infinity'::TIMESTAMP_NS);
+----
+TIMESTAMP_NS infinity is not a valid Spanner TIMESTAMP
+
+statement error
+SELECT spanner_value('-infinity'::TIMESTAMP_NS);
+----
+TIMESTAMP_NS infinity is not a valid Spanner TIMESTAMP
+
+statement error
+SELECT spanner_params({'v': 'infinity'::TIMESTAMP_NS});
+----
+TIMESTAMP_NS infinity is not a valid Spanner TIMESTAMP
+
+statement error
+SELECT spanner_value(['infinity'::TIMESTAMP_NS]);
+----
+TIMESTAMP_NS infinity is not a valid Spanner TIMESTAMP
+
 query TTTT
 SELECT spanner_value(NULL::BIGINT[]), spanner_value([]::BIGINT[]), spanner_value(NULL::BIGINT[2]), spanner_value([NULL, NULL]::BIGINT[2]);
 ----

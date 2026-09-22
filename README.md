@@ -664,7 +664,7 @@ The `$duckdb_spanner_json_format` field versions the parameter envelope, not
 the JSON payload. JSON object keys remain unrestricted; untagged low-level JSON
 envelopes keep their existing pre-serialized-string/structural-value behavior.
 
-`TIMESTAMP_NS` preserves nanoseconds in the outbound Spanner parameter. Spanner
+`TIMESTAMP_NS` preserves nanoseconds in the outbound Spanner parameter. Positive and negative `TIMESTAMP_NS` infinity are rejected instead of being formatted as the finite timestamps at the nanosecond range boundary. Spanner
 `TIMESTAMP` query results map to DuckDB `TIMESTAMP WITH TIME ZONE`, whose current
 conversion path has microsecond precision, so a nanosecond round trip truncates
 the final three fractional digits.
