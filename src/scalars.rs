@@ -17,6 +17,8 @@ use time::OffsetDateTime;
 
 use crate::RegistrationError;
 
+const TIMESTAMP_NS_INFINITY_ERROR: &str = "TIMESTAMP_NS infinity is not a valid Spanner TIMESTAMP";
+
 pub struct SpannerValueScalar;
 pub struct SpannerTypedScalar;
 pub struct SpannerParamsScalar;
@@ -817,6 +819,17 @@ fn flat_vector_to_json_value(
         }
         LogicalTypeId::TimestampNs => {
             let nanos = unsafe { vec.as_slice_with_len::<i64>(row + 1)[row] };
+            // DuckDB stores ±infinity as the i64 nanosecond sentinels. Those
+            // values are inside OffsetDateTime's range, so formatting them
+            // without this check emits a finite year-2262 or year-1677 timestamp.
+            let finite = unsafe {
+                duckdb::ffi::duckdb_is_finite_timestamp_ns(duckdb::ffi::duckdb_timestamp_ns {
+                    nanos,
+                })
+            };
+            if !finite {
+                return Err(TIMESTAMP_NS_INFINITY_ERROR.into());
+            }
             let timestamp = OffsetDateTime::from_unix_timestamp_nanos(nanos as i128)?;
             // Preserve the source's nanosecond precision. Other timestamp
             // physical types intentionally use their microsecond-exact helper.
@@ -1314,11 +1327,48 @@ mod tests {
                 "spanner_value('2024-01-15 12:34:56.123456789'::TIMESTAMP_NS)",
                 r#"{"type":"TIMESTAMP","value":"2024-01-15T12:34:56.123456789Z"}"#,
             ),
+            (
+                "spanner_value('1969-12-31 23:59:59.123456789'::TIMESTAMP_NS)",
+                r#"{"type":"TIMESTAMP","value":"1969-12-31T23:59:59.123456789Z"}"#,
+            ),
+            (
+                "spanner_value(NULL::TIMESTAMP_NS)",
+                r#"{"type":"TIMESTAMP","value":null}"#,
+            ),
         ];
 
         for (expression, expected) in cases {
             assert_eq!(query_string(&conn, expression), expected, "{expression}");
         }
+    }
+
+    #[test]
+    fn test_timestamp_ns_infinity_is_rejected() {
+        let conn = open_test_connection();
+        let rejected = [
+            "spanner_value('infinity'::TIMESTAMP_NS)",
+            "spanner_value('-infinity'::TIMESTAMP_NS)",
+            "spanner_typed('infinity'::TIMESTAMP_NS, 'TIMESTAMP')",
+            "spanner_typed('-infinity'::TIMESTAMP_NS, 'TIMESTAMP')",
+            "spanner_params({'v': 'infinity'::TIMESTAMP_NS})",
+            "spanner_params({'v': '-infinity'::TIMESTAMP_NS})",
+            "spanner_value(['infinity'::TIMESTAMP_NS])",
+            "spanner_value(['-infinity'::TIMESTAMP_NS])",
+            "spanner_value(['2024-01-15 12:34:56.123456789'::TIMESTAMP_NS, 'infinity'::TIMESTAMP_NS]::TIMESTAMP_NS[2])",
+            "spanner_typed(['infinity'::TIMESTAMP_NS], 'ARRAY<TIMESTAMP>')",
+            "spanner_params({'v': spanner_value(['infinity'::TIMESTAMP_NS])})",
+        ];
+        for expression in rejected {
+            assert_query_error(&conn, expression, TIMESTAMP_NS_INFINITY_ERROR);
+        }
+
+        assert_eq!(
+            query_string(
+                &conn,
+                "spanner_value([NULL::TIMESTAMP_NS, '2024-01-15 12:34:56.123456789'::TIMESTAMP_NS])"
+            ),
+            r#"{"type":"ARRAY<TIMESTAMP>","value":[null,"2024-01-15T12:34:56.123456789Z"]}"#
+        );
     }
 
     #[test]
