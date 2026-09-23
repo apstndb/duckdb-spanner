@@ -106,6 +106,21 @@ SELECT spanner_value('2024-01-15 12:34:56.123456789'::TIMESTAMP_NS);
 ----
 {"type":"TIMESTAMP","value":"2024-01-15T12:34:56.123456789Z"}
 
+query I
+SELECT IF(json_extract_string(spanner_value('101'::BIT)::JSON, '$.value') = to_base64('101'::BIT::BLOB), 1, error('partial BIT bytes diverged'));
+----
+1
+
+query I
+SELECT IF(json_extract_string(spanner_value('10101010'::BIT)::JSON, '$.value') = to_base64('10101010'::BIT::BLOB), 1, error('aligned BIT bytes diverged'));
+----
+1
+
+query T
+SELECT spanner_value(NULL::BIT);
+----
+{"type":"BYTES","value":null}
+
 query T
 SELECT spanner_value('1969-12-31 23:59:59.123456789'::TIMESTAMP_NS);
 ----

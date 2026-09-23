@@ -876,8 +876,17 @@ fn flat_vector_to_json_value(
                 timestamp.format(&time::format_description::well_known::Rfc3339)?,
             ))
         }
-        LogicalTypeId::Blob | LogicalTypeId::Bit => {
+        LogicalTypeId::Blob => {
             let bytes = read_blob_at(vec, row)?;
+            Ok(Value::String(
+                base64::engine::general_purpose::STANDARD.encode(bytes),
+            ))
+        }
+        LogicalTypeId::Bit => {
+            // DuckDB's physical BIT string starts with a padding-count byte.
+            // CAST(bit AS BLOB) strips that header and masks the padding bits.
+            let physical = read_blob_at(vec, row)?;
+            let bytes = bit_physical_to_blob(&physical)?;
             Ok(Value::String(
                 base64::engine::general_purpose::STANDARD.encode(bytes),
             ))
@@ -1011,6 +1020,32 @@ unsafe fn read_decimal_raw(
             _ => hugeint_to_i128(*data.cast::<duckdb_hugeint>().add(row_idx)),
         }
     }
+}
+
+/// Convert DuckDB's physical BIT storage to the bytes produced by `CAST(bit AS BLOB)`.
+///
+/// The first byte is the count of padding bits in the following byte. The
+/// remaining bytes are the payload, with padding bits set. `Bit::BitToBlob`
+/// keeps the low `(8 - padding)` bits of that first payload byte and copies
+/// the rest unchanged.
+fn bit_physical_to_blob(physical: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    if physical.len() < 2 {
+        return Err("BIT value is missing its DuckDB storage header".into());
+    }
+    let padding = usize::from(physical[0]);
+    if padding >= 8 {
+        return Err(format!("BIT padding count {padding} is invalid").into());
+    }
+    let significant_bits = 8 - padding;
+    let mask = if significant_bits == 8 {
+        0xff
+    } else {
+        (1u16 << significant_bits) - 1
+    } as u8;
+    let mut bytes = Vec::with_capacity(physical.len() - 1);
+    bytes.push(physical[1] & mask);
+    bytes.extend_from_slice(&physical[2..]);
+    Ok(bytes)
 }
 
 fn read_blob_at(vec: &FlatVector, row: usize) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
@@ -1422,6 +1457,68 @@ mod tests {
         for (expression, expected) in cases {
             assert_eq!(query_string(&conn, expression), expected, "{expression}");
         }
+    }
+
+    #[test]
+    fn test_bit_bytes_match_duckdb_blob_cast() {
+        let conn = open_test_connection();
+        let bits = vec![
+            "'10101010'::BIT".to_string(),
+            "'101'::BIT".to_string(),
+            "'0'::BIT".to_string(),
+            "'11111111'::BIT".to_string(),
+            // Longer than DuckDB's inline string storage.
+            format!("'{}'::BIT", "10".repeat(100)),
+        ];
+        for bit in bits {
+            let encoded = query_string(&conn, &format!("spanner_value({bit})"));
+            let parsed: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+            let expected = query_string(&conn, &format!("to_base64({bit}::BLOB)"));
+            assert_eq!(parsed["type"], "BYTES", "{bit}");
+            assert_eq!(parsed["value"], expected, "{bit}");
+
+            let typed = query_string(&conn, &format!("spanner_typed({bit}, 'BYTES')"));
+            let typed: serde_json::Value = serde_json::from_str(&typed).unwrap();
+            assert_eq!(typed["value"], expected, "typed {bit}");
+        }
+
+        assert_eq!(
+            query_string(&conn, "spanner_value(NULL::BIT)"),
+            r#"{"type":"BYTES","value":null}"#
+        );
+        let list = query_string(
+            &conn,
+            "spanner_value(['101'::BIT, NULL::BIT, '10101010'::BIT])",
+        );
+        let list: serde_json::Value = serde_json::from_str(&list).unwrap();
+        assert_eq!(list["type"], "ARRAY<BYTES>");
+        assert_eq!(
+            list["value"][0],
+            query_string(&conn, "to_base64('101'::BIT::BLOB)")
+        );
+        assert!(list["value"][1].is_null());
+        assert_eq!(
+            list["value"][2],
+            query_string(&conn, "to_base64('10101010'::BIT::BLOB)")
+        );
+
+        let array = query_string(
+            &conn,
+            "spanner_value(['101'::BIT, '10101010'::BIT]::BIT[2])",
+        );
+        let array: serde_json::Value = serde_json::from_str(&array).unwrap();
+        assert_eq!(array["type"], "ARRAY<BYTES>");
+        assert_eq!(
+            array["value"][0],
+            query_string(&conn, "to_base64('101'::BIT::BLOB)")
+        );
+        assert_eq!(
+            array["value"][1],
+            query_string(&conn, "to_base64('10101010'::BIT::BLOB)")
+        );
+
+        let blob = query_string(&conn, "spanner_value(from_hex('00AA'))");
+        assert_eq!(blob, r#"{"type":"BYTES","value":"AKo="}"#);
     }
 
     #[test]
