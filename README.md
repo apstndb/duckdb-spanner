@@ -294,7 +294,7 @@ Runs arbitrary Spanner SQL. Implemented as a [table macro](https://duckdb.org/do
 ```sql
 SELECT * FROM spanner_query(
     'SELECT * FROM Users WHERE Age > @min_age',
-    params := {'min_age': spanner_value(21::BIGINT)},
+    params := {'min_age': 21::BIGINT},
     exact_staleness_secs := 10,
     parallelism_mode := 'required',
     use_data_boost := true
@@ -589,7 +589,7 @@ COPY my_table TO 'Users' (
 
 ## Query Parameters
 
-The `params` parameter accepts a STRUCT mapping parameter names to values. Two helper macros format values for Spanner type compatibility.
+The `params` argument of `spanner_query` is a STRUCT. `spanner_params()` converts that STRUCT into the JSON object accepted by `spanner_query_raw`. `spanner_value()` and `spanner_typed()` return envelope JSON text; nesting either helper inside the STRUCT stores that text as `STRING`.
 
 ### `spanner_value(val)` -- Auto-Detect Type
 
@@ -619,19 +619,19 @@ spanner_typed('abc', 'STRING')  -- {"value":"abc","type":"STRING"}
 
 ### Plain Values
 
-Values without `spanner_value()` or `spanner_typed()` wrappers are passed as raw JSON. Types are inferred from the JSON representation (number, string, boolean, null).
-`spanner_params()` preserves DECIMAL and wide integer fields as typed NUMERIC
-strings, and preserves non-finite FLOAT/DOUBLE fields as typed special values,
-because those values cannot be represented safely as plain JSON numbers.
-Its output is a Spanner parameter transport envelope, not a plain JSON mirror of
-the input STRUCT; callers that inspect the JSON directly must accept these typed
-objects. An untyped SQL `NULL` has no lossless Spanner type and is rejected by
-`spanner_value()`; cast it or use `spanner_typed(NULL, 'TYPE')`.
+`spanner_params()` derives each parameter type from the STRUCT field's DuckDB type. Pass native values:
 
 ```sql
--- Mix plain and typed values
-params := {'id': 1, 'name': spanner_value('Alice')}
+params := {'id': 42::BIGINT, 'name': 'Alice', 'ids': [1, 2], 'missing': NULL::BIGINT, 'payload': json('{"a":1}')}
 ```
+
+`VARCHAR`, `BOOLEAN`, `FLOAT`, and `DOUBLE` fields are sent as explicit Spanner types. A `VARCHAR` field is always `STRING` (`{"type":"STRING","value":"..."}`), including text that looks like a parameter envelope. Spanner infers an untyped value as `INT64` when the SQL expression has no type, so these values have to carry their type. Integers remain plain JSON numbers, which Spanner infers as `INT64`. Nesting `spanner_value()` or `spanner_typed()` inside the STRUCT stores that helper text as `STRING` instead of applying the envelope. `spanner_query` accepts a STRUCT, not the helper's JSON string. To place helper JSON into a hand-built params object for `spanner_query_raw`, cast it to JSON:
+
+```sql
+json_object('x', spanner_typed(json('"abc"'), 'STRING')::JSON)
+```
+
+DECIMAL and wide integer fields are preserved as typed NUMERIC strings, and non-finite FLOAT/DOUBLE fields as typed special values, because those values cannot be represented safely as plain JSON numbers. The output is a Spanner parameter transport envelope, not a plain JSON mirror of the input STRUCT. An untyped SQL `NULL` has no lossless Spanner type. Cast it (`NULL::BIGINT`) or build an envelope with `spanner_typed(NULL, 'TYPE')` and pass that envelope through `spanner_query_raw`. `spanner_value()` rejects an untyped SQL `NULL`.
 
 ## Type Mapping
 
@@ -664,7 +664,7 @@ The `$duckdb_spanner_json_format` field versions the parameter envelope, not
 the JSON payload. JSON object keys remain unrestricted; untagged low-level JSON
 envelopes keep their existing pre-serialized-string/structural-value behavior.
 
-`TIMESTAMP_NS` preserves nanoseconds in the outbound Spanner parameter. Spanner
+`TIMESTAMP_NS` preserves nanoseconds in the outbound Spanner parameter. Positive and negative `TIMESTAMP_NS` infinity are rejected instead of being formatted as the finite timestamps at the nanosecond range boundary. Spanner
 `TIMESTAMP` query results map to DuckDB `TIMESTAMP WITH TIME ZONE`, whose current
 conversion path has microsecond precision, so a nanosecond round trip truncates
 the final three fractional digits.
@@ -683,9 +683,8 @@ spanner_value([true, false])         -- {"value":[true,false],"type":"ARRAY<BOOL
 ```
 
 STRUCT values and nested LIST/ARRAY element types are not supported. A top-level
-LIST or ARRAY must contain a supported scalar type. `spanner_params()` also
-rejects plain LIST/ARRAY fields; wrap them with `spanner_value()` or
-`spanner_typed()` so their element type is explicit.
+LIST or ARRAY of a supported scalar is accepted by both `spanner_value()` and
+`spanner_params()`.
 
 ### Spanner to DuckDB (Query Results)
 
@@ -807,7 +806,7 @@ The `params` parameter is a VARCHAR containing a JSON object. Use `spanner_param
 ```sql
 SELECT * FROM spanner_query_raw(
     'SELECT * FROM Users WHERE Age > @min_age',
-    params := spanner_params({'min_age': spanner_value(21::BIGINT)})
+    params := spanner_params({'min_age': 21::BIGINT})
 );
 ```
 
@@ -860,7 +859,7 @@ SET spanner_endpoint = 'localhost:9010';
 SELECT * FROM spanner_query('SELECT * FROM Users');
 SELECT * FROM spanner_query(
     'SELECT * FROM Users WHERE Age > @min',
-    params := {'min': spanner_value(21::BIGINT)}
+    params := {'min': 21::BIGINT}
 );
 ```
 
