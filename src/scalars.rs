@@ -682,8 +682,24 @@ fn wrapper_envelope_at(
     if wrapper.row_is_null(row as u64) {
         return Ok(Value::Null);
     }
+    let wrapper_ty = wrapper.logical_type();
+    for (idx, label) in [(0, "tag"), (1, "envelope")] {
+        let child_ty = wrapper_ty.child(idx);
+        if child_ty.id() != LogicalTypeId::Varchar {
+            return Err(format!(
+                "SPANNER_VALUE {label} must be VARCHAR, got {:?}",
+                child_ty.id()
+            )
+            .into());
+        }
+    }
     let tag_vec = wrapper.child(0, cap);
     let envelope_vec = wrapper.child(1, cap);
+    if tag_vec.logical_type().id() != LogicalTypeId::Varchar
+        || envelope_vec.logical_type().id() != LogicalTypeId::Varchar
+    {
+        return Err("SPANNER_VALUE tag and envelope vectors must be VARCHAR".into());
+    }
     if tag_vec.row_is_null(row as u64) || envelope_vec.row_is_null(row as u64) {
         return Err("SPANNER_VALUE wrapper is missing tag or envelope".into());
     }
@@ -1726,5 +1742,31 @@ mod tests {
             .unwrap();
         let prepared: serde_json::Value = serde_json::from_str(&prepared).unwrap();
         assert_eq!(prepared["x"], r#"{"type":"INT64","value":1}"#);
+    }
+
+    #[test]
+    fn test_wrapper_children_must_be_varchar_before_read() {
+        let conn = open_test_connection();
+        let rejected = [
+            (
+                "spanner_params({'x': {'tag': 0::BIGINT, 'envelope': '{\"type\":\"INT64\",\"value\":9}'}})",
+                "tag must be VARCHAR",
+            ),
+            (
+                "spanner_params({'x': {'tag': 'spanner-value-v1', 'envelope': 0::BIGINT}})",
+                "envelope must be VARCHAR",
+            ),
+            (
+                "spanner_params({'x': {'tag': 'spanner-value-v1', 'envelope': {'inner': 1}}})",
+                "envelope must be VARCHAR",
+            ),
+            (
+                "spanner_params({'x': {'tag': NULL::VARCHAR, 'envelope': '{\"type\":\"INT64\",\"value\":9}'}})",
+                "missing tag or envelope",
+            ),
+        ];
+        for (expression, expected) in rejected {
+            assert_query_error(&conn, expression, expected);
+        }
     }
 }
