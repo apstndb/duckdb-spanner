@@ -1327,11 +1327,12 @@ fn test_vtab_query_params_bool_float() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Round-trip E2E tests — DuckDB spanner_value() → Spanner emulator → DuckDB
+// Round-trip E2E tests — native STRUCT fields → Spanner emulator → DuckDB
 //
-// Tests the full pipeline: DuckDB macro formats a typed JSON param,
-// params.rs parses it and binds to a Spanner Statement, Spanner processes
-// the query, and DuckDB reads back the result.
+// Tests the full pipeline: spanner_params derives a parameter from the field
+// type, params.rs binds it to a Spanner Statement, Spanner processes the
+// query, and DuckDB reads back the result. Helper envelopes are not nested
+// in these STRUCTs; a VARCHAR field would stay STRING.
 //
 // Table-driven: each entry specifies a DuckDB param expression and an
 // `Expected` variant that encodes both the expected DuckDB type and how
@@ -1402,25 +1403,24 @@ macro_rules! roundtrip_tests {
 use Expected::*;
 
 roundtrip_tests! {
-    test_roundtrip_e2e_bool:              "spanner_value(true)"                                => Value("BOOLEAN", "true");
-    test_roundtrip_e2e_int64:             "spanner_value(42::BIGINT)"                          => Value("BIGINT", "42");
-    test_roundtrip_e2e_int64_from_integer: "spanner_value(1000::INTEGER)"                      => Value("BIGINT", "1000");
-    test_roundtrip_e2e_float64:           "spanner_value(3.125::DOUBLE)"                       => Value("DOUBLE", "3.125");
-    test_roundtrip_e2e_float32:           "spanner_value(1.5::FLOAT)"                          => Value("FLOAT", "1.5");
-    test_roundtrip_e2e_string:            "spanner_value('hello world')"                       => Value("VARCHAR", "hello world");
-    test_roundtrip_e2e_date:              "spanner_value('2024-01-15'::DATE)"                   => Value("DATE", "2024-01-15");
-    test_roundtrip_e2e_timestamp:         "spanner_value('2024-06-15T10:30:00Z'::TIMESTAMPTZ)" => Timestamp("2024-06-15T10:30:00Z");
-    test_roundtrip_e2e_bytes:             "spanner_value('\\xDEAD'::BLOB)"                     => Base64("3kFE");
-    test_roundtrip_e2e_numeric:           "spanner_value(123.456789::DECIMAL(38,9))"            => Value("DECIMAL(38,9)", "123.456789000");
-    test_roundtrip_e2e_plain_null:        "NULL"                                                => Null("VARCHAR");
-    test_roundtrip_e2e_null_int64:        "spanner_value(NULL::BIGINT)"                        => Null("BIGINT");
-    test_roundtrip_e2e_null_date:         "spanner_value(NULL::DATE)"                          => Null("DATE");
-    test_roundtrip_e2e_spanner_typed:     "spanner_typed(42, 'INT64')"                         => Value("BIGINT", "42");
-    test_roundtrip_e2e_array_int64:       "spanner_value([1, 2, 3])"                           => Value("BIGINT[]", "[1, 2, 3]");
-    test_roundtrip_e2e_array_string:      "spanner_value(['a', 'b', 'c'])"                     => Value("VARCHAR[]", "[a, b, c]");
-    test_roundtrip_e2e_array_float64:     "spanner_value([1.5, 2.5]::DOUBLE[])"                => Value("DOUBLE[]", "[1.5, 2.5]");
-    test_roundtrip_e2e_array_bool:        "spanner_value([true, false])"                       => Value("BOOLEAN[]", "[true, false]");
-    test_roundtrip_e2e_array_typed:       "spanner_typed([10, 20], 'ARRAY<INT64>')"            => Value("BIGINT[]", "[10, 20]")
+    test_roundtrip_e2e_bool:              "true"                                => Value("BOOLEAN", "true");
+    test_roundtrip_e2e_int64:             "42::BIGINT"                          => Value("BIGINT", "42");
+    test_roundtrip_e2e_int64_from_integer: "1000::INTEGER"                      => Value("BIGINT", "1000");
+    test_roundtrip_e2e_float64:           "3.125::DOUBLE"                       => Value("DOUBLE", "3.125");
+    test_roundtrip_e2e_float32:           "1.5::FLOAT"                          => Value("FLOAT", "1.5");
+    test_roundtrip_e2e_string:            "'hello world'"                       => Value("VARCHAR", "hello world");
+    test_roundtrip_e2e_date:              "'2024-01-15'::DATE"                   => Value("DATE", "2024-01-15");
+    test_roundtrip_e2e_timestamp:         "'2024-06-15T10:30:00Z'::TIMESTAMPTZ" => Timestamp("2024-06-15T10:30:00Z");
+    test_roundtrip_e2e_bytes:             "'\\xDEAD'::BLOB"                     => Base64("3kFE");
+    test_roundtrip_e2e_numeric:           "123.456789::DECIMAL(38,9)"            => Value("DECIMAL(38,9)", "123.456789000");
+    test_roundtrip_e2e_plain_null:        "NULL"                                => Null("VARCHAR");
+    test_roundtrip_e2e_null_int64:        "NULL::BIGINT"                        => Null("BIGINT");
+    test_roundtrip_e2e_null_date:         "NULL::DATE"                          => Null("DATE");
+    test_roundtrip_e2e_array_int64:       "[1, 2, 3]"                           => Value("BIGINT[]", "[1, 2, 3]");
+    test_roundtrip_e2e_array_string:      "['a', 'b', 'c']"                     => Value("VARCHAR[]", "[a, b, c]");
+    test_roundtrip_e2e_array_float64:     "[1.5, 2.5]::DOUBLE[]"                => Value("DOUBLE[]", "[1.5, 2.5]");
+    test_roundtrip_e2e_array_bool:        "[true, false]"                       => Value("BOOLEAN[]", "[true, false]");
+    test_roundtrip_e2e_array_typed:       "[10, 20]::BIGINT[]"                  => Value("BIGINT[]", "[10, 20]")
 }
 
 // Multi-param tests — structurally different (multiple columns, table queries)
@@ -1430,7 +1430,7 @@ fn test_roundtrip_e2e_mixed_params() {
     let conn = create_duckdb_connection();
     let sql = vtab_query_sql_with(
         "SELECT Id, StringCol FROM ScalarTypes WHERE Id = @id AND StringCol = @name",
-        "params := {'id': spanner_value(1::BIGINT), 'name': spanner_value('hello')}",
+        "params := {'id': 1::BIGINT, 'name': 'hello'}",
     );
     let (id, name): (i64, String) = conn
         .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -1444,7 +1444,7 @@ fn test_roundtrip_e2e_plain_and_typed_mix() {
     let conn = create_duckdb_connection();
     let sql = vtab_query_sql_with(
         "SELECT Id, StringCol FROM ScalarTypes WHERE Id = @id AND StringCol = @name",
-        "params := {'id': 1, 'name': spanner_value('hello')}",
+        "params := {'id': 1, 'name': 'hello'}",
     );
     let (id, name): (i64, String) = conn
         .query_row(&sql, [], |r| Ok((r.get(0)?, r.get(1)?)))
