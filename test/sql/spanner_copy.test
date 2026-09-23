@@ -88,3 +88,56 @@ statement error
 COPY (SELECT CAST(911 AS BIGINT) AS Id, CAST(5 AS BIGINT) AS Amount, CAST(999 AS BIGINT) AS Doubled, 'x' AS Label) TO 'CopyGenerated' (FORMAT spanner);
 ----
 Column count mismatch
+
+# Nested JSON inside a STRUCT keeps its JSON value. VARCHAR text that happens
+# to be valid JSON stays a string. A top-level JSON column stays JSON too.
+
+statement ok
+COPY (
+	SELECT
+		2941::BIGINT,
+		NULL::DECIMAL(38, 9),
+		{
+			obj: json('{"x":1}'),
+			jnull: json('null'),
+			flag: json('true'),
+			num: json('1.5'),
+			word: json('"abc"'),
+			arr: json('[1,true,null]'),
+			text: '{"x":1}'::VARCHAR,
+			items: [json('{"a":true}')],
+			fixed: [json('1')]::JSON[1],
+			sql_null: NULL::JSON
+		}
+) TO 'NumericTypes' (FORMAT spanner, dialect 'googlesql');
+
+statement ok
+SELECT IF(
+	json_extract(JsonCol::JSON, '$.obj') = json('{"x":1}')
+	AND json_type(JsonCol::JSON, '$.jnull') = 'NULL'
+	AND json_extract(JsonCol::JSON, '$.flag') = true
+	AND json_extract(JsonCol::JSON, '$.num') = 1.5
+	AND json_extract_string(JsonCol::JSON, '$.word') = 'abc'
+	AND json_extract(JsonCol::JSON, '$.arr') = json('[1,true,null]')
+	AND json_type(JsonCol::JSON, '$.text') = 'VARCHAR'
+	AND json_extract_string(JsonCol::JSON, '$.text') = '{"x":1}'
+	AND json_extract(JsonCol::JSON, '$.items[0].a') = true
+	AND json_extract(JsonCol::JSON, '$.fixed[0]') = 1
+	AND json_type(JsonCol::JSON, '$.sql_null') = 'NULL',
+	1,
+	error('expected nested JSON identity')
+) FROM spanner_query('SELECT JsonCol FROM NumericTypes WHERE Id = 2941', parallelism_mode := 'off');
+
+statement ok
+COPY (
+	SELECT 2942::BIGINT, NULL::DECIMAL(38, 9), json('{"x":1,"ok":true}')
+) TO 'NumericTypes' (FORMAT spanner, dialect 'googlesql');
+
+statement ok
+SELECT IF(
+	json_type(JsonCol::JSON) = 'OBJECT'
+	AND json_extract(JsonCol::JSON, '$.x') = 1
+	AND json_extract(JsonCol::JSON, '$.ok') = true,
+	1,
+	error('expected direct JSON copy to stay an object')
+) FROM spanner_query('SELECT JsonCol FROM NumericTypes WHERE Id = 2942', parallelism_mode := 'off');
