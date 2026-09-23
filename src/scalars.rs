@@ -17,6 +17,8 @@ use time::OffsetDateTime;
 
 use crate::RegistrationError;
 
+const TIMESTAMP_NS_INFINITY_ERROR: &str = "TIMESTAMP_NS infinity is not a valid Spanner TIMESTAMP";
+
 pub struct SpannerValueScalar;
 pub struct SpannerTypedScalar;
 pub struct SpannerParamsScalar;
@@ -564,9 +566,12 @@ fn validate_params_struct_type(ty: &LogicalTypeHandle) -> Result<(), Box<dyn std
     for field_idx in 0..ty.num_children() {
         let name = ty.child_name(field_idx);
         let child = ty.child(field_idx);
-        if logical_scalar_type_name(&child).is_none() && child.id() != LogicalTypeId::SqlNull {
+        if logical_scalar_type_name(&child).is_none()
+            && child.id() != LogicalTypeId::SqlNull
+            && !is_supported_param_container(&child)
+        {
             return Err(format!(
-                "Unsupported DuckDB type {:?} for spanner_params field '{name}'; plain fields must be supported scalar values, or use spanner_value/spanner_typed for arrays",
+                "Unsupported DuckDB type {:?} for spanner_params field '{name}'; fields must be supported scalar, LIST, or ARRAY values",
                 child.id()
             )
             .into());
@@ -594,6 +599,43 @@ struct ParamField {
     is_json: bool,
 }
 
+fn is_supported_param_container(ty: &LogicalTypeHandle) -> bool {
+    matches!(ty.id(), LogicalTypeId::List | LogicalTypeId::Array)
+        && logical_scalar_type_name(&ty.child(0)).is_some()
+}
+
+fn struct_field_json_value(
+    struct_vec: &StructVector,
+    field_idx: usize,
+    row: usize,
+    cap: usize,
+    field: &ParamField,
+) -> Result<Value, Box<dyn std::error::Error>> {
+    let (value_is_json, child_is_json) = json_type_flags(&field.ty);
+    match field.ty.id() {
+        LogicalTypeId::List => {
+            let list_vec = struct_vec.list_vector_child(field_idx);
+            if list_vec.row_is_null(row as u64) {
+                Ok(Value::Null)
+            } else {
+                list_vector_to_json_value(&list_vec, row, &field.ty, child_is_json)
+            }
+        }
+        LogicalTypeId::Array => {
+            let array_vec = struct_vec.array_vector_child(field_idx);
+            if array_vec.row_is_null(row as u64) {
+                Ok(Value::Null)
+            } else {
+                array_vector_to_json_value(&array_vec, row, &field.ty, child_is_json)
+            }
+        }
+        _ => {
+            let child_vec = struct_vec.child(field_idx, cap);
+            flat_vector_to_json_value(&child_vec, row, &field.ty, value_is_json)
+        }
+    }
+}
+
 fn struct_row_to_map(
     struct_vec: &StructVector,
     row: usize,
@@ -602,8 +644,7 @@ fn struct_row_to_map(
 ) -> Result<Map<String, Value>, Box<dyn std::error::Error>> {
     let mut map = Map::new();
     for (field_idx, field) in fields.iter().enumerate() {
-        let child_vec = struct_vec.child(field_idx, cap);
-        let value = flat_vector_to_json_value(&child_vec, row, &field.ty, field.is_json)?;
+        let value = struct_field_json_value(struct_vec, field_idx, row, cap, field)?;
         map.insert(
             field.name.clone(),
             struct_field_to_param_json(value, &field.ty, field.is_json),
@@ -795,6 +836,17 @@ fn flat_vector_to_json_value(
         }
         LogicalTypeId::TimestampNs => {
             let nanos = unsafe { vec.as_slice_with_len::<i64>(row + 1)[row] };
+            // DuckDB stores ±infinity as the i64 nanosecond sentinels. Those
+            // values are inside OffsetDateTime's range, so formatting them
+            // without this check emits a finite year-2262 or year-1677 timestamp.
+            let finite = unsafe {
+                duckdb::ffi::duckdb_is_finite_timestamp_ns(duckdb::ffi::duckdb_timestamp_ns {
+                    nanos,
+                })
+            };
+            if !finite {
+                return Err(TIMESTAMP_NS_INFINITY_ERROR.into());
+            }
             let timestamp = OffsetDateTime::from_unix_timestamp_nanos(nanos as i128)?;
             // Preserve the source's nanosecond precision. Other timestamp
             // physical types intentionally use their microsecond-exact helper.
@@ -802,8 +854,17 @@ fn flat_vector_to_json_value(
                 timestamp.format(&time::format_description::well_known::Rfc3339)?,
             ))
         }
-        LogicalTypeId::Blob | LogicalTypeId::Bit => {
+        LogicalTypeId::Blob => {
             let bytes = read_blob_at(vec, row)?;
+            Ok(Value::String(
+                base64::engine::general_purpose::STANDARD.encode(bytes),
+            ))
+        }
+        LogicalTypeId::Bit => {
+            // DuckDB's physical BIT string starts with a padding-count byte.
+            // CAST(bit AS BLOB) strips that header and masks the padding bits.
+            let physical = read_blob_at(vec, row)?;
+            let bytes = bit_physical_to_blob(&physical)?;
             Ok(Value::String(
                 base64::engine::general_purpose::STANDARD.encode(bytes),
             ))
@@ -939,6 +1000,32 @@ unsafe fn read_decimal_raw(
     }
 }
 
+/// Convert DuckDB's physical BIT storage to the bytes produced by `CAST(bit AS BLOB)`.
+///
+/// The first byte is the count of padding bits in the following byte. The
+/// remaining bytes are the payload, with padding bits set. `Bit::BitToBlob`
+/// keeps the low `(8 - padding)` bits of that first payload byte and copies
+/// the rest unchanged.
+fn bit_physical_to_blob(physical: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    if physical.len() < 2 {
+        return Err("BIT value is missing its DuckDB storage header".into());
+    }
+    let padding = usize::from(physical[0]);
+    if padding >= 8 {
+        return Err(format!("BIT padding count {padding} is invalid").into());
+    }
+    let significant_bits = 8 - padding;
+    let mask = if significant_bits == 8 {
+        0xff
+    } else {
+        (1u16 << significant_bits) - 1
+    } as u8;
+    let mut bytes = Vec::with_capacity(physical.len() - 1);
+    bytes.push(physical[1] & mask);
+    bytes.extend_from_slice(&physical[2..]);
+    Ok(bytes)
+}
+
 fn read_blob_at(vec: &FlatVector, row: usize) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let strings = unsafe { vec.as_slice_with_len::<duckdb_string_t>(row + 1) };
     let mut s = strings[row];
@@ -958,16 +1045,19 @@ fn struct_field_to_param_json(value: Value, ty: &LogicalTypeHandle, is_json: boo
         return typed_param_envelope(value, "JSON", true);
     }
 
-    if ty.id() == LogicalTypeId::Varchar
-        && let Value::String(s) = value
+    if matches!(ty.id(), LogicalTypeId::List | LogicalTypeId::Array) {
+        let type_name = spanner_type_name(ty).unwrap_or_else(|| "ARRAY<UNKNOWN>".to_string());
+        // ARRAY<JSON> elements are canonical JSON text. The transport tag tells
+        // params.rs to parse that text instead of treating each element as a
+        // JSON string value. Other arrays stay untagged.
+        let child_is_json = is_json_type(&ty.child(0));
+        return typed_param_envelope(value, type_name, child_is_json);
+    }
+
+    if value.is_null()
+        && let Some(type_name) = spanner_type_name(ty)
     {
-        if let Ok(parsed) = serde_json::from_str::<Value>(&s)
-            && parsed.get("type").is_some()
-            && parsed.get("value").is_some()
-        {
-            return parsed;
-        }
-        return Value::String(s);
+        return typed_param_envelope(Value::Null, type_name, false);
     }
 
     if matches!(
@@ -990,7 +1080,47 @@ fn struct_field_to_param_json(value: Value, ty: &LogicalTypeHandle, is_json: boo
         };
         return json!({"value": value, "type": type_name});
     }
+
+    // Untyped parameters are inferred by Spanner, which defaults to INT64 when
+    // the SQL expression has no type. A JSON string such as a VARCHAR, DATE,
+    // or BYTES value would then fail as "could not parse ... as an integer".
+    // The envelope carries the DuckDB field type and keeps VARCHAR text intact,
+    // including text that looks like another envelope.
+    if json_string_needs_explicit_type(ty)
+        && let Some(type_name) = spanner_type_name(ty)
+    {
+        return typed_param_envelope(value, type_name, false);
+    }
+
+    // BOOL and FLOAT are not inferred as those types. In `SELECT @v AS col`
+    // Spanner defaults an untyped parameter to INT64.
+    if matches!(
+        ty.id(),
+        LogicalTypeId::Boolean | LogicalTypeId::Float | LogicalTypeId::Double
+    ) && let Some(type_name) = spanner_type_name(ty)
+    {
+        return typed_param_envelope(value, type_name, false);
+    }
     value
+}
+
+fn json_string_needs_explicit_type(ty: &LogicalTypeHandle) -> bool {
+    matches!(
+        ty.id(),
+        LogicalTypeId::Varchar
+            | LogicalTypeId::Date
+            | LogicalTypeId::Timestamp
+            | LogicalTypeId::TimestampS
+            | LogicalTypeId::TimestampMs
+            | LogicalTypeId::TimestampNs
+            | LogicalTypeId::TimestampTZ
+            | LogicalTypeId::Uuid
+            | LogicalTypeId::Interval
+            | LogicalTypeId::Blob
+            | LogicalTypeId::Bit
+            | LogicalTypeId::Time
+            | LogicalTypeId::TimeNs
+    )
 }
 
 fn format_decimal128(value: i128, scale: u32) -> String {
@@ -1351,11 +1481,110 @@ mod tests {
                 "spanner_value('2024-01-15 12:34:56.123456789'::TIMESTAMP_NS)",
                 r#"{"type":"TIMESTAMP","value":"2024-01-15T12:34:56.123456789Z"}"#,
             ),
+            (
+                "spanner_value('1969-12-31 23:59:59.123456789'::TIMESTAMP_NS)",
+                r#"{"type":"TIMESTAMP","value":"1969-12-31T23:59:59.123456789Z"}"#,
+            ),
+            (
+                "spanner_value(NULL::TIMESTAMP_NS)",
+                r#"{"type":"TIMESTAMP","value":null}"#,
+            ),
         ];
 
         for (expression, expected) in cases {
             assert_eq!(query_string(&conn, expression), expected, "{expression}");
         }
+    }
+
+    #[test]
+    fn test_bit_bytes_match_duckdb_blob_cast() {
+        let conn = open_test_connection();
+        let bits = vec![
+            "'10101010'::BIT".to_string(),
+            "'101'::BIT".to_string(),
+            "'0'::BIT".to_string(),
+            "'11111111'::BIT".to_string(),
+            // Longer than DuckDB's inline string storage.
+            format!("'{}'::BIT", "10".repeat(100)),
+        ];
+        for bit in bits {
+            let encoded = query_string(&conn, &format!("spanner_value({bit})"));
+            let parsed: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+            let expected = query_string(&conn, &format!("to_base64({bit}::BLOB)"));
+            assert_eq!(parsed["type"], "BYTES", "{bit}");
+            assert_eq!(parsed["value"], expected, "{bit}");
+
+            let typed = query_string(&conn, &format!("spanner_typed({bit}, 'BYTES')"));
+            let typed: serde_json::Value = serde_json::from_str(&typed).unwrap();
+            assert_eq!(typed["value"], expected, "typed {bit}");
+        }
+
+        assert_eq!(
+            query_string(&conn, "spanner_value(NULL::BIT)"),
+            r#"{"type":"BYTES","value":null}"#
+        );
+        let list = query_string(
+            &conn,
+            "spanner_value(['101'::BIT, NULL::BIT, '10101010'::BIT])",
+        );
+        let list: serde_json::Value = serde_json::from_str(&list).unwrap();
+        assert_eq!(list["type"], "ARRAY<BYTES>");
+        assert_eq!(
+            list["value"][0],
+            query_string(&conn, "to_base64('101'::BIT::BLOB)")
+        );
+        assert!(list["value"][1].is_null());
+        assert_eq!(
+            list["value"][2],
+            query_string(&conn, "to_base64('10101010'::BIT::BLOB)")
+        );
+
+        let array = query_string(
+            &conn,
+            "spanner_value(['101'::BIT, '10101010'::BIT]::BIT[2])",
+        );
+        let array: serde_json::Value = serde_json::from_str(&array).unwrap();
+        assert_eq!(array["type"], "ARRAY<BYTES>");
+        assert_eq!(
+            array["value"][0],
+            query_string(&conn, "to_base64('101'::BIT::BLOB)")
+        );
+        assert_eq!(
+            array["value"][1],
+            query_string(&conn, "to_base64('10101010'::BIT::BLOB)")
+        );
+
+        let blob = query_string(&conn, "spanner_value(from_hex('00AA'))");
+        assert_eq!(blob, r#"{"type":"BYTES","value":"AKo="}"#);
+    }
+
+    #[test]
+    fn test_timestamp_ns_infinity_is_rejected() {
+        let conn = open_test_connection();
+        let rejected = [
+            "spanner_value('infinity'::TIMESTAMP_NS)",
+            "spanner_value('-infinity'::TIMESTAMP_NS)",
+            "spanner_typed('infinity'::TIMESTAMP_NS, 'TIMESTAMP')",
+            "spanner_typed('-infinity'::TIMESTAMP_NS, 'TIMESTAMP')",
+            "spanner_params({'v': 'infinity'::TIMESTAMP_NS})",
+            "spanner_params({'v': '-infinity'::TIMESTAMP_NS})",
+            "spanner_value(['infinity'::TIMESTAMP_NS])",
+            "spanner_value(['-infinity'::TIMESTAMP_NS])",
+            "spanner_value(['2024-01-15 12:34:56.123456789'::TIMESTAMP_NS, 'infinity'::TIMESTAMP_NS]::TIMESTAMP_NS[2])",
+            "spanner_typed(['infinity'::TIMESTAMP_NS], 'ARRAY<TIMESTAMP>')",
+            "spanner_params({'v': spanner_value(['infinity'::TIMESTAMP_NS])})",
+        ];
+        for expression in rejected {
+            assert_query_error(&conn, expression, TIMESTAMP_NS_INFINITY_ERROR);
+        }
+
+        assert_eq!(
+            query_string(
+                &conn,
+                "spanner_value([NULL::TIMESTAMP_NS, '2024-01-15 12:34:56.123456789'::TIMESTAMP_NS])"
+            ),
+            r#"{"type":"ARRAY<TIMESTAMP>","value":[null,"2024-01-15T12:34:56.123456789Z"]}"#
+        );
     }
 
     #[test]
@@ -1428,12 +1657,17 @@ mod tests {
             query_string(&conn, r#"spanner_value(json('{"a":1}'))"#),
             r#"{"$duckdb_spanner_json_format":"json-text-v1","type":"JSON","value":"{\"a\":1}"}"#
         );
-        assert_eq!(
-            query_string(
-                &conn,
-                r#"spanner_params({'x': spanner_value(json('{"a":1}'))})"#,
-            ),
-            r#"{"x":{"$duckdb_spanner_json_format":"json-text-v1","type":"JSON","value":"{\"a\":1}"}}"#
+        let helper_in_params = query_string(
+            &conn,
+            r#"spanner_params({'x': spanner_value(json('{"a":1}'))})"#,
+        );
+        let helper_json: serde_json::Value = serde_json::from_str(&helper_in_params).unwrap();
+        assert_eq!(helper_json["x"]["type"], "STRING");
+        assert!(
+            helper_json["x"]["value"]
+                .as_str()
+                .is_some_and(|text| text.contains("\"type\":\"JSON\"")),
+            "helper output inside spanner_params stays STRING text, got {helper_json}"
         );
         let plain_json = query_string(&conn, r#"spanner_params({'x': json('{"a":1}')})"#);
         assert_eq!(
@@ -1458,11 +1692,27 @@ mod tests {
             &conn,
             r#"spanner_params({'x': spanner_typed(json('"abc"'), 'STRING')})"#,
         );
-        assert_eq!(
-            as_string,
-            r#"{"x":{"$duckdb_spanner_json_format":"json-text-v1","type":"STRING","value":"\"abc\""}}"#
+        let as_string_json: serde_json::Value = serde_json::from_str(&as_string).unwrap();
+        assert_eq!(as_string_json["x"]["type"], "STRING");
+        assert!(as_string_json["x"]["value"].is_string());
+        let migrated = query_string(
+            &conn,
+            r#"json_object('x', spanner_typed(json('"abc"'), 'STRING')::JSON)"#,
         );
-        crate::params::create_statement("SELECT @x", Some(&as_string)).unwrap();
+        let migrated_json: serde_json::Value = serde_json::from_str(&migrated).unwrap();
+        assert_eq!(migrated_json["x"]["type"], "STRING");
+        assert!(migrated_json["x"].is_object());
+        crate::params::create_statement("SELECT @x", Some(&migrated)).unwrap();
+
+        let json_array = query_string(
+            &conn,
+            r#"spanner_params({'x': [json('"abc"'), json('null'), NULL::JSON]})"#,
+        );
+        assert_eq!(
+            json_array,
+            r#"{"x":{"$duckdb_spanner_json_format":"json-text-v1","type":"ARRAY<JSON>","value":["\"abc\"","null",null]}}"#
+        );
+        crate::params::create_statement("SELECT @x", Some(&json_array)).unwrap();
     }
 
     #[test]
@@ -1484,9 +1734,13 @@ mod tests {
             r#"{"x":{"type":"NUMERIC","value":"18446744073709551615"}}"#
         );
         assert_eq!(
-            query_string(&conn, "spanner_params({'x': spanner_value([1, 2])})"),
+            query_string(&conn, "spanner_params({'x': [1, 2]::BIGINT[]})"),
             r#"{"x":{"type":"ARRAY<INT64>","value":[1,2]}}"#
         );
+        let helper_array = query_string(&conn, "spanner_params({'x': spanner_value([1, 2])})");
+        let helper_array: serde_json::Value = serde_json::from_str(&helper_array).unwrap();
+        assert_eq!(helper_array["x"]["type"], "STRING");
+        assert!(helper_array["x"]["value"].is_string());
 
         let non_finite = query_string(&conn, "spanner_params({'x': 'NaN'::DOUBLE})");
         assert_eq!(non_finite, r#"{"x":{"type":"FLOAT64","value":"NaN"}}"#);
@@ -1517,10 +1771,9 @@ mod tests {
             "spanner_value([{'a': 1}])",
             "Unsupported nested DuckDB type Struct for spanner_value",
         );
-        assert_query_error(
-            &conn,
-            "spanner_params({'x': [1, 2]})",
-            "Unsupported DuckDB type List for spanner_params field 'x'",
+        assert_eq!(
+            query_string(&conn, "spanner_params({'x': [1, 2]})"),
+            r#"{"x":{"type":"ARRAY<INT64>","value":[1,2]}}"#
         );
         assert_query_error(
             &conn,
@@ -1557,15 +1810,31 @@ mod tests {
 
         let json: String = conn
             .query_row(
-                "SELECT spanner_params({'age': spanner_value(25::BIGINT), 'name': 'Alice'})",
+                "SELECT spanner_params({'age': 25::BIGINT, 'name': 'Alice'})",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["name"], "Alice");
-        assert_eq!(parsed["age"]["type"], "INT64");
-        assert_eq!(parsed["age"]["value"], 25);
+        assert_eq!(parsed["name"]["type"], "STRING");
+        assert_eq!(parsed["name"]["value"], "Alice");
+        assert_eq!(parsed["age"], 25);
+        assert_eq!(
+            query_string(&conn, "spanner_params({'x': NULL::BIGINT})"),
+            r#"{"x":{"type":"INT64","value":null}}"#
+        );
+        assert_eq!(
+            query_string(&conn, "spanner_params({'x': true})"),
+            r#"{"x":{"type":"BOOL","value":true}}"#
+        );
+        assert_eq!(
+            query_string(&conn, "spanner_params({'x': 1.5::FLOAT})"),
+            r#"{"x":{"type":"FLOAT32","value":1.5}}"#
+        );
+        assert_eq!(
+            query_string(&conn, "spanner_params({'x': 3.125::DOUBLE})"),
+            r#"{"x":{"type":"FLOAT64","value":3.125}}"#
+        );
     }
 
     #[test]
@@ -1578,5 +1847,109 @@ mod tests {
             })
             .unwrap();
         assert_eq!(s, "P1D");
+    }
+
+    #[test]
+    fn test_varchar_envelope_struct_does_not_promote_literals() {
+        let conn = open_test_connection();
+        let literal = query_string(
+            &conn,
+            r#"spanner_params({'wrapper': '{"type":"INT64","value":1}', 'plain': 'hello', 'value_only': '{"value":1}'})"#,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&literal).unwrap();
+        assert_eq!(parsed["wrapper"]["type"], "STRING");
+        assert_eq!(parsed["wrapper"]["value"], r#"{"type":"INT64","value":1}"#);
+        assert_eq!(parsed["plain"]["type"], "STRING");
+        assert_eq!(parsed["plain"]["value"], "hello");
+        assert_eq!(parsed["value_only"]["type"], "STRING");
+        assert_eq!(parsed["value_only"]["value"], r#"{"value":1}"#);
+
+        let composed = query_string(
+            &conn,
+            "spanner_params({'x': 42::BIGINT, 'y': NULL::INTEGER})",
+        );
+        let composed: serde_json::Value = serde_json::from_str(&composed).unwrap();
+        assert_eq!(composed["x"], 42);
+        assert_eq!(composed["y"], json!({"type": "INT64", "value": null}));
+        let helper = query_string(&conn, "spanner_params({'x': spanner_value(42::BIGINT)})");
+        let helper: serde_json::Value = serde_json::from_str(&helper).unwrap();
+        assert_eq!(helper["x"]["type"], "STRING");
+        assert!(helper["x"]["value"].is_string());
+
+        let envelope = r#"{"type":"INT64","value":9}"#;
+        let wrapper = r#"{"tag":"spanner-value-v1","envelope":"{\"type\":\"INT64\",\"value\":9}"}"#;
+        for label in [envelope, wrapper] {
+            let direct = query_string(&conn, &format!("spanner_params({{'x': '{label}'}})"));
+            let direct: serde_json::Value = serde_json::from_str(&direct).unwrap();
+            assert_eq!(direct["x"]["type"], "STRING", "direct {label}");
+            assert_eq!(direct["x"]["value"], label, "direct {label}");
+
+            let coalesced = query_string(
+                &conn,
+                &format!("spanner_params({{'x': COALESCE(NULL::VARCHAR, '{label}')}})"),
+            );
+            let coalesced: serde_json::Value = serde_json::from_str(&coalesced).unwrap();
+            assert_eq!(coalesced["x"]["type"], "STRING", "coalesce {label}");
+            assert_eq!(coalesced["x"]["value"], label, "coalesce {label}");
+
+            let cased = query_string(
+                &conn,
+                &format!(
+                    "spanner_params({{'x': CASE WHEN false THEN 'plain' ELSE '{label}' END}})"
+                ),
+            );
+            let cased: serde_json::Value = serde_json::from_str(&cased).unwrap();
+            assert_eq!(cased["x"]["type"], "STRING", "case {label}");
+            assert_eq!(cased["x"]["value"], label, "case {label}");
+
+            let unioned = query_string(
+                &conn,
+                &format!(
+                    "string_agg(spanner_params({{'x': v}}), '|' ORDER BY v = 'plain' DESC) FROM (SELECT 'plain' AS v UNION ALL SELECT '{label}')"
+                ),
+            );
+            let rows: Vec<serde_json::Value> = unioned
+                .split('|')
+                .map(|row| serde_json::from_str(row).unwrap())
+                .collect();
+            assert_eq!(rows[0]["x"]["type"], "STRING");
+            assert_eq!(rows[0]["x"]["value"], "plain");
+            assert_eq!(rows[1]["x"]["type"], "STRING");
+            assert_eq!(rows[1]["x"]["value"], label, "union {label}");
+        }
+
+        conn.execute_batch("CREATE TABLE envelope_text AS SELECT 'plain' AS v")
+            .unwrap();
+        conn.execute("INSERT INTO envelope_text VALUES (?)", [envelope])
+            .unwrap();
+        let stored = query_string(
+            &conn,
+            "string_agg(spanner_params({'x': v}), '|' ORDER BY v = 'plain' DESC) FROM envelope_text",
+        );
+        let stored: Vec<serde_json::Value> = stored
+            .split('|')
+            .map(|row| serde_json::from_str(row).unwrap())
+            .collect();
+        assert_eq!(stored[0]["x"]["type"], "STRING");
+        assert_eq!(stored[0]["x"]["value"], "plain");
+        assert_eq!(stored[1]["x"]["type"], "STRING");
+        assert_eq!(stored[1]["x"]["value"], envelope);
+
+        // DuckDB rejects PREPARE of this SELECT (`Unexpected prepared
+        // parameter`). The client prepared-statement path is the one callers
+        // use, and it still binds the value as VARCHAR.
+        let prepared: String = conn
+            .query_row("SELECT spanner_params({'x': ?})", [wrapper], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let prepared: serde_json::Value = serde_json::from_str(&prepared).unwrap();
+        assert_eq!(prepared["x"]["type"], "STRING");
+        assert_eq!(prepared["x"]["value"], wrapper);
+        assert_query_error(
+            &conn,
+            "spanner_params({'x': {'a': 1}})",
+            "Unsupported DuckDB type Struct",
+        );
     }
 }
