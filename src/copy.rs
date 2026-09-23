@@ -175,6 +175,10 @@ struct ColumnMeta {
     child: Option<Box<ColumnMeta>>,
     /// Field metadata for DuckDB STRUCT columns.
     struct_fields: Vec<StructFieldMeta>,
+    /// True when this DuckDB value is logical JSON. The physical type is still
+    /// VARCHAR, so the alias has to be stored separately. Ordinary VARCHAR text
+    /// is not JSON even when it is valid JSON text.
+    is_json: bool,
     /// Target Spanner column type code (populated during GlobalInit).
     spanner_type_code: TypeCode,
 }
@@ -701,6 +705,7 @@ unsafe fn column_meta_from_logical_type(
 
         let type_id = ffi::duckdb_get_type_id(logical_type);
         validate_copy_source_type(type_id)?;
+        let is_json = logical_type_is_json(logical_type);
         let (decimal_scale, decimal_internal_type) =
             if type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL {
                 (
@@ -763,8 +768,24 @@ unsafe fn column_meta_from_logical_type(
             array_size,
             child,
             struct_fields,
+            is_json,
             spanner_type_code: TypeCode::Unspecified,
         })
+    }
+}
+
+fn logical_type_is_json(logical_type: ffi::duckdb_logical_type) -> bool {
+    unsafe {
+        if ffi::duckdb_get_type_id(logical_type) != ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR {
+            return false;
+        }
+        let alias = OwnedDuckDbString::from_raw(ffi::duckdb_logical_type_get_alias(logical_type));
+        if alias.as_ptr().is_null() {
+            return false;
+        }
+        CStr::from_ptr(alias.as_ptr())
+            .to_str()
+            .is_ok_and(|alias| alias.eq_ignore_ascii_case("json"))
     }
 }
 
@@ -1623,7 +1644,15 @@ unsafe fn read_duckdb_json_value(
             }
             ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR => {
                 let str_ptr = data.cast::<ffi::duckdb_string_t>().add(row_idx);
-                Ok(serde_json::Value::String(read_duckdb_string(str_ptr)))
+                let text = read_duckdb_string(str_ptr);
+                if col.is_json {
+                    // Parse the logical JSON document. A physical VARCHAR with
+                    // the same text stays a JSON string below.
+                    serde_json::from_str(&text)
+                        .map_err(|e| format!("Invalid DuckDB JSON value: {e}"))
+                } else {
+                    Ok(serde_json::Value::String(text))
+                }
             }
             ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB => {
                 let str_ptr = data.cast::<ffi::duckdb_string_t>().add(row_idx);
@@ -2124,6 +2153,37 @@ mod tests {
         unsafe { column_meta_from_logical_type(logical_type.as_raw()) }
     }
 
+    fn json_alias(type_id: ffi::duckdb_type) -> OwnedDuckDbLogicalType {
+        let logical_type = logical_type(type_id);
+        let alias = CString::new("JSON").unwrap();
+        unsafe {
+            ffi::duckdb_logical_type_set_alias(logical_type.as_raw(), alias.as_ptr());
+        }
+        logical_type
+    }
+
+    fn struct_type(members: &[(&str, &OwnedDuckDbLogicalType)]) -> OwnedDuckDbLogicalType {
+        let mut types: Vec<ffi::duckdb_logical_type> = members
+            .iter()
+            .map(|(_, logical_type)| logical_type.as_raw())
+            .collect();
+        let names: Vec<CString> = members
+            .iter()
+            .map(|(name, _)| CString::new(*name).unwrap())
+            .collect();
+        let mut name_ptrs: Vec<*const c_char> = names.iter().map(|name| name.as_ptr()).collect();
+        unsafe {
+            let raw = ffi::duckdb_create_struct_type(
+                types.as_mut_ptr(),
+                name_ptrs.as_mut_ptr(),
+                members.len() as _,
+            );
+            let logical_type = OwnedDuckDbLogicalType::from_raw(raw);
+            assert!(!logical_type.as_raw().is_null());
+            logical_type
+        }
+    }
+
     fn column_error_from_logical_type(logical_type: &OwnedDuckDbLogicalType) -> String {
         match column_from_logical_type(logical_type) {
             Ok(_) => panic!("logical type unexpectedly passed COPY metadata validation"),
@@ -2136,6 +2196,31 @@ mod tests {
             .iter()
             .map(|(key, value)| ((*key).to_string(), vec![(*value).to_string()]))
             .collect()
+    }
+
+    #[test]
+    fn json_alias_is_kept_through_nested_copy_metadata() {
+        let json_ty = json_alias(ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR);
+        let varchar_ty = logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR);
+        let json_meta = column_from_logical_type(&json_ty).unwrap();
+        let varchar_meta = column_from_logical_type(&varchar_ty).unwrap();
+        assert!(json_meta.is_json);
+        assert!(!varchar_meta.is_json);
+        assert_eq!(json_meta.type_id, ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR);
+
+        let nested = struct_type(&[("obj", &json_ty), ("text", &varchar_ty)]);
+        let nested = column_from_logical_type(&nested).unwrap();
+        assert!(!nested.is_json);
+        assert!(nested.struct_fields[0].column.is_json);
+        assert!(!nested.struct_fields[1].column.is_json);
+
+        let list = list_type(&json_ty);
+        let list = column_from_logical_type(&list).unwrap();
+        assert!(list.child.unwrap().is_json);
+
+        let array = array_type(&varchar_ty, 2);
+        let array = column_from_logical_type(&array).unwrap();
+        assert!(!array.child.unwrap().is_json);
     }
 
     #[test]

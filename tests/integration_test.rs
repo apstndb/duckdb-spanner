@@ -2365,6 +2365,62 @@ fn test_copy_to_struct_json() {
 }
 
 #[test]
+fn test_copy_preserves_nested_json_identity() {
+    let conn = create_duckdb_connection_with_copy();
+    let db = get_gsql_db();
+
+    let nested = format!(
+        "COPY (SELECT \
+            1941::BIGINT, \
+            NULL::DECIMAL(38, 9), \
+            {{ \
+                obj: json('{{\"x\":1}}'), \
+                jnull: json('null'), \
+                flag: json('true'), \
+                num: json('1.5'), \
+                word: json('\"abc\"'), \
+                arr: json('[1,true,null]'), \
+                text: '{{\"x\":1}}'::VARCHAR, \
+                items: [json('{{\"a\":true}}')], \
+                fixed: [json('1')]::JSON[1], \
+                sql_null: NULL::JSON \
+            }} \
+        ) TO 'NumericTypes' (FORMAT spanner, database_path '{}', endpoint '{}')",
+        db.database_path(),
+        db.emulator_host()
+    );
+    conn.execute_batch(&nested).unwrap();
+
+    let row = exec_spanner_one("SELECT JsonCol FROM NumericTypes WHERE Id = 1941");
+    let value: serde_json::Value = serde_json::from_str(&row.column::<String>(0).unwrap()).unwrap();
+    assert_eq!(value["obj"], serde_json::json!({"x": 1}));
+    assert!(value["jnull"].is_null());
+    assert_eq!(value["flag"], true);
+    assert_eq!(value["num"], serde_json::json!(1.5));
+    assert_eq!(value["word"], "abc");
+    assert_eq!(value["arr"], serde_json::json!([1, true, null]));
+    assert_eq!(value["text"], r#"{"x":1}"#);
+    assert_eq!(value["items"], serde_json::json!([{"a": true}]));
+    assert_eq!(value["fixed"], serde_json::json!([1]));
+    assert!(value["sql_null"].is_null());
+
+    let direct = format!(
+        "COPY (SELECT \
+            1942::BIGINT, \
+            NULL::DECIMAL(38, 9), \
+            json('{{\"x\":1,\"ok\":true}}') \
+        ) TO 'NumericTypes' (FORMAT spanner, database_path '{}', endpoint '{}')",
+        db.database_path(),
+        db.emulator_host()
+    );
+    conn.execute_batch(&direct).unwrap();
+    let row = exec_spanner_one("SELECT JsonCol FROM NumericTypes WHERE Id = 1942");
+    let value: serde_json::Value = serde_json::from_str(&row.column::<String>(0).unwrap()).unwrap();
+    assert_eq!(value["x"], 1);
+    assert_eq!(value["ok"], true);
+}
+
+#[test]
 fn test_copy_to_column_count_mismatch() {
     let conn = create_duckdb_connection_with_copy();
     let db = get_gsql_db();
