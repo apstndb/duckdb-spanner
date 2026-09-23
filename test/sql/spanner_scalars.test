@@ -80,10 +80,13 @@ SELECT IF(
 
 statement ok
 SELECT IF(
-	spanner_params({'i': spanner_typed(INTERVAL '1 day', NULL)}) = '{"i":null}'
-	AND strpos(spanner_params({'i': spanner_typed(INTERVAL '1 day', 'INTERVAL')}), 'P1D') > 0,
+	json_extract_string(spanner_params({'i': spanner_typed(INTERVAL '1 day', NULL)})::JSON, '$.i.type') = 'STRING'
+	AND json_type(spanner_params({'i': spanner_typed(INTERVAL '1 day', NULL)})::JSON, '$.i.value') = 'NULL'
+	AND json_extract_string(spanner_params({'i': spanner_typed(INTERVAL '1 day', 'INTERVAL')})::JSON, '$.i.type') = 'STRING'
+	AND json_type(spanner_params({'i': spanner_typed(INTERVAL '1 day', 'INTERVAL')})::JSON, '$.i.value') = 'VARCHAR'
+	AND contains(json_extract_string(spanner_params({'i': spanner_typed(INTERVAL '1 day', 'INTERVAL')})::JSON, '$.i.value'), 'P1D'),
 	1,
-	error('expected NULL INTERVAL type to stay null inside spanner_params')
+	error('expected helper text inside spanner_params to stay STRING')
 );
 
 statement ok

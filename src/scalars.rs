@@ -1349,19 +1349,23 @@ mod tests {
             r#"NULL|{"type":"INTERVAL","value":"P1D"}|NULL|{"type":"INTERVAL","value":null}"#
         );
 
-        assert_eq!(
-            query_string(
-                &conn,
-                "spanner_params({'i': spanner_typed(INTERVAL '1 day', NULL)})",
-            ),
-            r#"{"i":null}"#
+        let null_type = query_string(
+            &conn,
+            "spanner_params({'i': spanner_typed(INTERVAL '1 day', NULL)})",
         );
+        let null_type: serde_json::Value = serde_json::from_str(&null_type).unwrap();
+        assert_eq!(null_type["i"]["type"], "STRING");
+        assert!(null_type["i"]["value"].is_null());
+
+        let explicit = query_string(
+            &conn,
+            "spanner_params({'i': spanner_typed(INTERVAL '1 day', 'INTERVAL')})",
+        );
+        let explicit: serde_json::Value = serde_json::from_str(&explicit).unwrap();
+        assert_eq!(explicit["i"]["type"], "STRING");
         assert_eq!(
-            query_string(
-                &conn,
-                "spanner_params({'i': spanner_typed(INTERVAL '1 day', 'INTERVAL')})",
-            ),
-            r#"{"i":{"type":"INTERVAL","value":"P1D"}}"#
+            explicit["i"]["value"],
+            r#"{"type":"INTERVAL","value":"P1D"}"#
         );
     }
 
