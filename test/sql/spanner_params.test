@@ -1,5 +1,5 @@
 # name: test/sql/spanner_params.test
-# description: spanner_query params round-trip via spanner_value
+# description: spanner_query params round-trip from native STRUCT fields
 # group: [spanner]
 #
 # Prerequisites:
@@ -20,13 +20,13 @@ statement ok
 SET spanner_endpoint = '${SPANNER_EMULATOR_HOST}';
 
 statement ok
-SELECT IF(Int64Col = 42, 1, error('expected param round-trip 42')) FROM spanner_query('SELECT @v AS Int64Col', params := {'v': spanner_value(42::BIGINT)});
+SELECT IF(Int64Col = 42, 1, error('expected param round-trip 42')) FROM spanner_query('SELECT @v AS Int64Col', params := {'v': 42::BIGINT});
 
 statement ok
-SELECT IF(StringCol = 'hello', 1, error('expected param round-trip hello')) FROM spanner_query('SELECT @name AS StringCol', params := {'name': spanner_value('hello')});
+SELECT IF(StringCol = 'hello', 1, error('expected param round-trip hello')) FROM spanner_query('SELECT @name AS StringCol', params := {'name': 'hello'});
 
 statement ok
-SELECT IF(count = 1, 1, error('expected one filtered row')) FROM (SELECT COUNT(*)::INT AS count FROM spanner_query('SELECT Id FROM ScalarTypes WHERE Id = @id', params := {'id': spanner_value(1::BIGINT)}));
+SELECT IF(count = 1, 1, error('expected one filtered row')) FROM (SELECT COUNT(*)::INT AS count FROM spanner_query('SELECT Id FROM ScalarTypes WHERE Id = @id', params := {'id': 1::BIGINT}));
 
 # Plain fields that JSON cannot represent losslessly are emitted as typed
 # parameter envelopes by spanner_params(). Exercise the complete emulator wire
@@ -50,13 +50,13 @@ statement ok
 SELECT IF(typeof(JsonParam) = 'JSON' AND JsonParam IS NOT NULL AND JsonParam = json('null'), 1, error('expected JSON null distinct from SQL NULL')) FROM spanner_query('SELECT @v AS JsonParam', params := {'v': json('null')});
 
 statement ok
-SELECT IF(JsonParam IS NULL, 1, error('expected typed SQL NULL JSON param')) FROM spanner_query('SELECT @v AS JsonParam', params := {'v': spanner_value(NULL::JSON)});
+SELECT IF(JsonParam IS NULL, 1, error('expected typed SQL NULL JSON param')) FROM spanner_query('SELECT @v AS JsonParam', params := {'v': NULL::JSON});
 
 statement ok
-SELECT IF(JsonValues[1] = json('"abc"') AND JsonValues[2] IS NOT NULL AND JsonValues[2] = json('null') AND JsonValues[3] IS NULL, 1, error('expected ARRAY<JSON> value/null distinctions')) FROM spanner_query('SELECT @v AS JsonValues', params := {'v': spanner_value([json('"abc"'), json('null'), NULL::JSON])});
+SELECT IF(JsonValues[1] = json('"abc"') AND JsonValues[2] IS NOT NULL AND JsonValues[2] = json('null') AND JsonValues[3] IS NULL, 1, error('expected ARRAY<JSON> value/null distinctions')) FROM spanner_query('SELECT @v AS JsonValues', params := {'v': [json('"abc"'), json('null'), NULL::JSON]});
 
 statement ok
-SELECT IF(StringParam = 'abc', 1, error('expected JSON-to-STRING transport tag to be transparent')) FROM spanner_query('SELECT @v AS StringParam', params := {'v': spanner_typed(json('"abc"'), 'STRING')});
+SELECT IF(StringParam = 'abc', 1, error('expected JSON-to-STRING transport tag to be transparent')) FROM spanner_query_raw('SELECT @v AS StringParam', params := json_object('v', spanner_typed(json('"abc"'), 'STRING')::JSON)::VARCHAR);
 
 # Compare inside Spanner so DuckDB's microsecond result conversion cannot hide
 # loss of the final three outbound nanosecond digits.
@@ -76,28 +76,28 @@ statement ok
 SELECT IF(interval_to_iso8601(Nanos) = 'PT0S', 1, error('expected documented Spanner INTERVAL return precision')) FROM spanner_query('SELECT INTERVAL 1 NANOSECOND AS Nanos');
 
 statement ok
-SELECT IF(len(Intervals) = 2, 1, error('expected ARRAY<INTERVAL> param round-trip')) FROM spanner_query('SELECT @v AS Intervals', params := {'v': spanner_typed(['P1D', 'P1Y3M'], 'ARRAY<INTERVAL>')});
+SELECT IF(len(Intervals) = 2, 1, error('expected ARRAY<INTERVAL> param round-trip')) FROM spanner_query('SELECT @v AS Intervals', params := {'v': [INTERVAL '1 day', INTERVAL '1 year 3 months']});
 
 # Spanner accepts component-wise negative ISO 8601 durations. Verify these
-# values travel through interval_to_iso8601, spanner_typed, and spanner_query.
+# values travel through interval_to_iso8601 and a native INTERVAL field.
 statement ok
-SELECT IF(interval_to_iso8601(NegativeMonth) = 'P-1Y11M', 1, error('expected negative month interval round-trip')) FROM spanner_query('SELECT @v AS NegativeMonth', params := {'v': spanner_typed(INTERVAL '-1 month', 'INTERVAL')});
+SELECT IF(interval_to_iso8601(NegativeMonth) = 'P-1Y11M', 1, error('expected negative month interval round-trip')) FROM spanner_query('SELECT @v AS NegativeMonth', params := {'v': INTERVAL '-1 month'});
 
 statement ok
-SELECT IF(interval_to_iso8601(NegativeDay) = 'P-1D', 1, error('expected negative day interval round-trip')) FROM spanner_query('SELECT @v AS NegativeDay', params := {'v': spanner_typed(INTERVAL '-1 day', 'INTERVAL')});
+SELECT IF(interval_to_iso8601(NegativeDay) = 'P-1D', 1, error('expected negative day interval round-trip')) FROM spanner_query('SELECT @v AS NegativeDay', params := {'v': INTERVAL '-1 day'});
 
 statement ok
-SELECT IF(interval_to_iso8601(NegativeMicros) = 'PT-1H59M59.999999S', 1, error('expected negative microsecond interval round-trip')) FROM spanner_query('SELECT @v AS NegativeMicros', params := {'v': spanner_typed(INTERVAL '-1 microsecond', 'INTERVAL')});
+SELECT IF(interval_to_iso8601(NegativeMicros) = 'PT-1H59M59.999999S', 1, error('expected negative microsecond interval round-trip')) FROM spanner_query('SELECT @v AS NegativeMicros', params := {'v': INTERVAL '-1 microsecond'});
 
 statement ok
-SELECT IF(interval_to_iso8601(MixedDate) = 'P1M-1D', 1, error('expected mixed-sign date interval round-trip')) FROM spanner_query('SELECT @v AS MixedDate', params := {'v': spanner_typed(INTERVAL '1 month -1 day', 'INTERVAL')});
+SELECT IF(interval_to_iso8601(MixedDate) = 'P1M-1D', 1, error('expected mixed-sign date interval round-trip')) FROM spanner_query('SELECT @v AS MixedDate', params := {'v': INTERVAL '1 month -1 day'});
 
 statement ok
-SELECT IF(interval_to_iso8601(MixedTime) = 'P1DT-1H', 1, error('expected mixed-sign time interval round-trip')) FROM spanner_query('SELECT @v AS MixedTime', params := {'v': spanner_typed(INTERVAL '1 day -1 hour', 'INTERVAL')});
+SELECT IF(interval_to_iso8601(MixedTime) = 'P1DT-1H', 1, error('expected mixed-sign time interval round-trip')) FROM spanner_query('SELECT @v AS MixedTime', params := {'v': INTERVAL '1 day -1 hour'});
 
 # Send an invalid mixed-sign wire string directly. A component sign must
 # precede its value; the emulator rejects a sign placed after the day value.
 statement error
-SELECT * FROM spanner_query('SELECT @v AS InvalidMixedSign', params := {'v': spanner_typed('P1M1-D', 'INTERVAL')});
+SELECT * FROM spanner_query_raw('SELECT @v AS InvalidMixedSign', params := json_object('v', json_object('type', 'INTERVAL', 'value', 'P1M1-D'))::VARCHAR);
 ----
 Unexpected '-' in the date portion of interval

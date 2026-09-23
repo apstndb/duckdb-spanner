@@ -170,10 +170,13 @@ SELECT spanner_value(json('{"a":1}'));
 ----
 {"$duckdb_spanner_json_format":"json-text-v1","type":"JSON","value":"{\"a\":1}"}
 
-query T
-SELECT spanner_params({'x': spanner_value(json('{"a":1}'))});
-----
-{"x":{"$duckdb_spanner_json_format":"json-text-v1","type":"JSON","value":"{\"a\":1}"}}
+statement ok
+SELECT IF(
+	json_extract_string(spanner_params({'x': spanner_value(json('{"a":1}'))})::JSON, '$.x.type') = 'STRING'
+	AND json_type(spanner_params({'x': spanner_value(json('{"a":1}'))})::JSON, '$.x.value') = 'VARCHAR',
+	1,
+	error('expected helper output inside spanner_params to stay STRING')
+);
 
 query T
 SELECT spanner_params({'x': json('{"a":1}')});
@@ -190,10 +193,21 @@ SELECT spanner_value(json('null'));
 ----
 {"$duckdb_spanner_json_format":"json-text-v1","type":"JSON","value":"null"}
 
-query T
-SELECT spanner_params({'x': spanner_typed(json('"abc"'), 'STRING')});
-----
-{"x":{"$duckdb_spanner_json_format":"json-text-v1","type":"STRING","value":"\"abc\""}}
+statement ok
+SELECT IF(
+	json_extract_string(spanner_params({'x': spanner_typed(json('"abc"'), 'STRING')})::JSON, '$.x.type') = 'STRING'
+	AND json_type(spanner_params({'x': spanner_typed(json('"abc"'), 'STRING')})::JSON, '$.x.value') = 'VARCHAR',
+	1,
+	error('expected spanner_typed output inside spanner_params to stay STRING')
+);
+
+statement ok
+SELECT IF(
+	json_type(json_object('x', spanner_typed(json('"abc"'), 'STRING')::JSON), 'x') = 'OBJECT'
+	AND json_extract_string(json_object('x', spanner_typed(json('"abc"'), 'STRING')::JSON), '$.x.type') = 'STRING',
+	1,
+	error('expected json_object override to stay a JSON object')
+);
 
 statement error
 SELECT spanner_value({'a': 1});
@@ -220,10 +234,10 @@ SELECT spanner_value([{'a': 1}]);
 ----
 Unsupported nested DuckDB type Struct for spanner_value
 
-statement error
+query T
 SELECT spanner_params({'x': [1, 2]});
 ----
-Unsupported DuckDB type List for spanner_params field 'x'
+{"x":{"type":"ARRAY<INT64>","value":[1,2]}}
 
 statement error
 SELECT spanner_params({'x': {'a': 1}});
@@ -232,8 +246,10 @@ Unsupported DuckDB type Struct for spanner_params field 'x'
 
 statement ok
 SELECT IF(
-	strpos(spanner_params({'age': spanner_value(25::BIGINT), 'name': 'Alice'}), 'Alice') > 0
-	AND strpos(spanner_params({'age': spanner_value(25::BIGINT), 'name': 'Alice'}), 'INT64') > 0,
+	json_extract(spanner_params({'age': 25::BIGINT, 'name': 'Alice'})::JSON, '$.age') = 25
+	AND json_extract_string(spanner_params({'age': 25::BIGINT, 'name': 'Alice'})::JSON, '$.name.type') = 'STRING'
+	AND json_extract_string(spanner_params({'age': 25::BIGINT, 'name': 'Alice'})::JSON, '$.name.value') = 'Alice'
+	AND json_extract_string(spanner_params({'age': NULL::BIGINT})::JSON, '$.age.type') = 'INT64',
 	1,
 	error('expected spanner_params JSON')
 );
