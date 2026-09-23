@@ -43,9 +43,47 @@ SELECT IF(
 
 statement ok
 SELECT IF(
-	spanner_typed(42::BIGINT, NULL) IS NULL,
+	spanner_typed(42::BIGINT, NULL) IS NULL
+	AND spanner_typed(INTERVAL '1 day', NULL) IS NULL
+	AND spanner_typed(NULL::INTERVAL, NULL) IS NULL
+	AND spanner_typed([INTERVAL '1 day'], NULL) IS NULL,
 	1,
 	error('expected NULL from spanner_typed with NULL type')
+);
+
+statement ok
+SELECT IF(
+	strpos(spanner_typed(INTERVAL '1 day', 'INTERVAL'), '"type":"INTERVAL"') > 0
+	AND strpos(spanner_typed(INTERVAL '1 day', 'INTERVAL'), 'P1D') > 0
+	AND strpos(spanner_typed(NULL::INTERVAL, 'INTERVAL'), '"type":"INTERVAL"') > 0
+	AND strpos(spanner_typed(NULL::INTERVAL, 'INTERVAL'), '"value":null') > 0,
+	1,
+	error('expected explicit INTERVAL spanner_typed JSON')
+);
+
+statement ok
+SELECT IF(
+	count(*) = 4
+	AND count(envelope) = 2
+	AND count(*) FILTER (WHERE envelope LIKE '%P1D%') = 1
+	AND count(*) FILTER (WHERE envelope LIKE '%"value":null%') = 1,
+	1,
+	error('expected mixed NULL and explicit INTERVAL type arguments')
+) FROM (
+	SELECT spanner_typed(v, t) AS envelope FROM (VALUES
+		(INTERVAL '1 day', NULL::VARCHAR),
+		(INTERVAL '1 day', 'INTERVAL'),
+		(NULL::INTERVAL, NULL::VARCHAR),
+		(NULL::INTERVAL, 'INTERVAL')
+	) rows(v, t)
+);
+
+statement ok
+SELECT IF(
+	spanner_params({'i': spanner_typed(INTERVAL '1 day', NULL)}) = '{"i":null}'
+	AND strpos(spanner_params({'i': spanner_typed(INTERVAL '1 day', 'INTERVAL')}), 'P1D') > 0,
+	1,
+	error('expected NULL INTERVAL type to stay null inside spanner_params')
 );
 
 statement ok

@@ -334,31 +334,6 @@ impl VScalar for SpannerTypedScalar {
 
         validate_spanner_value_type(&value_type, "spanner_typed", true)?;
 
-        if value_type.id() == LogicalTypeId::Interval {
-            let value_vec = input.flat_vector(0);
-            let type_vec = input.flat_vector(1);
-            let mut strings = Vec::with_capacity(len);
-            for row in 0..len {
-                let typ = if type_vec.row_is_null(row as u64) {
-                    "INTERVAL".to_string()
-                } else {
-                    read_varchar_at(&type_vec, row)?
-                };
-                if value_vec.row_is_null(row as u64) {
-                    let obj = json!({"value": null, "type": typ});
-                    strings.push(serde_json::to_string(&obj)?);
-                } else {
-                    let interval =
-                        unsafe { value_vec.as_slice_with_len::<duckdb_interval>(row + 1)[row] };
-                    let iso =
-                        duckdb_interval_to_iso8601(interval.months, interval.days, interval.micros);
-                    let obj = json!({"value": iso, "type": typ});
-                    strings.push(serde_json::to_string(&obj)?);
-                }
-            }
-            return write_string_array(&strings, output);
-        }
-
         let mut types: Vec<Option<String>> = Vec::with_capacity(len);
         {
             let type_vec = input.flat_vector(1);
@@ -373,6 +348,9 @@ impl VScalar for SpannerTypedScalar {
         let (value_is_json, child_is_json) = json_type_flags(&value_type);
         let mut strings: Vec<Option<String>> = Vec::with_capacity(len);
         for (row, typ) in types.into_iter().enumerate() {
+            // A NULL type argument is SQL NULL for every value type. INTERVAL
+            // must not substitute its own type name; an explicit non-NULL type
+            // still builds the envelope, including a typed NULL value.
             let Some(typ) = typ else {
                 strings.push(None);
                 continue;
@@ -1195,6 +1173,65 @@ mod tests {
         assert_eq!(
             duckdb_interval_to_iso8601(0, 0, -90 * 60 * 1_000_000),
             "PT-2H30M"
+        );
+    }
+
+    #[test]
+    fn test_spanner_typed_null_type_is_sql_null() {
+        let conn = open_test_connection();
+        for expression in [
+            "spanner_typed(INTERVAL '1 day', NULL)",
+            "spanner_typed(NULL::INTERVAL, NULL)",
+            "spanner_typed(42::BIGINT, NULL)",
+            "spanner_typed([INTERVAL '1 day'], NULL)",
+        ] {
+            let result: Option<String> = conn
+                .query_row(&format!("SELECT {expression}"), [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(result, None, "{expression}");
+        }
+
+        assert_eq!(
+            query_string(&conn, "spanner_typed(INTERVAL '1 day', 'INTERVAL')"),
+            r#"{"type":"INTERVAL","value":"P1D"}"#
+        );
+        assert_eq!(
+            query_string(&conn, "spanner_typed(NULL::INTERVAL, 'INTERVAL')"),
+            r#"{"type":"INTERVAL","value":null}"#
+        );
+
+        let mixed: String = conn
+            .query_row(
+                "SELECT string_agg(COALESCE(spanner_typed(v, t), 'NULL'), '|' ORDER BY i) FROM (
+                    SELECT * FROM (VALUES
+                        (1, INTERVAL '1 day', NULL::VARCHAR),
+                        (2, INTERVAL '1 day', 'INTERVAL'),
+                        (3, NULL::INTERVAL, NULL::VARCHAR),
+                        (4, NULL::INTERVAL, 'INTERVAL')
+                    ) rows(i, v, t)
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            mixed,
+            r#"NULL|{"type":"INTERVAL","value":"P1D"}|NULL|{"type":"INTERVAL","value":null}"#
+        );
+
+        assert_eq!(
+            query_string(
+                &conn,
+                "spanner_params({'i': spanner_typed(INTERVAL '1 day', NULL)})",
+            ),
+            r#"{"i":null}"#
+        );
+        assert_eq!(
+            query_string(
+                &conn,
+                "spanner_params({'i': spanner_typed(INTERVAL '1 day', 'INTERVAL')})",
+            ),
+            r#"{"i":{"type":"INTERVAL","value":"P1D"}}"#
         );
     }
 
