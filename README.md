@@ -610,7 +610,10 @@ See [DuckDB to Spanner type mapping](#duckdb-to-spanner-query-parameters) for th
 
 For cases where auto-detection is insufficient, specify the Spanner type name directly.
 The type name is validated when the query binds its parameters; an unknown or
-malformed name returns an error and is never silently sent as `STRING`.
+malformed name returns an error and is never silently sent as `STRING`. A NULL
+type name returns SQL NULL for every value, including `INTERVAL`. Use a
+non-NULL type name for an INTERVAL envelope, and
+`spanner_typed(NULL::INTERVAL, 'INTERVAL')` for a typed NULL interval.
 
 ```sql
 spanner_typed(NULL, 'INT64')    -- {"value":null,"type":"INT64"}
