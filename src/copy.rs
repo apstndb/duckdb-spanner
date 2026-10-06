@@ -418,6 +418,7 @@ unsafe fn copy_bind_inner(info: ffi::duckdb_copy_function_bind_info) -> Result<(
             None,
             emulator_host.as_deref(),
         )
+        .and_then(|profile| profile.with_tls_settings(cfg))
         .map_err(|error| error.to_string())?;
 
         let dialect = option_value(&opts, "dialect")

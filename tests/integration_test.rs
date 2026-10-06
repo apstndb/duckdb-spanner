@@ -1,4 +1,6 @@
+mod omni_tls;
 mod spanemuboost;
+mod tls_support;
 
 use std::ops::Deref;
 use std::sync::{Arc, OnceLock};

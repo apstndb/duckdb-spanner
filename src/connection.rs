@@ -5,6 +5,9 @@
 //! so passing an endpoint string alone is not enough to identify a connection.
 
 use std::fmt;
+use std::sync::Arc;
+
+use crate::tls::{TlsIdentity, TlsOptions, TlsSnapshot};
 
 /// Transport and credential behavior for a Spanner connection.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -47,6 +50,7 @@ pub(crate) struct ConnectionIdentity {
     authentication: AuthenticationMode,
     tls: TlsMode,
     sdk_emulator_mode: bool,
+    custom_tls: Option<TlsIdentity>,
 }
 
 #[cfg(test)]
@@ -84,6 +88,7 @@ pub(crate) struct ConnectionProfile {
     data_endpoint: Option<String>,
     explicit_admin_endpoint: Option<String>,
     sdk_emulator_mode: bool,
+    custom_tls: Option<Arc<TlsSnapshot>>,
 }
 
 impl ConnectionProfile {
@@ -161,7 +166,32 @@ impl ConnectionProfile {
             data_endpoint,
             explicit_admin_endpoint,
             sdk_emulator_mode,
+            custom_tls: None,
         })
+    }
+
+    /// Freeze validated TLS file contents before any data or schema cache lookup.
+    pub(crate) fn with_tls_settings(
+        mut self,
+        get: impl FnMut(&str) -> Option<String>,
+    ) -> Result<Self, ConnectionProfileError> {
+        self.custom_tls = TlsSnapshot::load(&self, &TlsOptions::from_settings(get))?;
+        Ok(self)
+    }
+
+    pub(crate) fn custom_tls(&self) -> Option<&TlsSnapshot> {
+        self.custom_tls.as_deref()
+    }
+
+    /// The pinned REST DatabaseAdmin client does not consume Spanner TlsConfig.
+    /// Fail before Admin/cache access rather than silently using different trust.
+    pub(crate) fn ensure_admin_transport(&self) -> Result<(), ConnectionProfileError> {
+        if self.custom_tls.is_some() {
+            return Err(ConnectionProfileError::new(
+                "Custom Omni TLS settings are unsupported for DDL/operations by the current DatabaseAdmin REST transport",
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn database_path(&self) -> &str {
@@ -222,6 +252,7 @@ impl ConnectionProfile {
             authentication: self.authentication(),
             tls: self.tls(),
             sdk_emulator_mode: self.sdk_emulator_mode,
+            custom_tls: self.custom_tls.as_ref().map(|tls| tls.identity().clone()),
         }
     }
 
@@ -230,13 +261,14 @@ impl ConnectionProfile {
     pub(crate) fn cache_key(&self) -> String {
         let identity = self.identity();
         format!(
-            "database={:?};mode={:?};endpoint={:?};auth={:?};tls={:?};sdk_emulator={}",
+            "database={:?};mode={:?};endpoint={:?};auth={:?};tls={:?};sdk_emulator={};custom_tls={:?}",
             identity.database_path,
             identity.endpoint_mode,
             identity.data_endpoint,
             identity.authentication,
             identity.tls,
             identity.sdk_emulator_mode,
+            identity.custom_tls,
         )
     }
 }
@@ -245,7 +277,7 @@ impl ConnectionProfile {
 pub(crate) struct ConnectionProfileError(String);
 
 impl ConnectionProfileError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self(message.into())
     }
 }

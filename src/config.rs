@@ -130,6 +130,22 @@ pub(crate) unsafe fn prepare_config_options() -> Result<PreparedConfigOptions, R
             "spanner_admin_endpoint",
             "Default Spanner admin REST endpoint",
         ),
+        (
+            crate::tls::ROOT_CA_OPTION,
+            "Experimental Omni HTTPS root CA PEM file (replaces default roots)",
+        ),
+        (
+            crate::tls::CLIENT_CERT_OPTION,
+            "Experimental Omni mTLS client certificate chain PEM file",
+        ),
+        (
+            crate::tls::CLIENT_KEY_OPTION,
+            "Experimental Omni mTLS client private key PEM file",
+        ),
+        (
+            crate::tls::SERVER_NAME_OPTION,
+            "Experimental Omni TLS verification server name override",
+        ),
     ];
     let mut options = Vec::with_capacity(specifications.len() + 1);
     for (name, description) in specifications {

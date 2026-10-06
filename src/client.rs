@@ -148,6 +148,9 @@ async fn create_client_inner(
     if profile.authentication() == AuthenticationMode::Anonymous {
         builder = builder.with_credentials(Anonymous::new().build());
     }
+    if let Some(tls) = profile.custom_tls() {
+        builder = builder.with_omni_tls(tls.sdk_config());
+    }
 
     let spanner = builder.build().await?;
 
