@@ -16,7 +16,7 @@ HEADER_MARKER_OFFSET = 224
 # and the header marker.
 FIXED_FIELDS = {
     "abi": (96, "C_STRUCT_UNSTABLE"),
-    "duckdb_version": (160, "v1.5.5"),
+    "duckdb_version": (160, "v1.5.6"),
     "header_marker": (HEADER_MARKER_OFFSET, "4"),
 }
 PLATFORM_FIELD_OFFSET = 192

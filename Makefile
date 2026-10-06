@@ -26,9 +26,9 @@ DUCKDB_VERSION_CHECK := scripts/check-duckdb-version.sh
 EMULATOR_NAME := spanner-emulator
 EMULATOR_IMAGE := gcr.io/cloud-spanner-emulator/emulator:1.5.56@sha256:18a56fd557011e50e1733a9232e8d17ec9bdd7e51f6cf7660f14c234479f4f36
 # This is the compile-time ABI target, not a caller-selectable metadata value.
-override DUCKDB_TARGET_VERSION := v1.5.5
+override DUCKDB_TARGET_VERSION := v1.5.6
 DUCKDB_TEST_HOST_VERSION := $(patsubst v%,%,$(DUCKDB_TARGET_VERSION))
-DUCKDB_MISMATCH_TEST_VERSION := 1.5.4
+DUCKDB_MISMATCH_TEST_VERSION := 1.5.5
 DUCKDB_BIN ?= duckdb
 DUCKDB_CLI_VERSION := $(shell "$(DUCKDB_BIN)" --version 2>/dev/null | sed -nE 's/^v?([0-9]+\.[0-9]+\.[0-9]+).*/v\1/p')
 

@@ -114,10 +114,10 @@ jobs:
     name: Build extension binaries
     needs: changes
     if: ${{ needs.changes.outputs.run_distribution == 'true' }}
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@401cc753a9251216567652ed06b456a20f74c9b0 # 401cc753a9251216567652ed06b456a20f74c9b0
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@969bc76276acec1c0a3922ff500d2ec3a1a3b037 # 969bc76276acec1c0a3922ff500d2ec3a1a3b037
     with:
-      duckdb_version: v1.5.5
-      ci_tools_version: 401cc753a9251216567652ed06b456a20f74c9b0
+      duckdb_version: v1.5.6
+      ci_tools_version: 969bc76276acec1c0a3922ff500d2ec3a1a3b037
       extension_name: spanner
       extra_toolchains: rust;python3
       reduced_ci_mode: ${{ needs.changes.outputs.reduced_ci_mode }}
@@ -148,7 +148,7 @@ jobs:
 
       - name: Offline release smoke profile
         env:
-          DUCKDB_TEST_VERSION: 1.5.5
+          DUCKDB_TEST_VERSION: 1.5.6
         run: make community_smoke
 
       - name: SQLLogicTest (make test_release)

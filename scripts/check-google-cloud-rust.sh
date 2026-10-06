@@ -65,4 +65,20 @@ for forbidden_package in aws-lc-rs aws-lc-sys; do
   fi
 done
 
-echo "google-cloud-rust revisions aligned; aws-lc is absent from normal dependencies"
+# The Spanner crate now defaults to a background Cloud Monitoring exporter.
+# Keep it and base64 0.23's unsafe SIMD implementation out of production builds.
+normal_feature_tree="$(
+  cargo tree --locked --edges normal,features --target all --prefix none --format '{p} {f}'
+)"
+for forbidden_feature in 'google-cloud-spanner v.*builtin-metrics' 'base64 v0\.23\.[^ ]+ .*simd-unsafe'; do
+  if grep -E "^${forbidden_feature}" <<<"$normal_feature_tree"; then
+    echo "error: normal production dependencies enable a forbidden feature: $forbidden_feature" >&2
+    exit 1
+  fi
+done
+if grep -E '^google-cloud-monitoring-v3 v' <<<"$normal_dependency_tree"; then
+  echo "error: normal production dependencies contain Cloud Monitoring" >&2
+  exit 1
+fi
+
+echo "google-cloud-rust revisions aligned; aws-lc, built-in metrics, and unsafe base64 SIMD are absent from normal dependencies"
