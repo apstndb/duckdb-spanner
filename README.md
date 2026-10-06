@@ -36,10 +36,13 @@ brew install cargo-sweep
   DuckDB exposes no stable public removal API or shared registration transaction for config, COPY, scalar, table-function, and replacement-scan registration. The macro transaction is the only stage this initializer can roll back. An unexpected later registration failure can therefore leave earlier native registrations in the database catalog. A fresh load attempt still fails deterministically because config registration precedes every later mutation and is found by preflight; function and macro residues are preflighted as additional defense. `duckdb_add_replacement_scan` returns no status and has no removal API, so initialization cannot verify or roll it back and installs it only after every status-returning stage succeeds.
   Version 0.4.0 intentionally consolidates the Rust registration API as the breaking `register_spanner_extension(db, raw_con, &connection) -> Result<(), RegistrationError>`. The former public split-stage helpers are no longer exposed because calling them independently could bypass preflight and leave a misleading partial surface. Both supplied connections must be in autocommit mode; registration independently detects and rejects caller-owned transactions on `raw_con` and the Rust connection before any mutation.
 
-- DuckDB `VARIANT` is not used yet.
-  Spanner JSON results currently map to DuckDB `VARCHAR` with the `JSON` alias.
-  DuckDB `v1.5.6` and duckdb-rs `1.10506.0` expose `VARIANT` metadata, and upstream DuckDB has C API support for reading `VARIANT`, but duckdb-rs still documents decoding `VARIANT` result columns as unsupported and this extension does not yet have a safe writer path for JSON-to-`VARIANT`.
-  Changing JSON output to `VARIANT` would also be a visible result-type change.
+- Native results remain the default, including Spanner JSON mapped to DuckDB `JSON`.
+  The explicit `spanner_query_variant` and `spanner_scan_variant` table macros cast
+  native columns to `VARIANT` in DuckDB; no private vector writer is involved.
+  This representation intentionally merges JSON null and SQL NULL and does not
+  preserve all original type metadata. See [optional VARIANT results](#optional-variant-results).
+  The Rust binding still cannot decode raw VARIANT columns directly; Rust callers
+  should cast selected values to a supported native type before reading them.
 
 - DuckDB `GEOMETRY` is not used yet.
   DuckDB 1.5 exposes `GEOMETRY` in the C API, and duckdb-rs `1.10506.0` exposes it as WKB with CRS metadata, but this extension has no current Spanner type mapping that requires geometry output.
@@ -308,6 +311,53 @@ Reads all rows from a table using the Spanner Read API.
 ```sql
 SELECT * FROM spanner_scan('Users', index := 'UsersByName');
 ```
+
+### Optional VARIANT results
+
+The experimental `spanner_query_variant` and `spanner_scan_variant` accept the same options as
+`spanner_query` and `spanner_scan`, respectively. They preserve column names/order
+and cast every result column to DuckDB `VARIANT`, including parsed JSON. Query
+`params` still accepts a native STRUCT. Scans still use the Spanner Read API.
+
+```sql
+SELECT Id::BIGINT, Payload.customer::VARCHAR
+FROM spanner_query_variant('SELECT Id, Payload FROM Events');
+
+SELECT Id::BIGINT, StringCol::VARCHAR
+FROM spanner_scan_variant('ScalarTypes', parallelism_mode := 'off');
+```
+
+This opt-in changes SQL semantics: JSON `null` and SQL NULL both test as NULL,
+including nested positions. `IS NULL` and `COUNT(value)` may therefore change.
+Null members/array positions remain present, but their original categories
+cannot be recovered. Typed NULL subtypes and complete declared container schemas
+are not carried by the value alone. JSON-looking STRING values remain strings.
+Use native results when preserving these distinctions is required.
+
+DuckDB may also promote native operands to VARIANT when combining them with
+VARIANT values in `CASE`, `COALESCE`, or set operations. Cast/extract explicitly
+when the combined expression needs a particular native type.
+
+On DuckDB 1.5.6, use `value::JSON` to serialize a VARIANT object/array to JSON;
+`to_json(value)` may instead encode its display string. Casting a VARIANT null to
+JSON yields JSON `null` and does not restore whether the source was SQL NULL.
+
+For selective conversion or JSON exclusion, use explicit projection:
+
+```sql
+SELECT COLUMNS(* EXCLUDE (Payload))::VARIANT, Payload
+FROM spanner_query('SELECT Id, Payload FROM Events');
+```
+
+Keep an entire JSON-bearing ARRAY/STRUCT column native when preserving nested
+null distinctions. `Payload::VARCHAR::VARIANT` is an alternative that stores JSON
+as opaque text, requiring explicit parsing before object access. Neither recipe
+is an implicit extension setting.
+
+These are output wrappers; scalar parameter helpers and `COPY ... FORMAT spanner`
+do not infer Spanner types from VARIANT. Cast to explicitly known native types or
+use native results for writes. Export compatibility also depends on the value:
+DuckDB 1.5.6 cannot export an INTERVAL-valued VARIANT as Parquet VARIANT.
 
 ### Replacement Scan
 

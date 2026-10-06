@@ -163,6 +163,8 @@ const FUNCTION_NAMES: &[&str] = &[
     "spanner_operations_raw",
     "spanner_tables",
     "spanner_query",
+    "spanner_query_variant",
+    "spanner_scan_variant",
     "spanner_ddl",
     "spanner_ddl_async",
     "spanner_operations",
@@ -1204,18 +1206,22 @@ HRVeBmUqB9ZvD2iFzjibxg==
 
     #[test]
     fn function_conflicts_are_preflighted_before_registration() {
-        {
+        for name in [
+            "spanner_query",
+            "spanner_query_variant",
+            "spanner_scan_variant",
+        ] {
             let handles = open_registration_handles();
             let db = handles.database();
             let raw_con = handles.raw_connection();
             let con = handles.connection();
-            con.execute_batch("CREATE MACRO spanner_query(x) AS x")
+            con.execute_batch(&format!("CREATE MACRO {name}(x) AS x"))
                 .unwrap();
 
             let mut initialization = Initialization::new();
             let error = initialization.run(db, raw_con, con).unwrap_err();
             assert_eq!(error.stage, "preflight function");
-            assert_eq!(error.name, "spanner_query");
+            assert_eq!(error.name, name);
             let settings_count: i64 = con
                 .query_row(
                     "SELECT count(*) FROM duckdb_settings() WHERE name LIKE 'spanner_%'",
@@ -1412,12 +1418,81 @@ HRVeBmUqB9ZvD2iFzjibxg==
 
         let count: i64 = con
             .query_row(
-                "SELECT count(*) FROM duckdb_functions() WHERE function_name = 'spanner_query'",
+                "SELECT count(*) FROM duckdb_functions() WHERE function_name IN ('spanner_query', 'spanner_query_variant', 'spanner_scan_variant')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn variant_wrappers_expose_native_option_names() {
+        let handles = open_registration_handles();
+        let mut initialization = Initialization::new();
+        initialization
+            .run(
+                handles.database(),
+                handles.raw_connection(),
+                handles.connection(),
+            )
+            .unwrap();
+        for (native, wrapper) in [
+            ("spanner_query", "spanner_query_variant"),
+            ("spanner_scan", "spanner_scan_variant"),
+        ] {
+            // Ignore the positional argument's label/order; every named option
+            // must remain available as the native surface evolves.
+            let matches: bool = handles.connection().query_row(
+                "SELECT (SELECT list_sort(parameters[2:]) FROM duckdb_functions() WHERE function_name = ?) = \
+                 (SELECT list_sort(parameters[2:]) FROM duckdb_functions() WHERE function_name = ?)",
+                [native, wrapper], |row| row.get(0),
+            ).unwrap();
+            assert!(matches, "named options drifted for {wrapper}");
+        }
+    }
+
+    #[test]
+    fn variant_wrappers_forward_option_validation_before_connecting() {
+        let handles = open_registration_handles();
+        let con = handles.connection();
+        let mut initialization = Initialization::new();
+        initialization
+            .run(handles.database(), handles.raw_connection(), con)
+            .unwrap();
+        con.execute_batch(
+            "SET spanner_database_path = 'projects/p/instances/i/databases/d'; \
+                           SET spanner_endpoint = 'http://127.0.0.1:1'",
+        )
+        .unwrap();
+        for (sql, expected) in [
+            (
+                "SELECT * FROM spanner_query_variant('SELECT 1', parallelism_mode := 'invalid')",
+                "parallelism_mode",
+            ),
+            (
+                "SELECT * FROM spanner_scan_variant('T', dialect := 'invalid')",
+                "dialect",
+            ),
+            (
+                "SELECT * FROM spanner_query_variant('SELECT 1', exact_staleness_secs := -1)",
+                "exact_staleness_secs",
+            ),
+            (
+                "SELECT * FROM spanner_scan_variant('T', parallelism_mode := 'off', use_data_boost := true)",
+                "use_data_boost=true requires parallelism_mode='required'",
+            ),
+        ] {
+            let error = con.prepare(sql).unwrap_err().to_string();
+            assert!(
+                error.contains(expected),
+                "unexpected forwarded error: {error}"
+            );
+            assert!(
+                !error.contains("connect"),
+                "option was not checked before connection: {error}"
+            );
+        }
     }
 
     #[test]
@@ -1441,12 +1516,12 @@ HRVeBmUqB9ZvD2iFzjibxg==
             assert_eq!(interval, "P1D");
             let macro_count: i64 = con
                 .query_row(
-                    "SELECT count(*) FROM duckdb_functions() WHERE function_name = 'spanner_query' AND function_type = 'table_macro'",
+                    "SELECT count(*) FROM duckdb_functions() WHERE function_name IN ('spanner_query', 'spanner_query_variant', 'spanner_scan_variant') AND function_type = 'table_macro'",
                     [],
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(macro_count, 1);
+            assert_eq!(macro_count, 3);
         }
     }
 }

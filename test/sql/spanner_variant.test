@@ -1,0 +1,81 @@
+# name: test/sql/spanner_variant.test
+# description: Explicit VARIANT result wrappers and their lossy null contract
+# group: [spanner]
+
+require spanner
+
+require-env SPANNER_EMULATOR_HOST
+
+statement ok
+SET allow_extensions_metadata_mismatch=true;
+
+statement ok
+SET spanner_database_path='projects/test-project/instances/test-instance/databases/test-db';
+
+statement ok
+SET spanner_endpoint='${SPANNER_EMULATOR_HOST}';
+
+# Native output still distinguishes JSON null from SQL NULL.
+statement ok
+SELECT IF(NativeJ IS NULL OR NativeN IS NOT NULL, error('native JSON null distinction changed'), 1)
+FROM spanner_query('SELECT JSON ''null'' AS NativeJ,CAST(NULL AS JSON) AS NativeN',parallelism_mode:='off');
+
+# The optional representation deliberately collapses both categories.
+statement ok
+SELECT IF(J IS NULL AND N IS NULL AND typeof(J)='VARIANT',1,error('VARIANT null contract failed'))
+FROM spanner_query_variant('SELECT JSON ''null'' AS J,CAST(NULL AS JSON) AS N',parallelism_mode:='off');
+
+# JSON-looking STRING values must remain strings, including old envelopes.
+statement ok
+SELECT IF(variant_typeof(S)='VARCHAR' AND S::VARCHAR='{"type":"INT64","value":"42"}',1,error('ordinary STRING was promoted'))
+FROM spanner_query_variant('SELECT ''{"type":"INT64","value":"42"}'' AS S',parallelism_mode:='off');
+
+# Exact numeric values retain their typed representation and precision.
+statement ok
+SELECT IF(I::BIGINT=9007199254740993 AND D::DECIMAL(38,9)=9007199254740993.123456789,1,error('exact numeric value changed'))
+FROM spanner_query_variant('SELECT CAST(9007199254740993 AS INT64) AS I,NUMERIC ''9007199254740993.123456789'' AS D',parallelism_mode:='off');
+
+statement ok
+SELECT IF(A[1] IS NULL AND A[2] IS NULL AND variant_typeof(A)='ARRAY(2)',1,error('nested null positions changed'))
+FROM spanner_query_variant('SELECT [JSON ''null'',CAST(NULL AS JSON)] AS A',parallelism_mode:='off');
+
+statement ok
+SELECT IF(O::JSON::VARCHAR='{"a":null}',1,error('JSON object CAST failed'))
+FROM spanner_query_variant('SELECT JSON ''{"a":null}'' AS O',parallelism_mode:='off');
+
+# STRUCT params are passed once through the native parameter converter.
+statement ok
+SELECT IF(count=1,1,error('STRUCT params were not forwarded')) FROM
+(SELECT COUNT(*) count FROM spanner_query_variant('SELECT Id FROM ScalarTypes WHERE Id > @minimum',params:={'minimum':2::BIGINT},parallelism_mode:='off'));
+
+statement ok
+SELECT IF(count=0,1,error('empty variant query lost cardinality')) FROM
+(SELECT COUNT(*) count FROM spanner_query_variant('SELECT Id FROM EmptyTable',parallelism_mode:='off'));
+
+statement ok
+SELECT IF(count=0,1,error('empty variant scan lost cardinality')) FROM
+(SELECT COUNT(*) count FROM spanner_scan_variant('EmptyTable',parallelism_mode:='off'));
+
+statement ok
+SELECT IF(Id::BIGINT=1 AND BoolCol::BOOLEAN AND StringCol::VARCHAR='hello' AND DateCol::DATE=DATE '2024-01-15',1,error('variant scan values changed'))
+FROM spanner_scan_variant('ScalarTypes',parallelism_mode:='off',dialect:='googlesql',priority:='low') WHERE Id::BIGINT=1;
+
+statement ok
+SELECT IF(count=3,1,error('zero-column projection lost scan rows')) FROM
+(SELECT COUNT(*) count FROM spanner_scan_variant('ScalarTypes',parallelism_mode:='off'));
+
+statement ok
+SELECT IF(Id::BIGINT=2,1,error('single-column projection changed'))
+FROM (SELECT Id FROM spanner_scan_variant('ScalarTypes',parallelism_mode:='off')) WHERE Id::BIGINT=2;
+
+statement ok
+SELECT IF(NumCol::DECIMAL(38,9)=123.456789 AND strpos(JsonCol::JSON::VARCHAR,'key')>0,1,error('numeric/JSON scan conversion failed'))
+FROM spanner_scan_variant('NumericTypes',parallelism_mode:='off') WHERE Id::BIGINT=1;
+
+statement ok
+SELECT IF(IntArray::BIGINT[]=[10,20,30] AND StrArray::VARCHAR[]=['a','b','c'],1,error('ARRAY scan conversion failed'))
+FROM spanner_scan_variant('ArrayTypes',parallelism_mode:='off') WHERE Id::BIGINT=1;
+
+statement ok
+SELECT IF(StringCol IS NULL AND Int64Col IS NULL,1,error('native NULL scan conversion failed'))
+FROM spanner_scan_variant('ScalarTypes',parallelism_mode:='off') WHERE Id::BIGINT=3;
