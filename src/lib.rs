@@ -16,6 +16,7 @@ mod scan;
 mod schema;
 mod streaming;
 mod tables;
+mod tls;
 mod types;
 mod vector_size;
 mod vtab_safety;
@@ -148,6 +149,10 @@ const CONFIG_OPTION_NAMES: &[&str] = &[
     "spanner_endpoint",
     "spanner_endpoint_mode",
     "spanner_admin_endpoint",
+    tls::ROOT_CA_OPTION,
+    tls::CLIENT_CERT_OPTION,
+    tls::CLIENT_KEY_OPTION,
+    tls::SERVER_NAME_OPTION,
     "spanner_stream_idle_timeout_secs",
 ];
 

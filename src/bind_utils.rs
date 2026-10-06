@@ -311,6 +311,7 @@ pub(crate) fn resolve_connection_profile(
         admin_endpoint,
         emulator_host.as_deref(),
     )
+    .and_then(|profile| profile.with_tls_settings(|name| config::get_config_string(bind, name)))
     .map_err(Into::into)
 }
 

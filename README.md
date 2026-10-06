@@ -189,7 +189,7 @@ For emulator access, no authentication is required. Either set the environment v
 export SPANNER_EMULATOR_HOST=localhost:9010
 ```
 
-Use `endpoint_mode := 'emulator'` when the profile should be explicit. `custom` requires an HTTPS endpoint and ADC. `omni` selects the official client's Omni instance type and uses anonymous credentials and HTTPS unless its endpoint explicitly starts with `http://`. Explicit non-emulator modes (`default`, `custom`, and `omni`) reject `SPANNER_EMULATOR_HOST`; unset it before selecting one. Omni TLS uses the system trust store. Custom CA certificates and mTLS are not currently configurable through the pinned official Rust client builder.
+Use `endpoint_mode := 'emulator'` when the profile should be explicit. `custom` requires an HTTPS endpoint and ADC. `omni` selects the official client's Omni instance type and uses anonymous credentials and HTTPS unless its endpoint explicitly starts with `http://`. Explicit non-emulator modes (`default`, `custom`, and `omni`) reject `SPANNER_EMULATOR_HOST`; unset it before selecting one. Omni HTTPS uses default trust unless the experimental [custom TLS settings](#omni-custom-tls) are supplied.
 
 `admin_endpoint` (or `spanner_admin_endpoint`) overrides the admin endpoint used by DDL and operation helpers. Emulator mode preserves the data endpoint's scheme and maps the conventional data port `9010` to `9020`; custom and Omni modes use the data endpoint for admin requests by default. Custom admin requests use ADC and HTTPS, while Omni admin requests are anonymous and use the data endpoint's scheme. An explicit admin endpoint must use HTTPS for authenticated `default` and `custom` profiles. Real Spanner uses its authenticated Database Admin client when no emulator admin endpoint applies.
 
@@ -287,6 +287,45 @@ SELECT * FROM spanner_query('SELECT * FROM Users');
 Repository CI does not provision a Spanner Omni deployment. Before production
 rollout, validate query and DDL operations against the target deployment,
 including its system trust-store and TLS configuration.
+
+### Omni custom TLS
+
+Experimental session settings enable private CA trust and mutual TLS for Omni
+**data RPCs** (query, Read API scan, metadata and COPY):
+
+```sql
+SET spanner_endpoint_mode = 'omni';
+SET spanner_endpoint = 'https://omni.example:443';
+SET spanner_tls_root_ca_file = '/path/to/ca.pem';
+SET spanner_tls_client_cert_file = '/path/to/client-chain.pem';
+SET spanner_tls_client_key_file = '/path/to/client-key.pem';
+SET spanner_tls_server_name = 'omni.example';
+```
+
+All four settings default to empty/unset. The client certificate/key are a pair;
+the root CA and server-name override are independently optional. A custom CA
+bundle replaces the SDK's default roots rather than adding to them. The override
+sets TLS verification/SNI; it does not disable verification or change the RPC
+target. Any custom TLS setting requires an Omni HTTPS profile. Clear the settings
+before switching to a cloud/custom/emulator target.
+
+At bind, the extension loads local regular PEM files (at most 1 MiB each), parses
+certificates/keys and proves that the client key matches its certificate before
+cache lookup. Invalid material, missing files and incomplete pairs fail as SQL
+errors. Cache identity uses public certificate/trust fingerprints and server name,
+not file paths or private-key bytes/digests. Files are not reread by an already
+bound statement: rebind/reprepare to apply rotation. In-flight clients retain the
+old snapshot. Private keys remain in memory through the SDK transport; no secure
+erasure guarantee is made. Filesystem latency is outside the network timeout.
+
+The pinned DatabaseAdmin REST client does not use the data client's TLS config.
+DDL and operation helpers therefore reject a custom-TLS profile before Admin
+cache/network access, including when `admin_endpoint` is explicitly supplied.
+There is no default-trust or plaintext fallback. Admin custom TLS needs a separate
+supported transport implementation.
+
+CI exercises the public extension over locally generated TLS/mTLS gRPC servers;
+it does not provision an actual Omni deployment or establish deployment support.
 
 ## Table Functions
 
@@ -425,6 +464,10 @@ Session-level defaults can be set via `SET` statements. These are used when the 
 | `spanner_endpoint` | VARCHAR | Default gRPC endpoint |
 | `spanner_endpoint_mode` | VARCHAR | Default connection profile: `default`, `emulator`, `custom`, or `omni` |
 | `spanner_admin_endpoint` | VARCHAR | Default admin endpoint for DDL/operations; mode determines credentials and default scheme |
+| `spanner_tls_root_ca_file` | VARCHAR | Experimental Omni HTTPS root CA bundle PEM file |
+| `spanner_tls_client_cert_file` | VARCHAR | Experimental Omni mTLS client certificate chain PEM file |
+| `spanner_tls_client_key_file` | VARCHAR | Experimental Omni mTLS private key PEM file; paired with the client certificate |
+| `spanner_tls_server_name` | VARCHAR | Experimental Omni TLS verification/SNI name override |
 | `spanner_stream_idle_timeout_secs` | BIGINT | Per-next-batch query/scan idle timeout in seconds (default `900`, `0` disables, maximum `31536000`) |
 
 ### Database Resolution
@@ -896,6 +939,10 @@ This extension registers the following names into the global DuckDB namespace.
 | `spanner_endpoint` | VARCHAR | Default gRPC endpoint |
 | `spanner_endpoint_mode` | VARCHAR | Default connection profile |
 | `spanner_admin_endpoint` | VARCHAR | Default admin endpoint for DDL/operations |
+| `spanner_tls_root_ca_file` | VARCHAR | Experimental Omni HTTPS root CA PEM file |
+| `spanner_tls_client_cert_file` | VARCHAR | Experimental Omni mTLS certificate chain PEM file |
+| `spanner_tls_client_key_file` | VARCHAR | Experimental Omni mTLS private key PEM file |
+| `spanner_tls_server_name` | VARCHAR | Experimental Omni verification/SNI name override |
 | `spanner_stream_idle_timeout_secs` | BIGINT | Query/scan idle timeout seconds (default `900`, `0` disables, maximum `31536000`) |
 
 ### Convenience Macro Pattern

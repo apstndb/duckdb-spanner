@@ -46,8 +46,13 @@ base64 = "0.22"
 serde_json = "1"
 reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+ring = "0.17"
 
 [dev-dependencies]
 testcontainers = "0.28"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 duckdb = { version = "=1.10506.0", features = ["bundled", "vtab", "vscalar", "json"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+spanner-grpc-mock = { git = "https://github.com/googleapis/google-cloud-rust", rev = "2a03d923a0d56114e15cc7404de33992111c854b" }
+tonic = { version = "=0.14.6", default-features = false, features = ["transport", "codegen", "tls-ring"] }
+tokio-stream = { version = "0.1", features = ["net"] }

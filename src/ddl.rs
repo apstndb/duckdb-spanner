@@ -816,6 +816,9 @@ static ADMIN_CLIENT_CACHE: LazyLock<Arc<Mutex<ClientCache<DatabaseAdmin>>>> = La
 async fn get_or_create_admin_client(
     profile: &ConnectionProfile,
 ) -> Result<Arc<DatabaseAdmin>, SpannerError> {
+    profile
+        .ensure_admin_transport()
+        .map_err(|error| SpannerError::Other(error.to_string()))?;
     let admin_endpoint = profile.admin_endpoint();
     let authentication = profile.authentication();
     let cache_key = format!(
@@ -1560,6 +1563,7 @@ impl VTab for SpannerDdlVTab {
         vtab_safety::guard_callback("SpannerDdlVTab", "bind", || {
             let statements = ddl_statements_from_bind(bind)?;
             let profile = bind_utils::resolve_connection_profile(bind)?;
+            profile.ensure_admin_transport()?;
 
             bind.add_result_column(
                 "operation_name",
@@ -1705,6 +1709,7 @@ impl VTab for SpannerDdlAsyncVTab {
         vtab_safety::guard_callback("SpannerDdlAsyncVTab", "bind", || {
             let statements = ddl_statements_from_bind(bind)?;
             let profile = bind_utils::resolve_connection_profile(bind)?;
+            profile.ensure_admin_transport()?;
 
             bind.add_result_column(
                 "operation_name",
@@ -1830,6 +1835,7 @@ impl VTab for SpannerOperationsVTab {
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
         vtab_safety::guard_callback("SpannerOperationsVTab", "bind", || {
             let profile = bind_utils::resolve_connection_profile(bind)?;
+            profile.ensure_admin_transport()?;
             let filter = bind_utils::get_named_string(bind, "filter");
 
             bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
