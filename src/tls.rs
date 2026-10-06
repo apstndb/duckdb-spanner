@@ -227,7 +227,7 @@ fn digest<'a>(chunks: impl Iterator<Item = &'a [u8]>) -> [u8; 32] {
 }
 
 #[cfg(test)]
-#[path = "../tests/tls_support.rs"]
+#[path = "../tests/tls_support/mod.rs"]
 mod test_support;
 
 #[cfg(test)]
