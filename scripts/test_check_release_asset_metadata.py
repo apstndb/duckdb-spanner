@@ -207,7 +207,7 @@ class FooterTests(unittest.TestCase):
                     {
                         "abi": "C_STRUCT_UNSTABLE",
                         "extension_version": "0.4.1",
-                        "duckdb_version": "v1.5.5",
+                        "duckdb_version": "v1.5.6",
                         "platform": platform,
                         "header_marker": "4",
                     },

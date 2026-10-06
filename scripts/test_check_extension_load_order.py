@@ -13,8 +13,8 @@ SPEC.loader.exec_module(load_order)
 
 class ExactVersionTests(unittest.TestCase):
     def test_rejects_an_unexpected_host(self) -> None:
-        with self.assertRaisesRegex(RuntimeError, "expected DuckDB 1.5.5"):
-            load_order.assert_exact_duckdb_version("1.5.4", "1.5.5")
+        with self.assertRaisesRegex(RuntimeError, "expected DuckDB 1.5.6"):
+            load_order.assert_exact_duckdb_version("1.5.5", "1.5.6")
 
 
 class AutocompleteStateTests(unittest.TestCase):
@@ -70,7 +70,7 @@ class WorkerCommandTests(unittest.TestCase):
         extension_directory = Path("/tmp/extensions")
         with mock.patch.object(load_order.sys, "executable", "/tmp/python"):
             command = load_order.worker_command(
-                artifact, extension_directory, "1.5.5", "spanner-first"
+                artifact, extension_directory, "1.5.6", "spanner-first"
             )
 
         self.assertEqual(command[0], "/tmp/python")
@@ -79,7 +79,7 @@ class WorkerCommandTests(unittest.TestCase):
             command[-6:],
             [
                 "--expected-duckdb-version",
-                "1.5.5",
+                "1.5.6",
                 "--extension-directory",
                 str(extension_directory),
                 "--worker-order",

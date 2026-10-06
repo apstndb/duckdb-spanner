@@ -8,7 +8,7 @@ Both **GoogleSQL** and **PostgreSQL** dialect databases are supported transparen
 
 ## Prerequisites
 
-- [Rust](https://rustup.rs/) 1.88 or later
+- [Rust](https://rustup.rs/) 1.91 or later
 - [DuckDB](https://duckdb.org/docs/installation/) CLI (for running the extension)
 - Python 3 (for `make extension` metadata appending)
 - Make
@@ -22,27 +22,27 @@ brew install cargo-sweep
 
 ## Known Issues and Limitations
 
-- The DuckDB Rust binding is pinned to `duckdb = "=1.10505.0"`, which matches DuckDB `v1.5.5`.
+- The DuckDB Rust binding is pinned to `duckdb = "=1.10506.0"`, which matches DuckDB `v1.5.6`.
   The upstream Rust extension template still requires the unstable C API (`USE_UNSTABLE_C_API=1` / `C_STRUCT_UNSTABLE`), so loadable extension binaries remain tied to the DuckDB version encoded in the extension metadata.
   The extension requests at least the DuckDB `v1.5.0` C API at load time because it uses C API functions added in the 1.5 line.
-  The Makefile has one canonical ABI target, DuckDB `v1.5.5`, for both local and distribution builds. Local metadata generation checks the detected CLI version before compiling and rejects a mismatched `DUCKDB_VERSION` override; an override cannot relabel a binary built for another DuckDB version.
+  The Makefile has one canonical ABI target, DuckDB `v1.5.6`, for both local and distribution builds. Local metadata generation checks the detected CLI version before compiling and rejects a mismatched `DUCKDB_VERSION` override; an override cannot relabel a binary built for another DuckDB version.
 
 - This project depends on the official [googleapis/google-cloud-rust](https://github.com/googleapis/google-cloud-rust) Spanner crates.
   Partitioned reads and queries use the official partition APIs; no local client fork is required.
 
 - Extension initialization is intentionally manual rather than using `#[duckdb_entrypoint_c_api]`.
   The extension needs a raw `duckdb_connection` to register session config options and the `COPY TO ... FORMAT spanner` copy function, and duckdb-rs currently exposes those APIs only through `duckdb::ffi`.
-  Initialization preflights config, scalar, table-function, and macro names through `duckdb_settings()` and `duckdb_functions()`, prepares every native C API builder before mutation, then checks every registration status and reaches `Ready` only after all required stages complete. Config options are the first mutation and therefore form a preflight-visible retry barrier. COPY follows because DuckDB exposes no stable public COPY-function catalog lookup and permits duplicate COPY names; putting it after config guarantees that a failed attempt cannot leave COPY as the only residue. Loading this extension claims the global COPY format name `spanner`. DuckDB 1.5.5 silently replaces an existing handler with that name, and the stable C API cannot detect the collision; load order therefore determines ownership. A successful COPY registration status proves that this handler was installed, not that the name was previously unused. Scalars follow before table functions so a native registration failure cannot leave a higher-level SQL surface that appears usable. duckdb-rs does not expose separate prepare or unregister operations for table functions, so a table-function failure can still leave the C registrations and earlier table functions. SQL macros are installed as one rollback-capable transaction after their dependencies, and the replacement scan is last.
+  Initialization preflights config, scalar, table-function, and macro names through `duckdb_settings()` and `duckdb_functions()`, prepares every native C API builder before mutation, then checks every registration status and reaches `Ready` only after all required stages complete. Config options are the first mutation and therefore form a preflight-visible retry barrier. COPY follows because DuckDB exposes no stable public COPY-function catalog lookup and permits duplicate COPY names; putting it after config guarantees that a failed attempt cannot leave COPY as the only residue. Loading this extension claims the global COPY format name `spanner`. DuckDB 1.5.6 silently replaces an existing handler with that name, and the stable C API cannot detect the collision; load order therefore determines ownership. A successful COPY registration status proves that this handler was installed, not that the name was previously unused. Scalars follow before table functions so a native registration failure cannot leave a higher-level SQL surface that appears usable. duckdb-rs does not expose separate prepare or unregister operations for table functions, so a table-function failure can still leave the C registrations and earlier table functions. SQL macros are installed as one rollback-capable transaction after their dependencies, and the replacement scan is last.
   DuckDB exposes no stable public removal API or shared registration transaction for config, COPY, scalar, table-function, and replacement-scan registration. The macro transaction is the only stage this initializer can roll back. An unexpected later registration failure can therefore leave earlier native registrations in the database catalog. A fresh load attempt still fails deterministically because config registration precedes every later mutation and is found by preflight; function and macro residues are preflighted as additional defense. `duckdb_add_replacement_scan` returns no status and has no removal API, so initialization cannot verify or roll it back and installs it only after every status-returning stage succeeds.
   Version 0.4.0 intentionally consolidates the Rust registration API as the breaking `register_spanner_extension(db, raw_con, &connection) -> Result<(), RegistrationError>`. The former public split-stage helpers are no longer exposed because calling them independently could bypass preflight and leave a misleading partial surface. Both supplied connections must be in autocommit mode; registration independently detects and rejects caller-owned transactions on `raw_con` and the Rust connection before any mutation.
 
 - DuckDB `VARIANT` is not used yet.
   Spanner JSON results currently map to DuckDB `VARCHAR` with the `JSON` alias.
-  DuckDB `v1.5.5` and duckdb-rs `1.10505.0` expose `VARIANT` metadata, and upstream DuckDB has C API support for reading `VARIANT`, but duckdb-rs still documents decoding `VARIANT` result columns as unsupported and this extension does not yet have a safe writer path for JSON-to-`VARIANT`.
+  DuckDB `v1.5.6` and duckdb-rs `1.10506.0` expose `VARIANT` metadata, and upstream DuckDB has C API support for reading `VARIANT`, but duckdb-rs still documents decoding `VARIANT` result columns as unsupported and this extension does not yet have a safe writer path for JSON-to-`VARIANT`.
   Changing JSON output to `VARIANT` would also be a visible result-type change.
 
 - DuckDB `GEOMETRY` is not used yet.
-  DuckDB 1.5 exposes `GEOMETRY` in the C API, and duckdb-rs `1.10505.0` exposes it as WKB with CRS metadata, but this extension has no current Spanner type mapping that requires geometry output.
+  DuckDB 1.5 exposes `GEOMETRY` in the C API, and duckdb-rs `1.10506.0` exposes it as WKB with CRS metadata, but this extension has no current Spanner type mapping that requires geometry output.
 
 - GoogleSQL `DATETIME` is unsupported until the Spanner data-plane API exposes a lossless type representation. It is never silently mapped to `STRING`.
 
@@ -96,7 +96,7 @@ exact annotated release-tag commit. Dispatch the **Stage Release Assets**
 workflow at that tag ref, providing the tag and source run ID. The workflow
 requires its dispatch ref, tag, source run, and empty draft release to agree on
 that commit, smoke-loads five platform artifacts on matching native DuckDB
-`v1.5.5` runners, packages each verified binary as the sole canonical member of
+`v1.5.6` runners, packages each verified binary as the sole canonical member of
 a platform ZIP, generates `SHA256SUMS` for those archives, and attaches them to
 the draft. Before upload, it creates GitHub/Sigstore build-provenance
 attestations for the six final ZIPs and `SHA256SUMS`. These attestations bind the
@@ -115,7 +115,7 @@ replaced by a release event; releases created outside this flow receive no
 automatic assets.
 
 Each platform archive includes its target platform in the asset name, for
-example `spanner-v1.5.5-linux_amd64.zip`. Every archive contains exactly one
+example `spanner-v1.5.6-linux_amd64.zip`. Every archive contains exactly one
 file named `spanner.duckdb_extension`. Keep that canonical filename when
 extracting it: DuckDB derives the extension initialization symbol from the
 filename. Verify the ZIP against `SHA256SUMS`, extract it into an empty
@@ -124,7 +124,7 @@ directory, and load that sole member without renaming it.
 Verify a downloaded release ZIP's GitHub provenance against this repository:
 
 ```bash
-gh attestation verify --repo apstndb/duckdb-spanner spanner-v1.5.5-linux_amd64.zip
+gh attestation verify --repo apstndb/duckdb-spanner spanner-v1.5.6-linux_amd64.zip
 ```
 
 This provenance attestation is separate from DuckDB extension signing. The
@@ -158,7 +158,7 @@ For a quick build-and-launch workflow:
 make duckdb
 ```
 
-`make duckdb` requires `DUCKDB_BIN` to report DuckDB `v1.5.5` and loads the extension into that CLI. Use `DUCKDB_BIN=/path/to/duckdb make duckdb` to select a specific CLI. `DUCKDB_VERSION=v1.5.5` is accepted as an explicit metadata value; other versions fail before the extension is built.
+`make duckdb` requires `DUCKDB_BIN` to report DuckDB `v1.5.6` and loads the extension into that CLI. Use `DUCKDB_BIN=/path/to/duckdb make duckdb` to select a specific CLI. `DUCKDB_VERSION=v1.5.6` is accepted as an explicit metadata value; other versions fail before the extension is built.
 
 ### Authentication
 
@@ -737,12 +737,12 @@ make test               # alias for test_release
 Requires Docker (Colima on macOS). Emulator tests use `SPANNER_EMULATOR_HOST` (default `localhost:9010`).
 
 `make test_peg_parser` runs the same full SQLLogicTest suite on the exact
-DuckDB `v1.5.5` Python host after `CALL enable_peg_parser()` is applied to
+DuckDB `v1.5.6` Python host after `CALL enable_peg_parser()` is applied to
 every test database. It is a separate lane: `make test_release` remains the
 legacy-parser acceptance run. `make test_duckdb_compatibility` verifies both
 load orders in separate processes between this extension and DuckDB's
-versioned core `autocomplete` extension, then proves the `v1.5.5`
-`C_STRUCT_UNSTABLE` artifact is rejected on an exact DuckDB `v1.5.4` host
+versioned core `autocomplete` extension, then proves the `v1.5.6`
+`C_STRUCT_UNSTABLE` artifact is rejected on an exact DuckDB `v1.5.5` host
 without metadata-mismatch opt-in. These
 compatibility targets use pinned DuckDB wheel versions, never a latest host.
 

@@ -13,15 +13,15 @@ SPEC.loader.exec_module(mismatched_host)
 class VersionRejectionTests(unittest.TestCase):
     def test_requires_both_exact_versions_in_the_loader_error(self) -> None:
         mismatched_host.assert_version_rejection(
-            RuntimeError("extension v1.5.5 does not match host v1.5.4"),
+            RuntimeError("extension v1.5.6 does not match host v1.5.5"),
+            "1.5.6",
             "1.5.5",
-            "1.5.4",
         )
 
     def test_rejects_an_unrelated_load_error(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "exact version mismatch"):
             mismatched_host.assert_version_rejection(
-                RuntimeError("could not open shared object file"), "1.5.5", "1.5.4"
+                RuntimeError("could not open shared object file"), "1.5.6", "1.5.5"
             )
 
 

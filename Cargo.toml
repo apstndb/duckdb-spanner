@@ -2,7 +2,7 @@
 name = "duckdb-spanner"
 version = "0.4.1"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.91"
 description = "DuckDB extension for querying Google Cloud Spanner databases"
 repository = "https://github.com/apstndb/duckdb-spanner"
 license = "MIT"
@@ -20,17 +20,19 @@ default = []
 loadable-extension = ["duckdb/loadable-extension"]
 
 [dependencies]
-duckdb = { version = "=1.10505.0", features = ["vtab", "vscalar"] }
-# google-cloud-rust release-20260730. Keep every direct revision aligned.
-google-cloud-spanner = { git = "https://github.com/googleapis/google-cloud-rust", rev = "e65d1417458d9ce7e4ecefc99427c50a5606b68c", default-features = false }
-google-cloud-auth = { git = "https://github.com/googleapis/google-cloud-rust", rev = "e65d1417458d9ce7e4ecefc99427c50a5606b68c", default-features = false }
-google-cloud-gax = { git = "https://github.com/googleapis/google-cloud-rust", rev = "e65d1417458d9ce7e4ecefc99427c50a5606b68c", default-features = false }
-google-cloud-longrunning = { git = "https://github.com/googleapis/google-cloud-rust", rev = "e65d1417458d9ce7e4ecefc99427c50a5606b68c", default-features = false }
-google-cloud-rpc = { git = "https://github.com/googleapis/google-cloud-rust", rev = "e65d1417458d9ce7e4ecefc99427c50a5606b68c", default-features = false }
-google-cloud-lro = { git = "https://github.com/googleapis/google-cloud-rust", rev = "e65d1417458d9ce7e4ecefc99427c50a5606b68c", default-features = false }
-google-cloud-spanner-admin-database-v1 = { git = "https://github.com/googleapis/google-cloud-rust", rev = "e65d1417458d9ce7e4ecefc99427c50a5606b68c", default-features = false }
-google-cloud-spanner-admin-instance-v1 = { git = "https://github.com/googleapis/google-cloud-rust", rev = "e65d1417458d9ce7e4ecefc99427c50a5606b68c", default-features = false }
-wkt = { package = "google-cloud-wkt", git = "https://github.com/googleapis/google-cloud-rust", rev = "e65d1417458d9ce7e4ecefc99427c50a5606b68c", default-features = false }
+duckdb = { version = "=1.10506.0", features = ["vtab", "vscalar"] }
+# google-cloud-rust release-20260930. Keep every direct revision aligned.
+# Disable upstream defaults to keep automatic Cloud Monitoring export off and
+# retain the ring crypto provider installed by this extension.
+google-cloud-spanner = { git = "https://github.com/googleapis/google-cloud-rust", rev = "2a03d923a0d56114e15cc7404de33992111c854b", default-features = false }
+google-cloud-auth = { git = "https://github.com/googleapis/google-cloud-rust", rev = "2a03d923a0d56114e15cc7404de33992111c854b", default-features = false }
+google-cloud-gax = { git = "https://github.com/googleapis/google-cloud-rust", rev = "2a03d923a0d56114e15cc7404de33992111c854b", default-features = false }
+google-cloud-longrunning = { git = "https://github.com/googleapis/google-cloud-rust", rev = "2a03d923a0d56114e15cc7404de33992111c854b", default-features = false }
+google-cloud-rpc = { git = "https://github.com/googleapis/google-cloud-rust", rev = "2a03d923a0d56114e15cc7404de33992111c854b", default-features = false }
+google-cloud-lro = { git = "https://github.com/googleapis/google-cloud-rust", rev = "2a03d923a0d56114e15cc7404de33992111c854b", default-features = false }
+google-cloud-spanner-admin-database-v1 = { git = "https://github.com/googleapis/google-cloud-rust", rev = "2a03d923a0d56114e15cc7404de33992111c854b", default-features = false }
+google-cloud-spanner-admin-instance-v1 = { git = "https://github.com/googleapis/google-cloud-rust", rev = "2a03d923a0d56114e15cc7404de33992111c854b", default-features = false }
+wkt = { package = "google-cloud-wkt", git = "https://github.com/googleapis/google-cloud-rust", rev = "2a03d923a0d56114e15cc7404de33992111c854b", default-features = false }
 prost-types = "0.14"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -48,4 +50,4 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 [dev-dependencies]
 testcontainers = "0.28"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
-duckdb = { version = "=1.10505.0", features = ["bundled", "vtab", "vscalar", "json"] }
+duckdb = { version = "=1.10506.0", features = ["bundled", "vtab", "vscalar", "json"] }

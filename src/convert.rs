@@ -21,7 +21,7 @@ const MAX_FLATTENED_CHILDREN: usize =
 
 /// Extract the raw `duckdb_vector` handle from a FlatVector.
 ///
-/// duckdb-rs 1.10505.0 does not expose the underlying `duckdb_vector` handle,
+/// duckdb-rs 1.10506.0 does not expose the underlying `duckdb_vector` handle,
 /// which is needed for `duckdb_unsafe_vector_assign_string_element_len`.
 /// `FlatVector<'_>` currently stores `ptr` first, followed by capacity and the
 /// lifetime marker. We read the first pointer-sized value and debug-check it
@@ -119,7 +119,7 @@ fn ensure_row_count(row_count: usize, context: &dyn Fn() -> String) -> Result<()
 }
 
 /// Reserve the outer list's child before constructing its nested ListVector.
-/// duckdb-rs 1.10505.0 carries this reservation into `list_child()`, so nested
+/// duckdb-rs 1.10506.0 carries this reservation into `list_child()`, so nested
 /// arrays are no longer limited to DuckDB's standard vector size.
 fn reserve_nested_list_child(
     list_vector: &ListVector<'_>,
