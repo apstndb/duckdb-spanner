@@ -100,6 +100,11 @@ fn test_omni_tls_and_mtls_query_via_public_extension() {
             .unwrap();
         let value: i64 = statement.query_row([], |row| row.get(0)).unwrap();
         assert_eq!(value, 42);
+        let variant_value: i64 = conn.query_row(
+            "SELECT Value::BIGINT FROM spanner_query_variant('SELECT 42 AS Value', parallelism_mode := 'off')",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(variant_value, 42);
         if mtls {
             let other = Certificates::new();
             std::fs::write(certs.directory.join("client.key"), &other.client_key).unwrap();
@@ -108,6 +113,8 @@ fn test_omni_tls_and_mtls_query_via_public_extension() {
             for sql in [
                 "SELECT * FROM spanner_query('SELECT 42 AS Value')",
                 "SELECT * FROM spanner_scan('T', dialect := 'googlesql')",
+                "SELECT * FROM spanner_query_variant('SELECT 42 AS Value')",
+                "SELECT * FROM spanner_scan_variant('T', dialect := 'googlesql')",
                 "SELECT * FROM spanner_tables()",
                 "SELECT * FROM \"spanner:T\"",
                 "COPY (SELECT 1::BIGINT AS Id) TO 'T' (FORMAT spanner, dialect 'googlesql')",
