@@ -103,6 +103,7 @@ jobs:
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_check_release_asset_metadata.py
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_package_release_assets.py
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_run_sqllogictest_with_peg_parser.py
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_run_sqllogictest_checked.py
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_check_extension_load_order.py
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_check_extension_rejects_mismatched_host.py
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_makefile_test_profiles.py
