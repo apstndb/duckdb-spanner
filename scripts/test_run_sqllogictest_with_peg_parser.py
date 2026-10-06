@@ -5,7 +5,7 @@ import unittest
 
 
 SCRIPT = Path(__file__).with_name("run_sqllogictest_with_peg_parser.py")
-SPEC = importlib.util.spec_from_file_location("peg_sqllogictest", SCRIPT)
+SPEC = importlib.util.spec_from_file_location("scripts.peg_sqllogictest", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 peg_sqllogictest = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(peg_sqllogictest)

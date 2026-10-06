@@ -3,9 +3,13 @@
 
 import argparse
 from pathlib import Path
-import subprocess
 import sys
 from tempfile import TemporaryDirectory
+
+if __package__:
+    from .run_sqllogictest_checked import run_command
+else:
+    from run_sqllogictest_checked import run_command
 
 
 PEG_PREAMBLE = b"""statement ok
@@ -53,7 +57,7 @@ def main() -> None:
         mirror_root = Path(directory)
         file_count = mirror_test_suite(source_root, mirror_root)
         print(f"running PEG mirror of {file_count} SQLLogicTest files")
-        subprocess.run(
+        status = run_command(
             [
                 sys.executable,
                 "-m",
@@ -64,9 +68,10 @@ def main() -> None:
                 str(artifact),
                 "--preinstall-extensions",
                 "autocomplete",
-            ],
-            check=True,
+            ]
         )
+        if status:
+            raise SystemExit(status)
 
 
 if __name__ == "__main__":

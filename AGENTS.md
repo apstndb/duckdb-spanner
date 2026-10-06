@@ -15,6 +15,8 @@ cargo build --release --features loadable-extension  # build loadable extension 
 
 Requires Docker (Colima on macOS) for the Spanner emulator. `make test_release` starts the emulator, seeds the test database (`tests/setup_sqllogic_db.sh`), and runs `test/sql/*.test`.
 
+Normal, debug, offline and PEG runs share `scripts/run_sqllogictest_checked.py`: a file parser error fails the gate even when the upstream runner exits zero. Do not bypass this guard when collecting acceptance evidence.
+
 ```sh
 make configure                 # venv + duckdb_sqllogictest-python (once)
 make release test_release      # build extension + emulator + seed + test/sql/*.test

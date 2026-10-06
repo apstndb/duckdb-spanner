@@ -164,6 +164,10 @@ EXTENSION_VERSION ?= $(patsubst v%,%,$(EXT_VERSION))
 
 include extension-ci-tools/makefiles/c_api_extensions/base.Makefile
 
+# The pinned runner can print a file parser error and still exit0. All normal,
+# debug and offline lanes share this guard; the PEG wrapper uses it directly.
+TEST_RUNNER = $(PYTHON_VENV_BIN) scripts/run_sqllogictest_checked.py
+
 # Cargo package name (duckdb-spanner) differs from extension name (spanner), so
 # the cdylib artifact keeps the crate name: libduckdb_spanner.so/.dylib on
 # Linux/Darwin and duckdb_spanner.dll on Windows (no lib prefix, hyphen -> underscore).
