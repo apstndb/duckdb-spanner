@@ -1,7 +1,9 @@
 # name: test/sql/spanner_variant.test
 # description: Explicit VARIANT result wrappers and their lossy null contract
 # group: [spanner]
+
 require spanner
+
 require-env SPANNER_EMULATOR_HOST
 
 statement ok

@@ -334,6 +334,10 @@ cannot be recovered. Typed NULL subtypes and complete declared container schemas
 are not carried by the value alone. JSON-looking STRING values remain strings.
 Use native results when preserving these distinctions is required.
 
+DuckDB may also promote native operands to VARIANT when combining them with
+VARIANT values in `CASE`, `COALESCE`, or set operations. Cast/extract explicitly
+when the combined expression needs a particular native type.
+
 On DuckDB 1.5.6, use `value::JSON` to serialize a VARIANT object/array to JSON;
 `to_json(value)` may instead encode its display string. Casting a VARIANT null to
 JSON yields JSON `null` and does not restore whether the source was SQL NULL.
