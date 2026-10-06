@@ -876,6 +876,187 @@ fn test_spanner_filtering() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
+fn test_variant_query_null_contract_and_exact_values() {
+    let conn = create_duckdb_connection();
+    let db = get_gsql_db();
+    conn.execute_batch(&format!(
+        "SET spanner_database_path = '{}'; SET spanner_endpoint = '{}'",
+        db.database_path(),
+        db.emulator_host()
+    ))
+    .unwrap();
+
+    let native_distinction: bool = conn
+        .query_row(
+            "SELECT J IS NOT NULL AND N IS NULL FROM spanner_query(\
+         'SELECT JSON ''null'' AS J, CAST(NULL AS JSON) AS N', parallelism_mode := 'off')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(native_distinction);
+
+    // Cast back in SQL: duckdb-rs does not decode VARIANT directly. Exercise
+    // the extension functions, including nested JSON, rather than local casts.
+    let contract: bool = conn.query_row(
+        "SELECT J IS NULL AND N IS NULL AND A[1] IS NULL AND A[2] IS NULL \
+         AND variant_typeof(A) = 'ARRAY(2)' AND O::JSON::VARCHAR = '{\"present\":null}' \
+         AND variant_typeof(S) = 'VARCHAR' AND S::VARCHAR = '{\"type\":\"INT64\",\"value\":\"42\"}' \
+         AND I::BIGINT = 9007199254740993 \
+         AND D::DECIMAL(38,9) = 9007199254740993.123456789 \
+         FROM spanner_query_variant('SELECT JSON ''null'' AS J, CAST(NULL AS JSON) AS N, \
+         [JSON ''null'', CAST(NULL AS JSON)] AS A, JSON ''{\"present\":null}'' AS O, \
+         ''{\"type\":\"INT64\",\"value\":\"42\"}'' AS S, \
+         CAST(9007199254740993 AS INT64) AS I, NUMERIC ''9007199254740993.123456789'' AS D', \
+         parallelism_mode := 'off')",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert!(contract);
+}
+
+#[test]
+fn test_variant_query_params_and_scan_projection() {
+    let conn = create_duckdb_connection();
+    let db = get_gsql_db();
+    conn.execute_batch(&format!(
+        "SET spanner_database_path = '{}'; SET spanner_endpoint = '{}'",
+        db.database_path(),
+        db.emulator_host()
+    ))
+    .unwrap();
+    let id: i64 = conn
+        .query_row(
+            "SELECT Id::BIGINT FROM spanner_query_variant(\
+         'SELECT Id FROM ScalarTypes WHERE Id > @minimum', \
+         params := {'minimum': 2::BIGINT}, parallelism_mode := 'off')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(id, 3);
+
+    // Rebinding a different native parameter must not reuse the previous
+    // query's value or change the wrapper's result shape.
+    for (minimum, expected) in [(0, 3), (2, 1), (3, 0), (0, 3)] {
+        let count: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT count(*) FROM spanner_query_variant(\
+                     'SELECT Id FROM ScalarTypes WHERE Id > @minimum', \
+                     params := {{'minimum': {minimum}::BIGINT}}, parallelism_mode := 'off')"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, expected);
+    }
+
+    let scan = "spanner_scan_variant('ScalarTypes', dialect := 'googlesql', \
+                parallelism_mode := 'off', priority := 'low')";
+    let projected: (i64, i64, String) = conn
+        .query_row(
+            &format!(
+                "SELECT Id::BIGINT, Id::BIGINT, StringCol::VARCHAR FROM {scan} WHERE Id::BIGINT = 2"
+            ),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(projected, (2, 2, "world".into()));
+    let count: i64 = conn
+        .query_row(&format!("SELECT count(*) FROM {scan}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 3);
+
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM spanner_scan_variant('ScalarTypes', parallelism_mode := 'auto')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 3);
+
+    let error = conn
+        .prepare(
+            "SELECT * FROM spanner_query_variant(\
+                            'SELECT Id FROM MissingVariantTable', parallelism_mode := 'off')",
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("MissingVariantTable"),
+        "unexpected error: {error}"
+    );
+    let alive: i64 = conn.query_row("SELECT 42", [], |row| row.get(0)).unwrap();
+    assert_eq!(alive, 42);
+
+    for source in [
+        "spanner_scan_variant('EmptyTable', parallelism_mode := 'off')",
+        "spanner_query_variant('SELECT Id, Name FROM EmptyTable', parallelism_mode := 'off')",
+    ] {
+        let columns: Vec<(String, String)> = conn
+            .prepare(&format!("DESCRIBE SELECT * FROM {source}"))
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            columns,
+            vec![
+                ("Id".into(), "VARIANT".into()),
+                ("Name".into(), "VARIANT".into())
+            ]
+        );
+        let count: i64 = conn
+            .query_row(&format!("SELECT count(*) FROM {source}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+}
+
+#[test]
+fn test_variant_postgresql_query_and_scan() {
+    let conn = create_pg_duckdb_connection();
+    let db = get_pg_db();
+    conn.execute_batch(&format!(
+        "SET spanner_database_path = '{}'; SET spanner_endpoint = '{}'",
+        db.database_path(),
+        db.emulator_host()
+    ))
+    .unwrap();
+    let name: String = conn.query_row(
+        "SELECT name::VARCHAR FROM spanner_query_variant(\
+         'SELECT name FROM users WHERE id = $1', params := {'p1': 2::BIGINT}, parallelism_mode := 'off')",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(name, "Bob");
+    // PostgreSQL NUMERIC is deliberately a native VARCHAR (its domain exceeds
+    // DECIMAL(38,9)); the wrapper preserves that existing representation.
+    let values: (bool, String, String) = conn
+        .query_row(
+            "SELECT bool_col::BOOLEAN, num_col::VARCHAR, json_col::JSON::VARCHAR \
+         FROM spanner_scan_variant('pgsql_types', dialect := 'postgresql', \
+         parallelism_mode := 'off') WHERE id::BIGINT = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert!(values.0);
+    assert_eq!(values.1, "123.456789");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&values.2).unwrap(),
+        serde_json::json!({"key": "value"})
+    );
+}
+
+#[test]
 fn test_vtab_query_basic() {
     let conn = create_duckdb_connection();
     let sql = vtab_query_sql("SELECT Id FROM ScalarTypes ORDER BY Id");
