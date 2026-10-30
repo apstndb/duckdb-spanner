@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use duckdb::Connection;
-use duckdb_spanner::register_spanner_extension;
+use duckdb_spanner::register_static_extension;
 use google_cloud_auth::credentials::anonymous::Builder as Anonymous;
 use google_cloud_spanner::client::{DatabaseClient, Spanner};
 use google_cloud_spanner::result::Row as SpannerRow;
@@ -284,11 +284,31 @@ fn create_duckdb_connection() -> ExtensionTestConnection {
 }
 
 fn open_extension_connection() -> ExtensionTestConnection {
+    register_static_extension().expect("register v2 static descriptor");
     unsafe {
         let mut db: duckdb::ffi::duckdb_database = std::ptr::null_mut();
-        let status = duckdb::ffi::duckdb_open(c":memory:".as_ptr(), &mut db);
+        let mut error = std::ptr::null_mut();
+        let status = duckdb::ffi::duckdb_open_ext(
+            c":memory:".as_ptr(),
+            &mut db,
+            std::ptr::null_mut(),
+            &mut error,
+        );
+        let detail = if error.is_null() {
+            String::new()
+        } else {
+            let detail = std::ffi::CStr::from_ptr(error)
+                .to_string_lossy()
+                .into_owned();
+            duckdb::ffi::duckdb_free(error.cast());
+            detail
+        };
         let database = OwnedTestDatabase(db);
-        assert_eq!(status, duckdb::ffi::DuckDBSuccess, "duckdb_open failed");
+        assert_eq!(
+            status,
+            duckdb::ffi::DuckDBSuccess,
+            "duckdb_open failed: {detail}"
+        );
         assert!(!database.0.is_null());
 
         let mut raw_con: duckdb::ffi::duckdb_connection = std::ptr::null_mut();
@@ -298,7 +318,6 @@ fn open_extension_connection() -> ExtensionTestConnection {
         assert!(!raw_connection.0.is_null());
 
         let conn = Connection::open_from_raw(db).unwrap();
-        register_spanner_extension(db, raw_con, &conn).unwrap();
         ExtensionTestConnection {
             connection: Some(conn),
             raw_connection: Some(raw_connection),
@@ -2231,13 +2250,13 @@ fn test_copy_rejects_zero_batch_size_during_bind() {
             "COPY (SELECT CAST(1 AS BIGINT) AS Id) TO 'T' (\
                 FORMAT spanner, \
                 database_path 'projects/p/instances/i/databases/d', \
-                batch_size 0\
+                mutation_batch_size 0\
             )",
         )
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("batch_size '0'") && err.contains("greater than zero"),
+        err.contains("mutation_batch_size '0'") && err.contains("greater than zero"),
         "unexpected COPY bind error: {err}"
     );
 }
@@ -2280,8 +2299,8 @@ fn test_copy_rejects_unknown_option_during_bind() {
         );
     }
 
-    // Current DuckDB rejects NULL COPY options before invoking the format
-    // binder, so the extension cannot observe that representation.
+    // DuckDB2 forwards NULL options to format bind. Unknown names still fail
+    // there before metadata resolution or any connection is attempted.
     let null_error = conn
         .execute_batch(
             "COPY (SELECT CAST(1 AS BIGINT) AS Id) TO 'T' (FORMAT spanner, databse NULL)",
@@ -2289,7 +2308,7 @@ fn test_copy_rejects_unknown_option_during_bind() {
         .unwrap_err()
         .to_string();
     assert!(
-        null_error.contains("NULL is not supported as a valid option"),
+        null_error.contains("Unknown COPY FORMAT spanner option(s): databse"),
         "unexpected NULL COPY option error: {null_error}"
     );
 }
@@ -2341,7 +2360,7 @@ fn test_copy_reports_partial_progress_after_later_batch_failure() {
         "COPY (SELECT CAST(Id AS BIGINT) AS Id, Name, CAST(Value AS DOUBLE) AS Value \
          FROM (VALUES (9800, 'first', 1.0), (9800, 'duplicate', 2.0)) AS t(Id, Name, Value)) \
          TO 'CopyTarget' (FORMAT spanner, database_path '{}', endpoint '{}', \
-         mode 'insert', batch_size 1)",
+         mode 'insert', mutation_batch_size 1)",
         db.database_path(),
         db.emulator_host()
     );
@@ -2875,4 +2894,201 @@ fn test_pg_copy_to_excludes_generated_column() {
         "generated column should be computed by Spanner"
     );
     assert_eq!(rows[0].column::<String>(2).unwrap(), "gen");
+}
+
+/// Exercise the public v2 owned-value API rather than the classic driver's
+/// partially implemented Value::data_type for composite values.
+fn open_native_connection() -> duckdb_neo::connection::Connection {
+    register_static_extension().unwrap();
+    duckdb_neo::environment::Environment::new()
+        .unwrap()
+        .open(duckdb_neo::environment::StorageLocation::InMemory)
+        .unwrap()
+        .connect()
+        .unwrap()
+}
+
+fn owned_composite_params(
+    connection: &duckdb_neo::connection::Connection,
+    id: i64,
+) -> duckdb_neo::value::Value {
+    use duckdb_neo::{DuckDBType, ToValue, connection::FFILink, value::ValueInput};
+    let int = i64::logical_type(connection).unwrap();
+    let string = String::logical_type(connection).unwrap();
+    let date = duckdb_neo::types::DateValue::logical_type(connection).unwrap();
+    let json = duckdb_neo::logical_type::LogicalType::from_text(connection, "JSON").unwrap();
+    let ids = [
+        1_i64.value(connection).unwrap(),
+        duckdb_neo::value::Value::null(connection, &int).unwrap(),
+        3_i64.value(connection).unwrap(),
+    ];
+    let fixed = [
+        7_i64.value(connection).unwrap(),
+        8_i64.value(connection).unwrap(),
+    ];
+    let fields = [
+        id.value(connection).unwrap(),
+        connection
+            .create_value(ValueInput::List {
+                child_type: &int,
+                children: &ids,
+            })
+            .unwrap(),
+        connection
+            .create_value(ValueInput::Array {
+                child_type: &int,
+                children: &fixed,
+            })
+            .unwrap(),
+        r#"{"x":9,"n":null}"#.value(connection).unwrap().cast(connection, &json).unwrap(),
+        connection
+            .create_value(ValueInput::Decimal {
+                value: 12345678901234567890123456789_i128,
+                width: 38,
+                scale: 9,
+            })
+            .unwrap(),
+        connection
+            .create_value(ValueInput::List {
+                child_type: &string,
+                children: &[],
+            })
+            .unwrap(),
+        duckdb_neo::value::Value::null(connection, &date).unwrap(),
+    ];
+    connection
+        .create_value(ValueInput::Struct {
+            names: &["id", "ids", "fixed", "doc", "amount", "empty", "missing"],
+            children: &fields,
+        })
+        .unwrap()
+}
+
+#[test]
+fn test_v2_owned_composite_prepared_parameter_transport() {
+    let conn = open_native_connection();
+    let prepared = conn.prepare("SELECT spanner_params($p)", false).unwrap();
+    for id in [9_007_199_254_740_993_i64, 42] {
+        let value = owned_composite_params(&conn, id);
+        let mut result = prepared
+            .execute(duckdb_neo::Parameters::named(&[("p", &value)]))
+            .unwrap();
+        drop(value); // The lazy execution must own its parameter snapshot.
+        let chunk = result.next_chunk().unwrap().unwrap();
+        let reader = chunk.get_vector_at::<String>(0).unwrap().reader().unwrap();
+        let payload: serde_json::Value =
+            serde_json::from_str(reader.get(0).unwrap().unwrap()).unwrap();
+        assert_eq!(payload["id"], serde_json::json!(id));
+        assert_eq!(payload["ids"]["type"], "ARRAY<INT64>");
+        assert_eq!(payload["ids"]["value"], serde_json::json!([1, null, 3]));
+        assert_eq!(payload["fixed"]["type"], "ARRAY<INT64>");
+        assert_eq!(payload["fixed"]["value"], serde_json::json!([7, 8]));
+        assert_eq!(payload["amount"]["value"], "12345678901234567890.123456789");
+        assert_eq!(payload["doc"]["type"], "JSON");
+        assert_eq!(payload["empty"]["type"], "ARRAY<STRING>");
+        assert_eq!(payload["empty"]["value"], serde_json::json!([]));
+        assert_eq!(payload["missing"]["type"], "DATE");
+        assert!(payload["missing"]["value"].is_null());
+        drop(chunk);
+        result.drain().unwrap();
+    }
+}
+
+#[test]
+fn test_v2_owned_composite_prepared_query_roundtrip() {
+    let db = get_gsql_db();
+    let conn = open_native_connection();
+    let remote = "SELECT @id AS id, ARRAY_LENGTH(@ids) AS len, @ids[OFFSET(1)] IS NULL AS null_item, @fixed[OFFSET(1)] AS fixed, JSON_VALUE(@doc, '$.x') AS x, CAST(@amount AS STRING) AS amount, ARRAY_LENGTH(@empty) AS empty, @missing IS NULL AS missing";
+    let sql = format!(
+        "SELECT COLUMNS(*)::VARCHAR FROM spanner_query('{}', database_path := '{}', endpoint := 'http://{}', params := $p)",
+        remote.replace('\'', "''"),
+        db.database_path(),
+        db.emulator_host()
+    );
+    let prepared = conn.prepare(sql.as_str(), false).unwrap();
+    for id in [9_007_199_254_740_993_i64, 43] {
+        let value = owned_composite_params(&conn, id);
+        let mut result = prepared
+            .execute(duckdb_neo::Parameters::named(&[("p", &value)]))
+            .unwrap();
+        drop(value);
+        let chunk = result.next_chunk().unwrap().unwrap();
+        assert_eq!(chunk.row_count().unwrap(), 1);
+        let actual = (0..chunk.col_count())
+            .map(|column| {
+                chunk
+                    .get_vector_at::<String>(column)
+                    .unwrap()
+                    .reader()
+                    .unwrap()
+                    .get(0)
+                    .unwrap()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            [
+                id.to_string(),
+                "3".into(),
+                "true".into(),
+                "8".into(),
+                "9".into(),
+                "12345678901234567890.123456789".into(),
+                "0".into(),
+                "true".into()
+            ]
+        );
+        drop(chunk);
+        result.drain().unwrap();
+    }
+}
+
+#[test]
+fn test_v2_prepared_query_keeps_owned_settings_after_set() {
+    let db = get_gsql_db();
+    let conn = open_extension_connection();
+    conn.execute_batch(&format!(
+        "SET spanner_database_path = '{}'; SET spanner_endpoint = 'http://{}'; \
+         PREPARE settings_snapshot AS SELECT x FROM spanner_query('SELECT 7 AS x'); \
+         SET spanner_endpoint_mode = 'custom'",
+        db.database_path(),
+        db.emulator_host()
+    ))
+    .unwrap();
+    let value: i64 = conn
+        .query_row("EXECUTE settings_snapshot", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(value, 7);
+    let error = conn
+        .query_row("SELECT x FROM spanner_query('SELECT 7 AS x')", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("endpoint_mode 'custom'"),
+        "new bind ignored changed settings: {error}"
+    );
+}
+
+#[test]
+fn test_v2_copy_explain_does_not_connect_or_commit() {
+    let conn = open_extension_connection();
+    let plan: String = conn
+        .query_row(
+            "EXPLAIN COPY (SELECT 1::BIGINT AS Id) TO 'UnreachableTarget' \
+         (FORMAT spanner, database_path 'projects/p/instances/i/databases/d', \
+          endpoint 'http://127.0.0.1:1', mutation_batch_size 1)",
+            [],
+            |row| row.get(1),
+        )
+        .unwrap();
+    assert!(!plan.is_empty());
+    assert_eq!(
+        conn.query_row("SELECT 42", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        42
+    );
 }

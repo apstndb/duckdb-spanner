@@ -462,9 +462,10 @@ mod tests {
     use std::sync::mpsc::{SyncSender, sync_channel};
     use std::time::Duration;
 
-    use duckdb::Connection;
-    use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
-    use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
+    use crate::duck::{
+        BindInfo, DataChunkHandle, InitInfo, LogicalTypeHandle, LogicalTypeId, TableFunctionInfo,
+        VTab,
+    };
 
     use super::*;
 
@@ -519,12 +520,15 @@ mod tests {
         type InitData = SyntheticStreamingInitData;
 
         fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn std::error::Error>> {
-            bind.add_result_column("value", LogicalTypeHandle::from(LogicalTypeId::Bigint));
+            bind.add_result_column("value", LogicalTypeHandle::from(LogicalTypeId::Bigint))?;
             Ok(())
         }
 
         fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
-            let probes = unsafe { (*init.get_extra_info::<SyntheticVTabProbes>()).clone() };
+            let probes = init
+                .get_extra_info::<SyntheticVTabProbes>()
+                .expect("native test probes")
+                .clone();
             let producer_partition_quiesced = Arc::clone(&probes.partition_quiesced);
             let streaming = StreamingState::spawn(
                 1,
@@ -570,15 +574,12 @@ mod tests {
                 .expect("DuckDB called the VTab after destroying its init data")
                 .next_batch()?
             else {
-                output.set_len(0);
+                output.set_len(0)?;
                 return Ok(());
             };
 
-            let mut values = output.flat_vector(0);
-            // SAFETY: bind registers `value` as BIGINT, and this batch holds
-            // exactly one i64 because its StreamState batch size is one.
-            unsafe { values.as_mut_slice::<i64>()[0] = batch[0] };
-            output.set_len(1);
+            output.set_len(1)?;
+            output.set(0, 0, batch[0])?;
             Ok(())
         }
     }
@@ -924,26 +925,43 @@ mod tests {
 
     #[test]
     fn duckdb_limit_quiesces_partition_before_vtab_init_drop_returns() {
-        let connection = Connection::open_in_memory().unwrap();
+        let connection = crate::test_support::connection();
         let (started_tx, started_rx) = sync_channel(1);
         let partition_quiesced = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (init_drop_result_tx, init_drop_result_rx) = sync_channel(1);
-        connection
-            .register_table_function_with_extra_info::<SyntheticStreamingVTab, _>(
-                "synthetic_streaming_vtab",
-                &SyntheticVTabProbes {
-                    partition_started: started_tx,
-                    partition_quiesced,
-                    init_drop_result: init_drop_result_tx,
-                },
+        crate::duck::register_for_tests::<SyntheticStreamingVTab>(
+            &connection,
+            "synthetic_streaming_vtab",
+            Some(Arc::new(SyntheticVTabProbes {
+                partition_started: started_tx,
+                partition_quiesced,
+                init_drop_result: init_drop_result_tx,
+            })),
+        )
+        .unwrap();
+        let statement = connection
+            .prepare(
+                "SELECT value FROM synthetic_streaming_vtab() LIMIT 1",
+                false,
             )
             .unwrap();
-
-        let mut statement = connection
-            .prepare("SELECT value FROM synthetic_streaming_vtab() LIMIT 1")
-            .unwrap();
-        let value: i64 = statement.query_row([], |row| row.get(0)).unwrap();
-        assert_eq!(value, 1);
+        {
+            let mut result = statement.execute(duckdb_neo::Parameters::None).unwrap();
+            let chunk = result.next_chunk().unwrap().unwrap();
+            assert_eq!(
+                chunk
+                    .get_vector_at::<i64>(0)
+                    .unwrap()
+                    .reader()
+                    .unwrap()
+                    .get(0)
+                    .unwrap()
+                    .copied(),
+                Some(1)
+            );
+            drop(chunk);
+            result.drain().unwrap();
+        }
         started_rx
             .try_recv()
             .expect("DuckDB returned a VTab row before its partition child started");

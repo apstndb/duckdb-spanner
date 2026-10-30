@@ -1,6 +1,6 @@
 [package]
 name = "duckdb-spanner"
-version = "0.4.1"
+version = "0.5.0-alpha.1"
 edition = "2024"
 rust-version = "1.91"
 description = "DuckDB extension for querying Google Cloud Spanner databases"
@@ -17,10 +17,11 @@ strip = true
 
 [features]
 default = []
-loadable-extension = ["duckdb/loadable-extension"]
+loadable-extension = ["duckdb-neo/build-extension"]
+static-extension = ["duckdb-neo/build-extension-static"]
 
 [dependencies]
-duckdb = { version = "=1.10506.1", features = ["vtab", "vscalar"] }
+duckdb-neo = { version = "=0.20000.1", default-features = false }
 # google-cloud-rust release-20260930. Keep every direct revision aligned.
 # Disable upstream defaults to keep automatic Cloud Monitoring export off and
 # retain the ring crypto provider installed by this extension.
@@ -51,8 +52,16 @@ ring = "0.17"
 [dev-dependencies]
 testcontainers = "0.28"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
-duckdb = { version = "=1.10506.1", features = ["bundled", "vtab", "vscalar", "json"] }
+duckdb = { version = "=1.20000.1", features = ["bundled", "json"] }
 rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
 spanner-grpc-mock = { git = "https://github.com/googleapis/google-cloud-rust", rev = "2a03d923a0d56114e15cc7404de33992111c854b" }
 tonic = { version = "=0.14.6", default-features = false, features = ["transport", "codegen", "tls-ring"] }
 tokio-stream = { version = "0.1", features = ["net"] }
+
+[[test]]
+name = "integration_test"
+required-features = ["static-extension"]
+
+[[example]]
+name = "owned_parameters"
+required-features = ["static-extension"]

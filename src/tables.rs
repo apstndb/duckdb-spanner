@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use duckdb::core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId};
-use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
+use crate::duck::{BindInfo, InitInfo, TableFunctionInfo, VTab};
+use crate::duck::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::statement::Statement;
 use google_cloud_spanner_admin_database_v1::model::DatabaseDialect;
@@ -42,19 +42,19 @@ impl VTab for SpannerTablesVTab {
             bind.add_result_column(
                 "table_schema",
                 LogicalTypeHandle::from(LogicalTypeId::Varchar),
-            );
+            )?;
             bind.add_result_column(
                 "table_name",
                 LogicalTypeHandle::from(LogicalTypeId::Varchar),
-            );
+            )?;
             bind.add_result_column(
                 "table_type",
                 LogicalTypeHandle::from(LogicalTypeId::Varchar),
-            );
+            )?;
             bind.add_result_column(
                 "parent_table_name",
                 LogicalTypeHandle::from(LogicalTypeId::Varchar),
-            );
+            )?;
 
             let profile = crate::bind_utils::resolve_connection_profile(bind)?;
             let dialect = crate::bind_utils::get_named_string(bind, "dialect")
@@ -80,7 +80,7 @@ impl VTab for SpannerTablesVTab {
                 },
             )??;
 
-            bind.set_cardinality(rows.len() as u64, true);
+            bind.set_cardinality(rows.len() as u64, true)?;
             Ok(TablesBindData { rows })
         })
     }
@@ -103,31 +103,24 @@ impl VTab for SpannerTablesVTab {
 
             let offset = init_data.offset.load(Ordering::Relaxed);
             if offset >= bind_data.rows.len() {
-                output.set_len(0);
+                output.set_len(0)?;
                 return Ok(());
             }
 
-            let capacity = crate::vector_size::runtime_vector_size();
+            let capacity = output.capacity()?;
             let end = (offset + capacity).min(bind_data.rows.len());
             let count = end - offset;
 
-            let schema_vec = output.flat_vector(0);
-            let name_vec = output.flat_vector(1);
-            let type_vec = output.flat_vector(2);
-            let mut parent_vec = output.flat_vector(3);
-
+            output.set_len(count)?;
             for (out_idx, row) in bind_data.rows[offset..end].iter().enumerate() {
-                schema_vec.insert(out_idx, &row.table_schema);
-                name_vec.insert(out_idx, &row.table_name);
-                type_vec.insert(out_idx, &row.table_type);
-                match &row.parent_table_name {
-                    Some(parent) => parent_vec.insert(out_idx, parent),
-                    None => parent_vec.set_null(out_idx),
-                }
+                output.set(0, out_idx, row.table_schema.as_str())?;
+                output.set(1, out_idx, row.table_name.as_str())?;
+                output.set(2, out_idx, row.table_type.as_str())?;
+                output.set(3, out_idx, row.parent_table_name.as_deref())?;
             }
 
             init_data.offset.store(end, Ordering::Relaxed);
-            output.set_len(count);
+            output.set_len(count)?;
             Ok(())
         })
     }

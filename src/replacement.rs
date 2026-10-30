@@ -1,97 +1,38 @@
-//! Replacement Scan API integration for ergonomic Spanner table references.
-//!
-//! Quoted table names with the `spanner:` prefix are rewritten to
-//! `spanner_scan(<table>)`. Connection details intentionally come from the
-//! existing `spanner_*` config options so plain table names never trigger
-//! remote reads by accident.
-
-use std::ffi::{CStr, CString, c_void};
-use std::ptr;
-
-use duckdb::ffi;
-
-const SPANNER_TABLE_PREFIX: &str = "spanner:";
-
-struct OwnedDuckDbValue(ffi::duckdb_value);
-
-impl OwnedDuckDbValue {
-    unsafe fn from_raw(raw: ffi::duckdb_value) -> Self {
-        Self(raw)
-    }
-
-    fn as_raw(&self) -> ffi::duckdb_value {
-        self.0
-    }
-}
-
-impl Drop for OwnedDuckDbValue {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { ffi::duckdb_destroy_value(&mut self.0) };
-        }
-    }
-}
-
-/// Register the Spanner replacement scan callback on a DuckDB database.
-///
-/// # Safety
-/// `db` must be a valid `duckdb_database`.
-pub(crate) unsafe fn register_replacement_scan(db: ffi::duckdb_database) {
-    unsafe {
-        ffi::duckdb_add_replacement_scan(db, Some(replacement_scan), ptr::null_mut(), None);
+//! Public v2 replacement scan; only unresolved spanner: names are claimed.
+use duckdb_neo::{
+    Result, ToValue,
+    connection::Context,
+    extension::Extension,
+    qualified_name::QualifiedName,
+    replacement_scan::{
+        ReplacementHandle, ReplacementScanBuilder, ReplacementScanCallbacks, ReplacementType,
+    },
+};
+struct Replacement;
+impl ReplacementScanCallbacks for Replacement {
+    fn scan(
+        &self,
+        ctx: &Context,
+        name: &QualifiedName,
+        handle: ReplacementHandle<'_>,
+    ) -> Result<()> {
+        crate::vtab_safety::guard_callback("SpannerReplacement", "scan", || {
+            let parts = name.parts()?;
+            let Some(table) = parts.last().and_then(|n| n.strip_prefix("spanner:")) else {
+                return Ok(());
+            };
+            if table.is_empty() {
+                return Err("spanner: replacement scan requires a table name".into());
+            }
+            handle.set_reference(ReplacementType::Table(QualifiedName::from_parts(&[
+                "spanner_scan",
+            ])?))?;
+            handle.add_parameter(table.value(ctx)?)?;
+            Ok(())
+        })
+        .map_err(|e| duckdb_neo::Error::invalid_input(e.to_string()))
     }
 }
-
-unsafe extern "C" fn replacement_scan(
-    info: ffi::duckdb_replacement_scan_info,
-    table_name: *const std::os::raw::c_char,
-    _data: *mut c_void,
-) {
-    let result = std::panic::catch_unwind(|| unsafe { replacement_scan_inner(info, table_name) });
-
-    if result.is_err() {
-        unsafe { set_replacement_error(info, "panic in spanner replacement scan") };
-    }
-}
-
-unsafe fn replacement_scan_inner(
-    info: ffi::duckdb_replacement_scan_info,
-    table_name: *const std::os::raw::c_char,
-) {
-    unsafe {
-        if table_name.is_null() {
-            return;
-        }
-
-        let name = CStr::from_ptr(table_name).to_string_lossy();
-        let Some(spanner_table) = name.strip_prefix(SPANNER_TABLE_PREFIX) else {
-            return;
-        };
-        if spanner_table.is_empty() {
-            set_replacement_error(info, "spanner: replacement scan requires a table name");
-            return;
-        }
-
-        let function_name = c"spanner_scan";
-        ffi::duckdb_replacement_scan_set_function_name(info, function_name.as_ptr());
-
-        let value = OwnedDuckDbValue::from_raw(ffi::duckdb_create_varchar_length(
-            spanner_table.as_ptr().cast(),
-            spanner_table.len() as u64,
-        ));
-        if value.as_raw().is_null() {
-            set_replacement_error(info, "failed to create replacement scan table parameter");
-            return;
-        }
-        // DuckDB copies the parameter into the replacement-scan input.
-        ffi::duckdb_replacement_scan_add_parameter(info, value.as_raw());
-    }
-}
-
-unsafe fn set_replacement_error(info: ffi::duckdb_replacement_scan_info, msg: &str) {
-    unsafe {
-        if let Ok(c_msg) = CString::new(msg) {
-            ffi::duckdb_replacement_scan_set_error(info, c_msg.as_ptr());
-        }
-    }
+pub(crate) fn register(ext: &Extension) -> Result<()> {
+    ReplacementScanBuilder::new(Replacement).register(ext)
 }

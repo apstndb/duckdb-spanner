@@ -81,14 +81,14 @@ class MakefileTestProfileTests(unittest.TestCase):
 
     def test_fresh_configure_pins_the_compiled_host_despite_an_override(self) -> None:
         output = subprocess.run(
-            ["make", "-Bn", "configure", "DUCKDB_TEST_VERSION=2.0.0"],
+            ["make", "-Bn", "configure", "DUCKDB_TEST_VERSION=9.9.9"],
             cwd=REPOSITORY_ROOT,
             check=True,
             capture_output=True,
             text=True,
         ).stdout
-        self.assertIn("-m pip install duckdb==1.5.6", output)
-        self.assertNotIn("-m pip install duckdb==2.0.0", output)
+        self.assertIn("-m pip install duckdb==2.0.0", output)
+        self.assertNotIn("-m pip install duckdb==9.9.9", output)
 
     def test_every_runner_repairs_a_reused_virtualenv_before_execution(self) -> None:
         for target, offline in [
@@ -105,7 +105,7 @@ class MakefileTestProfileTests(unittest.TestCase):
                     command, cwd=REPOSITORY_ROOT, check=True,
                     capture_output=True, text=True,
                 ).stdout
-                pin = '-m pip install --disable-pip-version-check "duckdb==1.5.6"'
+                pin = '-m pip install --disable-pip-version-check "duckdb==2.0.0"'
                 runner = ("scripts/run_sqllogictest_with_peg_parser.py" if "peg" in target
                           else "scripts/run_sqllogictest_checked.py")
                 self.assertLess(output.index(pin), output.index(runner))

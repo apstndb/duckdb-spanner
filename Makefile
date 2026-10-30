@@ -26,12 +26,12 @@ DUCKDB_VERSION_CHECK := scripts/check-duckdb-version.sh
 EMULATOR_NAME := spanner-emulator
 EMULATOR_IMAGE := gcr.io/cloud-spanner-emulator/emulator:1.5.56@sha256:18a56fd557011e50e1733a9232e8d17ec9bdd7e51f6cf7660f14c234479f4f36
 # This is the compile-time ABI target, not a caller-selectable metadata value.
-override DUCKDB_TARGET_VERSION := v1.5.6
+override DUCKDB_TARGET_VERSION := v2.0.0
 DUCKDB_TEST_HOST_VERSION := $(patsubst v%,%,$(DUCKDB_TARGET_VERSION))
 # The unstable extension ABI must not follow PyPI's latest DuckDB release.
 # Keep new virtualenvs and reused test environments on the compiled target.
 override DUCKDB_TEST_VERSION := $(DUCKDB_TEST_HOST_VERSION)
-DUCKDB_MISMATCH_TEST_VERSION := 1.5.5
+DUCKDB_MISMATCH_TEST_VERSION := 1.5.6
 DUCKDB_BIN ?= duckdb
 DUCKDB_CLI_VERSION := $(shell "$(DUCKDB_BIN)" --version 2>/dev/null | sed -nE 's/^v?([0-9]+\.[0-9]+\.[0-9]+).*/v\1/p')
 
@@ -159,6 +159,7 @@ clean_all: clean clean_build clean_configure clean_rust
 
 EXTENSION_NAME=spanner
 USE_UNSTABLE_C_API=1
+CAPI_VERSION=2
 # Keep extension-ci-tools metadata in sync with Cargo.toml (not stale git short hash).
 EXTENSION_VERSION ?= $(patsubst v%,%,$(EXT_VERSION))
 
@@ -237,14 +238,14 @@ community_smoke: configure release
 	@echo "Running offline release smoke test: $(COMMUNITY_SMOKE_TEST_FILE)"
 	@$(TEST_RUNNER) --test-dir "$(COMMUNITY_SMOKE_TEST_DIR)" --file-path "$(COMMUNITY_SMOKE_TEST_FILE)" --external-extension build/release/$(EXTENSION_NAME).duckdb_extension
 
-# Keep this separate from test_release so the existing legacy-parser lane
-# remains a full, independent acceptance run.
-TEST_RUNNER_PEG_RELEASE = $(PYTHON_VENV_BIN) scripts/run_sqllogictest_with_peg_parser.py --test-dir test/sql --external-extension build/release/$(EXTENSION_NAME).duckdb_extension
+# Keep the checked mirror separate from the original suite. Both profiles use
+# DuckDB 2's default PEG parser; this is not a second-parser coverage claim.
+TEST_RUNNER_PEG_RELEASE = $(PYTHON_VENV_BIN) scripts/run_sqllogictest_with_peg_parser.py --default-parser --test-dir test/sql --external-extension build/release/$(EXTENSION_NAME).duckdb_extension
 test_peg_parser: ensure-pinned-duckdb-test-host release test_extension_release_peg_parser_internal
 
 test_extension_release_peg_parser_internal: check_configure emulator-start
 	@bash tests/setup_sqllogic_db.sh
-	@echo "Running RELEASE tests with the opt-in PEG parser.."
+	@echo "Running RELEASE tests with the default PEG parser mirror.."
 	@$(TEST_RUNNER_PEG_RELEASE)
 
 # autocomplete is installed once from DuckDB's exact-version core repository,

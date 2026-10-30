@@ -19,8 +19,8 @@ def assert_exact_duckdb_version(actual: str, expected: str) -> None:
 def assert_metadata_validation_enabled(connection) -> None:
     value = connection.execute(
         "SELECT current_setting('allow_extensions_metadata_mismatch')"
-    ).fetchone()
-    if value not in ((False,), ("false",)):
+    ).fetchall()
+    if value not in ([(False,)], [("false",)]):
         raise RuntimeError(f"metadata mismatch validation is not enabled: {value!r}")
 
 
@@ -28,17 +28,17 @@ def assert_autocomplete_loaded(connection) -> None:
     state = connection.execute(
         "SELECT installed, loaded, installed_from "
         "FROM duckdb_extensions() WHERE extension_name = 'autocomplete'"
-    ).fetchone()
-    if state is None or state[0:2] != (True, True) or state[2] != "core":
+    ).fetchall()
+    if len(state) != 1 or state[0][0:2] != (True, True) or state[0][2] != "core":
         raise RuntimeError(f"autocomplete was not loaded from DuckDB core: {state!r}")
 
 
 def assert_both_extensions_usable(connection) -> None:
-    connection.execute("CALL enable_peg_parser()")
+    # DuckDB 2 uses PEG by default; its 1.x activation procedure no longer exists.
     result = connection.execute(
         "SELECT interval_to_iso8601(INTERVAL '1 day')"
-    ).fetchone()
-    if result != ("P1D",):
+    ).fetchall()
+    if result != [("P1D",)]:
         raise RuntimeError(f"spanner scalar was not usable after loading: {result!r}")
 
 

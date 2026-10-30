@@ -35,6 +35,20 @@ class MirrorTestSuiteTests(unittest.TestCase):
                 peg_sqllogictest.PEG_PREAMBLE + b"query I\nSELECT 1;\n",
             )
 
+    def test_default_peg_does_not_call_removed_activation(self) -> None:
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            payload = b"query I\nSELECT 42;\n"
+            (source / "first.test").write_bytes(payload)
+            destination = root / "destination"
+            self.assertEqual(peg_sqllogictest.mirror_test_suite(source, destination, default_parser=True), 1)
+            contents = (destination / "first.test").read_bytes()
+            self.assertTrue(contents.endswith(payload))
+            self.assertNotIn(b"enable_peg_parser", contents)
+            self.assertIn(b"autoinstall_known_extensions = false", contents)
+
     def test_rejects_an_empty_suite(self) -> None:
         with TemporaryDirectory() as directory:
             root = Path(directory)

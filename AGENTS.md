@@ -6,8 +6,8 @@ Rust DuckDB extension for querying Google Cloud Spanner databases.
 
 ```sh
 cargo check                    # type-check
-cargo test                     # unit tests + integration tests (requires Docker)
-cargo test test_name           # run a single test by name substring
+cargo test --features static-extension # unit tests + integration tests (requires Docker)
+cargo test --features static-extension test_name           # run a single test by name substring
 cargo build --release --features loadable-extension  # build loadable extension (.so/.dylib)
 ```
 
@@ -38,12 +38,12 @@ Docker (Colima on macOS) must be running. `RUST_TEST_THREADS=4` is set in `.carg
 ## Architecture
 
 - **Table functions**: `spanner_query` (SQL), `spanner_scan` (Read API), `spanner_ddl`/`spanner_ddl_async`, `spanner_operations`, `spanner_tables`
-- **Scalar functions**: `spanner_value`, `spanner_typed`, `spanner_params`, `interval_to_iso8601` (native VScalar; replaces former SQL macros)
+- **Scalar functions**: `spanner_value`, `spanner_typed`, `spanner_params`, `interval_to_iso8601` (native v2 scalar callback; replaces former SQL macros)
 - **COPY TO**: `FORMAT spanner` via DuckDB Copy Function C API
 - **Config options**: registered via DuckDB Config Options C API (`src/config.rs`)
 - **SQL macros**: `src/macros.sql` (loaded at extension init)
-- Manual C API init in `src/lib.rs` (not using `#[duckdb_entrypoint_c_api]` macro because raw `duckdb_connection` is needed for config/copy registration)
-- `register_spanner_extension` orchestrates prepared config/COPY/scalar C registrations, VTabs/macros, and final replacement-scan installation as one checked initialization path
+- Native C API v2 entrypoint through exact-pinned `duckdb-neo` in `src/lib.rs`; public Context settings are copied into owned bind snapshots. No private BindInfo/vector layout casts.
+- `register_spanner_extension(&Extension)` registers config first, then COPY/scalars/table functions/macros, with replacement scan last. Config duplicates reject retries after partial initialization; v2 macro registration has no batch rollback and temporary user macros may shadow extension names.
 
 ## Google Cloud Rust client
 
@@ -56,8 +56,8 @@ The upstream crates are currently consumed from a pinned git revision. Keep all 
 
 1. Replace the revision on every direct `google-cloud-*` dependency sourced from `googleapis/google-cloud-rust` in `Cargo.toml`; do not mix revisions.
 2. Run `cargo check` to refresh `Cargo.lock`, then run `make check-google-cloud-rust`. The guard checks the direct revision alignment and the normal dependency graph for every target, rejecting `aws-lc-rs` and `aws-lc-sys` so the Windows MinGW artifact remains buildable.
-3. Run `cargo fmt --check`, `cargo test --lib`, and `cargo clippy --features loadable-extension`.
-4. Run `make configure release test_release` and `cargo test --test integration_test` serially because both use the Spanner emulator.
+3. Run `cargo fmt --check`, `cargo test --features static-extension --lib`, and `cargo clippy --features loadable-extension`.
+4. Run `make configure release test_release` and `cargo test --features static-extension --test integration_test` serially because both use the Spanner emulator.
 5. Before merging, verify the distribution pipeline's platform-artifact matrix, including Windows MinGW, and both emulator jobs (`SQLLogicTest` and `Rust integration tests`).
 
 ## Test infrastructure
@@ -79,3 +79,16 @@ Both GoogleSQL and PostgreSQL dialect databases coexist on the same emulator ins
 
 Supports both GoogleSQL and PostgreSQL dialect (auto-detected from Spanner metadata).
 PG table names cannot start with `pg_` prefix.
+
+## Experimental DuckDB 2 C API v2 migration
+
+The native backend is `duckdb-neo =0.20000.1`, engine 2.0.0. Existing 1.5.6 artifacts remain ABI-incompatible; never relabel them. Rust tests use `--features static-extension` to invoke the same v2 entrypoint through DuckDB's static descriptor. The classic duckdb-rs dev dependency is only a client driving those tests. Loadable builds use `--features loadable-extension`; these two features are mutually exclusive. Check both production and test modes:
+
+```sh
+cargo clippy --lib --features loadable-extension -- -D warnings
+cargo clippy --all-targets --features static-extension -- -D warnings
+cargo test --features static-extension --lib
+cargo test --features static-extension --test integration_test
+```
+
+COPY's Spanner row commit cap is `mutation_batch_size` (1..80000, default 1000). Generic engine `BATCH_SIZE` is a separate hint and cannot be read by format bind. Decode engine-retained input and commit bounded windows only in flush; batch/finalize must not commit. Preserve earlier-confirmed rows and unknown-final-batch outcome errors. v2 uses PEG by default; `make test_peg_parser` is a checked mirror profile, not a second parser or a call to the removed activation procedure.

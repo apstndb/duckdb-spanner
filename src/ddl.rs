@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use duckdb::core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId};
-use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab, Value};
+use crate::duck::{BindInfo, InitInfo, TableFunctionInfo, VTab, Value};
+use crate::duck::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
 use google_cloud_auth::credentials::anonymous::Builder as Anonymous;
 use google_cloud_gax::options::RequestOptionsBuilder;
 use google_cloud_gax::paginator::Paginator;
@@ -1568,12 +1568,12 @@ impl VTab for SpannerDdlVTab {
             bind.add_result_column(
                 "operation_name",
                 LogicalTypeHandle::from(LogicalTypeId::Varchar),
-            );
-            bind.add_result_column("done", LogicalTypeHandle::from(LogicalTypeId::Boolean));
+            )?;
+            bind.add_result_column("done", LogicalTypeHandle::from(LogicalTypeId::Boolean))?;
             bind.add_result_column(
                 "duration_secs",
                 LogicalTypeHandle::from(LogicalTypeId::Double),
-            );
+            )?;
 
             Ok(DdlBindData {
                 profile,
@@ -1585,7 +1585,7 @@ impl VTab for SpannerDdlVTab {
 
     fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
         vtab_safety::guard_callback("SpannerDdlVTab", "init", || {
-            let bind_data = unsafe { &*init.get_bind_data::<DdlBindData>() };
+            let bind_data = init.get_bind_data::<DdlBindData>();
 
             let result = cached_init_result(&bind_data.cached_result, || {
                 let profile = bind_data.profile.clone();
@@ -1645,20 +1645,13 @@ impl VTab for SpannerDdlVTab {
 
             match result {
                 Some(r) => {
-                    let col_name = output.flat_vector(0);
-                    col_name.insert(0, &r.operation_name);
-                    let mut col_done = output.flat_vector(1);
-                    let mut col_duration = output.flat_vector(2);
-                    // SAFETY: the bind phase registers these columns as BOOLEAN and DOUBLE,
-                    // and index 0 is within the single-row output batch.
-                    unsafe {
-                        col_done.as_mut_slice::<bool>()[0] = r.done;
-                        col_duration.as_mut_slice::<f64>()[0] = r.duration_secs;
-                    }
-                    output.set_len(1);
+                    output.set_len(1)?;
+                    output.set(0, 0, r.operation_name.as_str())?;
+                    output.set(1, 0, r.done)?;
+                    output.set(2, 0, r.duration_secs)?;
                 }
                 None => {
-                    output.set_len(0);
+                    output.set_len(0)?;
                 }
             }
 
@@ -1714,8 +1707,8 @@ impl VTab for SpannerDdlAsyncVTab {
             bind.add_result_column(
                 "operation_name",
                 LogicalTypeHandle::from(LogicalTypeId::Varchar),
-            );
-            bind.add_result_column("done", LogicalTypeHandle::from(LogicalTypeId::Boolean));
+            )?;
+            bind.add_result_column("done", LogicalTypeHandle::from(LogicalTypeId::Boolean))?;
 
             Ok(DdlAsyncBindData {
                 profile,
@@ -1727,7 +1720,7 @@ impl VTab for SpannerDdlAsyncVTab {
 
     fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
         vtab_safety::guard_callback("SpannerDdlAsyncVTab", "init", || {
-            let bind_data = unsafe { &*init.get_bind_data::<DdlAsyncBindData>() };
+            let bind_data = init.get_bind_data::<DdlAsyncBindData>();
 
             let result = cached_init_result(&bind_data.cached_result, || {
                 let profile = bind_data.profile.clone();
@@ -1772,18 +1765,12 @@ impl VTab for SpannerDdlAsyncVTab {
 
             match result {
                 Some(r) => {
-                    let col_name = output.flat_vector(0);
-                    col_name.insert(0, &r.operation_name);
-                    let mut col_done = output.flat_vector(1);
-                    // SAFETY: the bind phase registers this column as BOOLEAN, and index 0
-                    // is within the single-row output batch.
-                    unsafe {
-                        col_done.as_mut_slice::<bool>()[0] = r.done;
-                    }
-                    output.set_len(1);
+                    output.set_len(1)?;
+                    output.set(0, 0, r.operation_name.as_str())?;
+                    output.set(1, 0, r.done)?;
                 }
                 None => {
-                    output.set_len(0);
+                    output.set_len(0)?;
                 }
             }
 
@@ -1838,20 +1825,20 @@ impl VTab for SpannerOperationsVTab {
             profile.ensure_admin_transport()?;
             let filter = bind_utils::get_named_string(bind, "filter");
 
-            bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-            bind.add_result_column("done", LogicalTypeHandle::from(LogicalTypeId::Boolean));
+            bind.add_result_column("name", LogicalTypeHandle::from(LogicalTypeId::Varchar))?;
+            bind.add_result_column("done", LogicalTypeHandle::from(LogicalTypeId::Boolean))?;
             bind.add_result_column(
                 "metadata_type",
                 LogicalTypeHandle::from(LogicalTypeId::Varchar),
-            );
+            )?;
             bind.add_result_column(
                 "error_code",
                 LogicalTypeHandle::from(LogicalTypeId::Integer),
-            );
+            )?;
             bind.add_result_column(
                 "error_message",
                 LogicalTypeHandle::from(LogicalTypeId::Varchar),
-            );
+            )?;
 
             Ok(OperationsBindData { profile, filter })
         })
@@ -1859,7 +1846,7 @@ impl VTab for SpannerOperationsVTab {
 
     fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
         vtab_safety::guard_callback("SpannerOperationsVTab", "init", || {
-            let bind_data = unsafe { &*init.get_bind_data::<OperationsBindData>() };
+            let bind_data = init.get_bind_data::<OperationsBindData>();
 
             let profile = bind_data.profile.clone();
             let filter = bind_data.filter.clone();
@@ -1889,45 +1876,22 @@ impl VTab for SpannerOperationsVTab {
                 .unwrap_or_else(|e| e.into_inner());
 
             if ops.is_empty() {
-                output.set_len(0);
+                output.set_len(0)?;
                 return Ok(());
             }
 
             // Drain at most one DuckDB data chunk per call.
-            let batch_size = ops.len().min(crate::vector_size::runtime_vector_size());
+            let batch_size = ops.len().min(output.capacity()?);
             let batch: Vec<OperationRow> = ops.drain(..batch_size).collect();
 
-            let col_name = output.flat_vector(0);
-            let mut col_done = output.flat_vector(1);
-            let col_metadata_type = output.flat_vector(2);
-            let mut col_error_code = output.flat_vector(3);
-            let mut col_error_message = output.flat_vector(4);
-
-            // SAFETY: the bind phase registers `done` as BOOLEAN, and the loop
-            // only writes indices within the drained batch size.
-            let done_values = unsafe { col_done.as_mut_slice::<bool>() };
+            output.set_len(batch.len())?;
             for (i, row) in batch.iter().enumerate() {
-                col_name.insert(i, &row.name);
-                done_values[i] = row.done;
-                col_metadata_type.insert(i, &row.metadata_type);
-                if row.error_code.is_none() {
-                    col_error_code.set_null(i);
-                }
-                match &row.error_message {
-                    Some(msg) => col_error_message.insert(i, msg),
-                    None => col_error_message.set_null(i),
-                }
+                output.set(0, i, row.name.as_str())?;
+                output.set(1, i, row.done)?;
+                output.set(2, i, row.metadata_type.as_str())?;
+                output.set(3, i, row.error_code)?;
+                output.set(4, i, row.error_message.as_deref())?;
             }
-            // SAFETY: the bind phase registers `error_code` as INTEGER, and the loop
-            // only writes indices within the drained batch size.
-            let error_code_values = unsafe { col_error_code.as_mut_slice::<i32>() };
-            for (i, row) in batch.iter().enumerate() {
-                if let Some(code) = row.error_code {
-                    error_code_values[i] = code;
-                }
-            }
-
-            output.set_len(batch.len());
             Ok(())
         })
     }
@@ -2226,7 +2190,6 @@ fn instance_path_from_database_path(database_path: &str) -> Result<&str, Spanner
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::ffi::CString;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::{SyncSender, sync_channel};
@@ -2234,15 +2197,11 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use duckdb::ffi::{
-        DUCKDB_TYPE_DUCKDB_TYPE_BIGINT, DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR, duckdb_create_int64,
-        duckdb_create_list_value, duckdb_create_logical_type, duckdb_create_null_value,
-        duckdb_create_varchar, duckdb_destroy_logical_type, duckdb_destroy_value, duckdb_value,
-    };
     use google_cloud_gax::error::rpc::{Code, Status};
     use google_cloud_longrunning::model::Operation as InternalOperation;
     use reqwest::{Method, StatusCode};
 
+    use crate::duck::{LogicalTypeHandle, LogicalTypeId};
     use crate::error::SpannerError;
     use crate::runtime::test_support::TestRuntimeOwner;
 
@@ -3596,56 +3555,55 @@ mod tests {
         .await
     }
 
-    fn varchar_value(s: &str) -> duckdb::vtab::Value {
-        let c_str = CString::new(s).unwrap();
-        unsafe { duckdb::vtab::Value::from(duckdb_create_varchar(c_str.as_ptr())) }
+    fn snapshot(value: impl duckdb_neo::ToValue) -> crate::duck::Value {
+        let context = crate::test_support::connection();
+        crate::duck::Value::from_neo(value.value(&context).unwrap()).unwrap()
     }
-
-    fn null_value() -> duckdb::vtab::Value {
-        unsafe { duckdb::vtab::Value::from(duckdb_create_null_value()) }
+    fn varchar_value(s: &str) -> crate::duck::Value {
+        snapshot(s)
     }
-
-    fn bigint_value(value: i64) -> duckdb::vtab::Value {
-        unsafe { duckdb::vtab::Value::from(duckdb_create_int64(value)) }
+    fn null_value() -> crate::duck::Value {
+        snapshot(Option::<String>::None)
     }
-
-    fn varchar_list_value(values: &[&str]) -> duckdb::vtab::Value {
-        let c_strings: Vec<_> = values
+    fn bigint_value(value: i64) -> crate::duck::Value {
+        snapshot(value)
+    }
+    fn varchar_list_value(values: &[&str]) -> crate::duck::Value {
+        let context = crate::test_support::connection();
+        let child = LogicalTypeHandle::from(LogicalTypeId::Varchar)
+            .build(&context)
+            .unwrap();
+        let values = values
             .iter()
-            .map(|value| CString::new(*value).unwrap())
-            .collect();
-        let duckdb_values: Vec<_> = c_strings
-            .iter()
-            .map(|value| unsafe { duckdb_create_varchar(value.as_ptr()) })
-            .collect();
-
-        list_value(DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR, duckdb_values)
+            .map(|v| duckdb_neo::ToValue::value(v, &context).unwrap())
+            .collect::<Vec<_>>();
+        let value = duckdb_neo::connection::FFILink::create_value(
+            &context,
+            duckdb_neo::value::ValueInput::List {
+                child_type: &child,
+                children: &values,
+            },
+        )
+        .unwrap();
+        crate::duck::Value::from_neo(value).unwrap()
     }
-
-    fn bigint_list_value(values: &[i64]) -> duckdb::vtab::Value {
-        let duckdb_values: Vec<_> = values
+    fn bigint_list_value(values: &[i64]) -> crate::duck::Value {
+        let context = crate::test_support::connection();
+        let child = LogicalTypeHandle::from(LogicalTypeId::Bigint)
+            .build(&context)
+            .unwrap();
+        let values = values
             .iter()
-            .map(|value| unsafe { duckdb_create_int64(*value) })
-            .collect();
-
-        list_value(DUCKDB_TYPE_DUCKDB_TYPE_BIGINT, duckdb_values)
-    }
-
-    fn list_value(
-        child_type_id: duckdb::ffi::duckdb_type,
-        mut values: Vec<duckdb_value>,
-    ) -> duckdb::vtab::Value {
-        unsafe {
-            let mut child_type = duckdb_create_logical_type(child_type_id);
-            let value =
-                duckdb_create_list_value(child_type, values.as_mut_ptr(), values.len() as u64);
-            duckdb_destroy_logical_type(&mut child_type);
-
-            for mut value in values {
-                duckdb_destroy_value(&mut value);
-            }
-
-            duckdb::vtab::Value::from(value)
-        }
+            .map(|v| duckdb_neo::ToValue::value(v, &context).unwrap())
+            .collect::<Vec<_>>();
+        let value = duckdb_neo::connection::FFILink::create_value(
+            &context,
+            duckdb_neo::value::ValueInput::List {
+                child_type: &child,
+                children: &values,
+            },
+        )
+        .unwrap();
+        crate::duck::Value::from_neo(value).unwrap()
     }
 }

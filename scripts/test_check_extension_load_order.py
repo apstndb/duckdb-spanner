@@ -24,8 +24,8 @@ class AutocompleteStateTests(unittest.TestCase):
                 self.query = query
                 return self
 
-            def fetchone(self):
-                return (True, True, "core")
+            def fetchall(self):
+                return [(True, True, "core")]
 
         load_order.assert_autocomplete_loaded(Connection())
 
@@ -34,8 +34,8 @@ class AutocompleteStateTests(unittest.TestCase):
             def execute(self, query):
                 return self
 
-            def fetchone(self):
-                return (True, False, "core")
+            def fetchall(self):
+                return [(True, False, "core")]
 
         with self.assertRaisesRegex(RuntimeError, "autocomplete was not loaded"):
             load_order.assert_autocomplete_loaded(Connection())
@@ -47,8 +47,8 @@ class MetadataValidationTests(unittest.TestCase):
             def execute(self, query):
                 return self
 
-            def fetchone(self):
-                return (False,)
+            def fetchall(self):
+                return [(False,)]
 
         load_order.assert_metadata_validation_enabled(Connection())
 
@@ -57,8 +57,8 @@ class MetadataValidationTests(unittest.TestCase):
             def execute(self, query):
                 return self
 
-            def fetchone(self):
-                return (True,)
+            def fetchall(self):
+                return [(True,)]
 
         with self.assertRaisesRegex(RuntimeError, "metadata mismatch validation"):
             load_order.assert_metadata_validation_enabled(Connection())
