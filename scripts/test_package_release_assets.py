@@ -1,4 +1,6 @@
 import importlib.util
+import json
+import os
 from pathlib import Path
 import subprocess
 from tempfile import TemporaryDirectory
@@ -15,6 +17,44 @@ TEST_DUCKDB_VERSION = "v9.8.7"
 
 
 class PackageReleaseAssetsTests(unittest.TestCase):
+    def test_workflow_selects_each_platform_artifact_for_configured_version(self) -> None:
+        # Exercise the workflow's actual jq assignment: a stale version prefix
+        # leaves no platform key, losing the per-platform download artifact ID.
+        workflow = SCRIPT.parent.parent / ".github/workflows/ReleaseAssets.yml"
+        source = workflow.read_text()
+        start = source.index("          artifact_ids=$(jq")
+        end = source.index("          artifact_ids_csv=", start)
+        artifacts = [
+            {
+                "name": f"spanner-{TEST_DUCKDB_VERSION}-extension-{platform}",
+                "id": index,
+            }
+            for index, platform in enumerate(packaging.PLATFORMS, start=1)
+        ]
+        environment = {
+            **os.environ,
+            "EXTENSION_NAME": "spanner",
+            "DUCKDB_VERSION": TEST_DUCKDB_VERSION,
+            "active_artifacts": json.dumps(artifacts),
+        }
+        result = subprocess.run(
+            [
+                "bash", "-eu", "-c",
+                source[start:end] + '\n printf "%s" "$artifact_ids"',
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(
+            json.loads(result.stdout),
+            {
+                platform: str(index)
+                for index, platform in enumerate(packaging.PLATFORMS, 1)
+            },
+        )
+
     def create_inputs(self, root: Path) -> dict[str, bytes]:
         payloads = {}
         for platform in packaging.PLATFORMS:
