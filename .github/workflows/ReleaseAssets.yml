@@ -132,9 +132,9 @@ jobs:
             exit 1
           fi
 
-          artifact_ids=$(jq -c '
+          artifact_ids=$(jq -c --arg prefix "$EXTENSION_NAME-$DUCKDB_VERSION-extension-" '
             map({
-              key: (.name | sub("^spanner-v1\\.5\\.6-extension-"; "")),
+              key: (.name | ltrimstr($prefix)),
               value: (.id | tostring)
             }) | from_entries
           ' <<<"$active_artifacts")
