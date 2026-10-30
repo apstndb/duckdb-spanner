@@ -22,7 +22,9 @@ brew install cargo-sweep
 
 ## Known Issues and Limitations
 
-- The DuckDB Rust binding is pinned to `duckdb = "=1.10506.0"`, which matches DuckDB `v1.5.6`.
+- The DuckDB Rust binding is pinned to `duckdb = "=1.10506.1"`, which matches DuckDB `v1.5.6`.
+  Configuration and every SQLLogicTest lane pin the Python host to this same ABI,
+  including when an existing virtualenv was upgraded to a newer DuckDB release.
   The upstream Rust extension template still requires the unstable C API (`USE_UNSTABLE_C_API=1` / `C_STRUCT_UNSTABLE`), so loadable extension binaries remain tied to the DuckDB version encoded in the extension metadata.
   The extension requests at least the DuckDB `v1.5.0` C API at load time because it uses C API functions added in the 1.5 line.
   The Makefile has one canonical ABI target, DuckDB `v1.5.6`, for both local and distribution builds. Local metadata generation checks the detected CLI version before compiling and rejects a mismatched `DUCKDB_VERSION` override; an override cannot relabel a binary built for another DuckDB version.
@@ -45,7 +47,7 @@ brew install cargo-sweep
   should cast selected values to a supported native type before reading them.
 
 - DuckDB `GEOMETRY` is not used yet.
-  DuckDB 1.5 exposes `GEOMETRY` in the C API, and duckdb-rs `1.10506.0` exposes it as WKB with CRS metadata, but this extension has no current Spanner type mapping that requires geometry output.
+  DuckDB 1.5 exposes `GEOMETRY` in the C API, and duckdb-rs `1.10506.1` exposes it as WKB with CRS metadata, but this extension has no current Spanner type mapping that requires geometry output.
 
 - GoogleSQL `DATETIME` is unsupported until the Spanner data-plane API exposes a lossless type representation. It is never silently mapped to `STRING`.
 

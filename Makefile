@@ -28,6 +28,9 @@ EMULATOR_IMAGE := gcr.io/cloud-spanner-emulator/emulator:1.5.56@sha256:18a56fd55
 # This is the compile-time ABI target, not a caller-selectable metadata value.
 override DUCKDB_TARGET_VERSION := v1.5.6
 DUCKDB_TEST_HOST_VERSION := $(patsubst v%,%,$(DUCKDB_TARGET_VERSION))
+# The unstable extension ABI must not follow PyPI's latest DuckDB release.
+# Keep new virtualenvs and reused test environments on the compiled target.
+override DUCKDB_TEST_VERSION := $(DUCKDB_TEST_HOST_VERSION)
 DUCKDB_MISMATCH_TEST_VERSION := 1.5.5
 DUCKDB_BIN ?= duckdb
 DUCKDB_CLI_VERSION := $(shell "$(DUCKDB_BIN)" --version 2>/dev/null | sed -nE 's/^v?([0-9]+\.[0-9]+\.[0-9]+).*/v\1/p')
@@ -127,12 +130,9 @@ test: test_release
 test_debug: test_extension_debug
 test_release: test_extension_release
 
-# These compatibility lanes use explicit DuckDB wheel versions. Do not reuse
-# extension-ci-tools' default (latest) test-host selection for unstable ABI checks.
-ensure-pinned-duckdb-test-host:
-	@if [ ! -x "$(PYTHON_VENV_BIN)" ]; then \
-		$(MAKE) --no-print-directory configure DUCKDB_TEST_VERSION=$(DUCKDB_TEST_HOST_VERSION); \
-	fi
+# All test lanes use the exact ABI host, including existing virtualenvs that
+# were created before the host pin or were subsequently upgraded by pip.
+ensure-pinned-duckdb-test-host: venv
 	@$(PYTHON_VENV_BIN) -m pip install --disable-pip-version-check "duckdb==$(DUCKDB_TEST_HOST_VERSION)"
 	@$(PYTHON_VENV_BIN) -c "import duckdb; assert duckdb.__version__ == '$(DUCKDB_TEST_HOST_VERSION)', duckdb.__version__"
 
@@ -197,7 +197,9 @@ endif
 endif
 
 # Always refresh extension version from Cargo.toml (avoid stale git-hash file).
-extension_version:
+# Override the prerequisite's recipe too: it can run before venv creates
+# configure/ in a fresh parallel build.
+extension_version configure/extension_version.txt:
 	@mkdir -p configure
 	@echo "$(EXTENSION_VERSION)" > configure/extension_version.txt
 
@@ -215,7 +217,13 @@ build_extension_library_release: check_configure check-target-duckdb-version
 	$(PYTHON_VENV_BIN) -c "from pathlib import Path;Path('$(EXTENSION_BUILD_PATH)/release/extension/$(EXTENSION_NAME)').mkdir(parents=True, exist_ok=True)"
 	$(PYTHON_VENV_BIN) -c "import shutil;shutil.copyfile('$(CARGO_TARGET_PATH)/release$(IS_EXAMPLE)/$(EXTENSION_LIB_FILENAME)', '$(EXTENSION_BUILD_PATH)/release/$(EXTENSION_LIB_FILENAME)')"
 
-configure: venv platform extension_version
+configure: ensure-pinned-duckdb-test-host platform extension_version
+
+# configure_helper imports DuckDB to identify the platform. Under parallel
+# make it must wait for both virtualenv creation and the exact host pin.
+platform: ensure-pinned-duckdb-test-host
+
+test_extension_release_internal test_extension_debug_internal test_extension_release_peg_parser_internal: ensure-pinned-duckdb-test-host
 
 debug: check-target-duckdb-version build_extension_library_debug build_extension_with_metadata_debug
 release: check-target-duckdb-version build_extension_library_release build_extension_with_metadata_release
