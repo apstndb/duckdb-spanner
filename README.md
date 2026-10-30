@@ -22,21 +22,39 @@ brew install cargo-sweep
 
 ## Known Issues and Limitations
 
-- The DuckDB Rust binding is pinned to `duckdb = "=1.10506.1"`, which matches DuckDB `v1.5.6`.
-  Configuration and every SQLLogicTest lane pin the Python host to this same ABI,
-  including when an existing virtualenv was upgraded to a newer DuckDB release.
-  The upstream Rust extension template still requires the unstable C API (`USE_UNSTABLE_C_API=1` / `C_STRUCT_UNSTABLE`), so loadable extension binaries remain tied to the DuckDB version encoded in the extension metadata.
-  The extension requests at least the DuckDB `v1.5.0` C API at load time because it uses C API functions added in the 1.5 line.
-  The Makefile has one canonical ABI target, DuckDB `v1.5.6`, for both local and distribution builds. Local metadata generation checks the detected CLI version before compiling and rejects a mismatched `DUCKDB_VERSION` override; an override cannot relabel a binary built for another DuckDB version.
+The local `0.5.0-alpha.1` migration targets DuckDB 2.0.0. It is an experimental
+ABI and Rust API change, not a release or a stability promise.
 
-- This project depends on the official [googleapis/google-cloud-rust](https://github.com/googleapis/google-cloud-rust) Spanner crates.
-  Partitioned reads and queries use the official partition APIs; no local client fork is required.
+- This experimental branch targets exact DuckDB `v2.0.0` through
+  `duckdb-neo =0.20000.1` and its native C API v2 entrypoint. Configuration,
+  SQLLogicTest hosts and distribution metadata use that exact engine version.
+  Existing 1.5.6 artifacts are ABI-incompatible and must not be relabeled.
+  The Google Cloud client remains pinned separately; the engine migration does
+  not imply adoption of a newer client or support for new Spanner types.
 
-- Extension initialization is intentionally manual rather than using `#[duckdb_entrypoint_c_api]`.
-  The extension needs a raw `duckdb_connection` to register session config options and the `COPY TO ... FORMAT spanner` copy function, and duckdb-rs currently exposes those APIs only through `duckdb::ffi`.
-  Initialization preflights config, scalar, table-function, and macro names through `duckdb_settings()` and `duckdb_functions()`, prepares every native C API builder before mutation, then checks every registration status and reaches `Ready` only after all required stages complete. Config options are the first mutation and therefore form a preflight-visible retry barrier. COPY follows because DuckDB exposes no stable public COPY-function catalog lookup and permits duplicate COPY names; putting it after config guarantees that a failed attempt cannot leave COPY as the only residue. Loading this extension claims the global COPY format name `spanner`. DuckDB 1.5.6 silently replaces an existing handler with that name, and the stable C API cannot detect the collision; load order therefore determines ownership. A successful COPY registration status proves that this handler was installed, not that the name was previously unused. Scalars follow before table functions so a native registration failure cannot leave a higher-level SQL surface that appears usable. duckdb-rs does not expose separate prepare or unregister operations for table functions, so a table-function failure can still leave the C registrations and earlier table functions. SQL macros are installed as one rollback-capable transaction after their dependencies, and the replacement scan is last.
-  DuckDB exposes no stable public removal API or shared registration transaction for config, COPY, scalar, table-function, and replacement-scan registration. The macro transaction is the only stage this initializer can roll back. An unexpected later registration failure can therefore leave earlier native registrations in the database catalog. A fresh load attempt still fails deterministically because config registration precedes every later mutation and is found by preflight; function and macro residues are preflighted as additional defense. `duckdb_add_replacement_scan` returns no status and has no removal API, so initialization cannot verify or roll it back and installs it only after every status-returning stage succeeds.
-  Version 0.4.0 intentionally consolidates the Rust registration API as the breaking `register_spanner_extension(db, raw_con, &connection) -> Result<(), RegistrationError>`. The former public split-stage helpers are no longer exposed because calling them independently could bypass preflight and leave a misleading partial surface. Both supplied connections must be in autocommit mode; registration independently detects and rejects caller-owned transactions on `raw_con` and the Rust connection before any mutation.
+- Configuration access and result writes use public factory/context/value APIs;
+  callback contexts are never retained. Bind copies settings, endpoint/TLS
+  material and input values into owned snapshots, so a later `SET` does not
+  alter an already prepared execution. The only handwritten production `unsafe`
+  is the static descriptor registration used for embedded testing.
+
+- Three explicit v2 compatibility differences apply. The Spanner commit row
+  cap in COPY is now `mutation_batch_size` (default 1000, range 1..80000).
+  Generic DuckDB `BATCH_SIZE` is an engine hint consumed before format bind;
+  it is not the Spanner cap. There is no public entrypoint catalog query for
+  preflighting existing temporary user macros, which may shadow these names.
+  Native registrations also persist after a caller SQL `ROLLBACK`; load the
+  extension outside application transactions. Macro registration is sequential
+  rather than rollback-capable as a batch:
+  a later initialization failure can leave earlier registrations. Config options
+  register first, so retry fails deterministically instead of completing over
+  a partial surface. Replacement scan is installed last.
+
+- The Rust registration API is now
+  `register_spanner_extension(&duckdb_neo::extension::Extension)`.
+  `register_static_extension()` (feature `static-extension`) initializes that
+  same v2 entrypoint before opening an embedded database. The old raw database
+  and connection registration API and private handle casts are removed.
 
 - Native results remain the default, including Spanner JSON mapped to DuckDB `JSON`.
   The explicit `spanner_query_variant` and `spanner_scan_variant` table macros cast
@@ -46,14 +64,9 @@ brew install cargo-sweep
   The Rust binding still cannot decode raw VARIANT columns directly; Rust callers
   should cast selected values to a supported native type before reading them.
 
-- DuckDB `GEOMETRY` is not used yet.
-  DuckDB 1.5 exposes `GEOMETRY` in the C API, and duckdb-rs `1.10506.1` exposes it as WKB with CRS metadata, but this extension has no current Spanner type mapping that requires geometry output.
+- DuckDB `GEOMETRY` remains unmapped because no current Spanner result type requires it.
 
 - GoogleSQL `DATETIME` is unsupported until the Spanner data-plane API exposes a lossless type representation. It is never silently mapped to `STRING`.
-
-- Some DuckDB vector writes still cross unsafe API boundaries:
-  fast UTF-8 string vector writes use raw C API escape hatches because safe duckdb-rs wrappers are missing for the exact operation (`src/convert.rs`), and fixed-size vector slices use duckdb-rs `unsafe` APIs (`src/ddl.rs`, `src/convert.rs`).
-  Keep the layout checks and local safety comments when touching those paths.
 
 - `database_role` ([fine-grained access control](https://cloud.google.com/spanner/docs/fgac-about)) is not yet supported as a named parameter. The official Rust Spanner client does not expose `creator_role` for session creation (the underlying `BatchCreateSessionsRequest.session_template` supports it, but the client hardcodes it to `None`).
 
@@ -65,7 +78,7 @@ brew install cargo-sweep
 
 - `parallelism_mode` controls the [partitioned API](https://cloud.google.com/spanner/docs/reads#read_data_in_parallel) (required for Data Boost). `auto` falls back to a single non-partitioned query/read only when partitioned execution fails **before any row is delivered**; `required` propagates every partition error; `off` skips partition APIs entirely. Partitions are executed concurrently, each with its own session from the pool.
 
-- `COPY TO ... FORMAT spanner` commits each `batch_size` chunk independently; a mid-COPY failure leaves earlier batches committed. Use idempotent write modes (e.g. `insert_or_update`) when retrying.
+- `COPY TO ... FORMAT spanner` commits each `mutation_batch_size` chunk independently; a mid-COPY failure leaves earlier batches committed. Use idempotent write modes (e.g. `insert_or_update`) when retrying.
 
 - Named parameters with empty string values (`project := ''`) are treated as absent (see `bind_utils::get_named_string`). `database_path` cannot be combined with `project`/`instance`/`database` named parameters.
 
@@ -101,7 +114,7 @@ exact annotated release-tag commit. Dispatch the **Stage Release Assets**
 workflow at that tag ref, providing the tag and source run ID. The workflow
 requires its dispatch ref, tag, source run, and empty draft release to agree on
 that commit, smoke-loads five platform artifacts on matching native DuckDB
-`v1.5.6` runners, packages each verified binary as the sole canonical member of
+`v2.0.0` runners, packages each verified binary as the sole canonical member of
 a platform ZIP, generates `SHA256SUMS` for those archives, and attaches them to
 the draft. Before upload, it creates GitHub/Sigstore build-provenance
 attestations for the six final ZIPs and `SHA256SUMS`. These attestations bind the
@@ -120,7 +133,7 @@ replaced by a release event; releases created outside this flow receive no
 automatic assets.
 
 Each platform archive includes its target platform in the asset name, for
-example `spanner-v1.5.6-linux_amd64.zip`. Every archive contains exactly one
+example `spanner-v2.0.0-linux_amd64.zip`. Every archive contains exactly one
 file named `spanner.duckdb_extension`. Keep that canonical filename when
 extracting it: DuckDB derives the extension initialization symbol from the
 filename. Verify the ZIP against `SHA256SUMS`, extract it into an empty
@@ -129,7 +142,7 @@ directory, and load that sole member without renaming it.
 Verify a downloaded release ZIP's GitHub provenance against this repository:
 
 ```bash
-gh attestation verify --repo apstndb/duckdb-spanner spanner-v1.5.6-linux_amd64.zip
+gh attestation verify --repo apstndb/duckdb-spanner spanner-v2.0.0-linux_amd64.zip
 ```
 
 This provenance attestation is separate from DuckDB extension signing. The
@@ -163,7 +176,7 @@ For a quick build-and-launch workflow:
 make duckdb
 ```
 
-`make duckdb` requires `DUCKDB_BIN` to report DuckDB `v1.5.6` and loads the extension into that CLI. Use `DUCKDB_BIN=/path/to/duckdb make duckdb` to select a specific CLI. `DUCKDB_VERSION=v1.5.6` is accepted as an explicit metadata value; other versions fail before the extension is built.
+`make duckdb` requires `DUCKDB_BIN` to report DuckDB `v2.0.0` and loads the extension into that CLI. Use `DUCKDB_BIN=/path/to/duckdb make duckdb` to select a specific CLI. `DUCKDB_VERSION=v2.0.0` is accepted as an explicit metadata value; other versions fail before the extension is built.
 
 ### Authentication
 
@@ -379,9 +392,9 @@ DuckDB may also promote native operands to VARIANT when combining them with
 VARIANT values in `CASE`, `COALESCE`, or set operations. Cast/extract explicitly
 when the combined expression needs a particular native type.
 
-On DuckDB 1.5.6, use `value::JSON` to serialize a VARIANT object/array to JSON;
-`to_json(value)` may instead encode its display string. Casting a VARIANT null to
-JSON yields JSON `null` and does not restore whether the source was SQL NULL.
+On DuckDB 2.0.0, both `value::JSON` and `to_json(value)` serialize VARIANT
+objects/arrays as JSON. A standalone VARIANT null serializes as SQL NULL,
+including when it came from JSON `null`; serialization cannot recover its origin.
 
 For selective conversion or JSON exclusion, use explicit projection:
 
@@ -398,7 +411,7 @@ is an implicit extension setting.
 These are output wrappers; scalar parameter helpers and `COPY ... FORMAT spanner`
 do not infer Spanner types from VARIANT. Cast to explicitly known native types or
 use native results for writes. Export compatibility also depends on the value:
-DuckDB 1.5.6 cannot export an INTERVAL-valued VARIANT as Parquet VARIANT.
+DuckDB 2.0.0 cannot export an INTERVAL-valued VARIANT as Parquet VARIANT.
 
 ### Replacement Scan
 
@@ -614,7 +627,7 @@ DDL/admin waits use fixed, finite defaults:
 
 DDL submissions carry a unique operation ID and report its deterministic operation name in correlated errors. For real Spanner, an ambiguous final submission error triggers one operation lookup; a found operation is returned, while a failed lookup reports an explicit ambiguous outcome instead of hiding the uncertainty. The emulator can mutate schema before registering `operationId`, so its PATCH is retried only after a definitive pre-acceptance schema-contention rejection. Emulator timeouts, transport failures, HTTP 429, and every HTTP 5xx response trigger one deterministic operation lookup and are never followed by another PATCH; if the lookup fails, the error identifies the ambiguous operation and preserves both failure details. A polling deadline error names the elapsed bound; reaching it does not cancel an already-submitted Spanner operation.
 
-The pinned `duckdb-rs` table-function init API does not expose the current query's interruption state. These waits therefore cannot react immediately to `duckdb_interrupt`; the extension does not use unsafe private DuckDB access, and every wait remains bounded by the limits above.
+The pinned native v2 callback Context does not expose the current query's interruption state. These waits therefore cannot react immediately to a client interruption request; the extension does not use unsafe private DuckDB access, and every wait remains bounded by the limits above.
 
 ### `COPY TO` (Write to Spanner)
 
@@ -636,12 +649,12 @@ Options:
 | `endpoint_mode` | VARCHAR | (config) | `default`, `emulator`, `custom`, or `omni` |
 | `dialect` | VARCHAR | (auto-detected) | Database dialect: `'googlesql'` or `'postgresql'`; bypasses metadata discovery |
 | `mode` | VARCHAR | `insert_or_update` | Mutation mode: `insert`, `update`, `insert_or_update`, or `replace` |
-| `batch_size` | VARCHAR | `1000` | Rows per independent commit (1 to 80,000) |
+| `mutation_batch_size` | VARCHAR | `1000` | Maximum rows per Spanner commit (1 to 80,000) |
 | `columns` | VARCHAR[] | (none) | Target Spanner column names in source-column order |
 
-`batch_size` must be between 1 and 80,000. The upper bound matches Spanner's absolute mutations-per-commit ceiling, not a generally safe row count: each affected cell and secondary index entry counts toward that ceiling. Wide or indexed tables need a lower value. The mutation buffer grows with actual input rather than reserving the requested size up front.
+`mutation_batch_size` must be between 1 and 80,000. The upper bound matches Spanner's absolute mutations-per-commit ceiling, not a generally safe row count: each affected cell and secondary index entry counts toward that ceiling. Wide or indexed tables need a lower value. The mutation buffer grows with actual input rather than reserving the requested size up front.
 
-Each batch commits independently; COPY is not atomic across batches. After writing begins, an error reports `rows_written` for confirmed commits and states that earlier batches remain committed. A cancellation or deadline can leave the final batch's write outcome unknown. The default `insert_or_update` mode is idempotent and remains the safest choice when retrying after a partial failure.
+Flush boundaries may produce commits smaller than the cap. Each batch commits independently; COPY is not atomic across batches. After writing begins, an error reports `rows_written` for confirmed commits and states that earlier batches remain committed. A cancellation or deadline can leave the final batch's write outcome unknown. The default `insert_or_update` mode is idempotent and remains the safest choice when retrying after a partial failure.
 
 Within one batch, the SDK's replay-protected Commit RPC retries transient failures for up to three attempts, with a 30-second retry-policy threshold and a 30-second timeout for each attempt. An explicit Spanner `ABORTED` result retries the whole replay-protected transaction up to five attempts. Its 60-second total-time setting stops scheduling another transaction after the threshold is observed between attempts; it is not a hard wall-clock deadline for an already-running Begin or Commit RPC. When a retry budget is exhausted, or a cancellation, deadline, transport, or service error can leave the result uncertain, COPY reports the batch's write outcome as unknown rather than starting another transaction. The emulator's definitive schema-registration race retains its existing bounded retry and is not reported as ambiguous. Write errors report the attempted batch size, its COPY row range, and the number of rows confirmed before that batch.
 
@@ -831,15 +844,12 @@ make test               # alias for test_release
 
 Requires Docker (Colima on macOS). Emulator tests use `SPANNER_EMULATOR_HOST` (default `localhost:9010`).
 
-`make test_peg_parser` runs the same full SQLLogicTest suite on the exact
-DuckDB `v1.5.6` Python host after `CALL enable_peg_parser()` is applied to
-every test database. It is a separate lane: `make test_release` remains the
-legacy-parser acceptance run. `make test_duckdb_compatibility` verifies both
-load orders in separate processes between this extension and DuckDB's
-versioned core `autocomplete` extension, then proves the `v1.5.6`
-`C_STRUCT_UNSTABLE` artifact is rejected on an exact DuckDB `v1.5.5` host
-without metadata-mismatch opt-in. These
-compatibility targets use pinned DuckDB wheel versions, never a latest host.
+`make test_peg_parser` runs a checked mirror of the full SQLLogicTest suite on
+exact DuckDB `v2.0.0`, which uses PEG by default. It does not call the removed
+1.x activation procedure or claim two-parser coverage. `make test_duckdb_compatibility`
+verifies both load orders with exact-version core `autocomplete` in fresh
+processes, then verifies rejection of the 2.0 artifact by an exact 1.5.6 host
+without metadata-mismatch opt-in.
 
 Community Extensions builds can set `DUCKDB_SPANNER_OFFLINE_TESTS=1` through
 their descriptor's `test_config`. This keeps the standard `make test_release`
@@ -852,14 +862,36 @@ emulator-backed suite with this variable unset.
 Rust integration tests use testcontainers to start the emulator automatically. You only need a running Docker daemon:
 
 ```bash
-cargo test
+cargo test --features static-extension
 ```
 
 `.cargo/config.toml` sets `RUST_TEST_THREADS=4` to keep Docker/testcontainers resource usage bounded during concurrent test runs.
 
 ### Library-Mode Tests
 
-Rust integration tests call the one-shot `register_spanner_extension` orchestrator, matching the loadable initializer's preflight and stage ordering.
+Rust integration tests use the static descriptor to invoke the same v2 entrypoint and production callbacks as the loadable artifact. The classic duckdb-rs dev dependency only drives SQL as an embedded client.
+
+### Owned Rust parameters with v2
+
+Use Neo's owned `Value` objects and `ValueInput::Struct`, `List`, and `Array`
+constructors with declared child types. Typed NULL and empty lists keep their
+parameter types. `PreparedStatement::execute` retains its own snapshot before
+lazy execution, so the caller can drop the original value. For remote queries,
+pass the owned STRUCT to `spanner_query(..., params := $p)`; the macro still
+requires STRUCT rather than a serialized JSON string. Existing low-level
+`spanner_query_raw(..., params := ...)` retains the explicit JSON protocol.
+
+The offline example prints the resulting transport object without credentials
+or a Spanner connection:
+
+```sh
+cargo run --features static-extension --example owned_parameters
+```
+
+The static mode must link the exact DuckDB 2.0.0 engine; repository tests and this
+example obtain it from the bundled dev dependency. `loadable-extension` and
+`static-extension` are mutually exclusive build modes. The classic driver's
+incomplete composite `Value::data_type` path is not used for these parameters.
 
 ### Cleaning Stale Build Artifacts
 

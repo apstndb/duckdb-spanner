@@ -4,6 +4,9 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum SpannerError {
+    #[error("DuckDB error: {0}")]
+    DuckDB(#[from] duckdb_neo::Error),
+
     #[error("Google Cloud error: {0}")]
     GoogleCloud(#[source] Arc<google_cloud_gax::error::Error>),
 

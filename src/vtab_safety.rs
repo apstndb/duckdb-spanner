@@ -19,7 +19,7 @@ impl fmt::Display for CallbackError {
 impl Error for CallbackError {}
 
 /// Run a DuckDB VTab callback without allowing a Rust panic or an interior NUL
-/// in an error message to reach duckdb-rs's `extern "C"` callback wrappers.
+/// in an error message to reach DuckDB's callback and client exception boundaries.
 pub(crate) fn guard_callback<T>(
     vtab_name: &'static str,
     stage: &'static str,
@@ -42,8 +42,8 @@ pub(crate) fn guard_callback<T>(
     }
 }
 
-/// Validate an externally supplied result name before passing it to a
-/// duckdb-rs API that converts the name with `CString::new(...).unwrap()`.
+/// Keep result names compatible with SQL clients that use NUL-terminated names,
+/// even though the native v2 API itself accepts length-delimited strings.
 pub(crate) fn validate_result_name(name: &str, context: &str) -> Result<(), SpannerError> {
     let Some(byte_index) = name.as_bytes().iter().position(|byte| *byte == 0) else {
         return Ok(());
@@ -72,9 +72,10 @@ fn panic_payload_message(payload: &(dyn Any + Send)) -> &str {
 mod tests {
     use std::io;
 
-    use duckdb::Connection;
-    use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
-    use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
+    use crate::duck::{
+        BindInfo, DataChunkHandle, InitInfo, LogicalTypeHandle, LogicalTypeId, TableFunctionInfo,
+        VTab,
+    };
 
     use super::*;
 
@@ -105,9 +106,9 @@ mod tests {
                 if FAILURE == BIND_NUL_NAME {
                     let name = "value\0name";
                     validate_result_name(name, "query result column 0")?;
-                    bind.add_result_column(name, LogicalTypeHandle::from(LogicalTypeId::Boolean));
+                    bind.add_result_column(name, LogicalTypeHandle::from(LogicalTypeId::Boolean))?;
                 }
-                bind.add_result_column("value", LogicalTypeHandle::from(LogicalTypeId::Boolean));
+                bind.add_result_column("value", LogicalTypeHandle::from(LogicalTypeId::Boolean))?;
                 Ok(())
             })
         }
@@ -126,23 +127,28 @@ mod tests {
                 if FAILURE == FUNC_PANIC {
                     panic!("deliberate func panic");
                 }
-                output.set_len(0);
+                output.set_len(0)?;
                 Ok(())
             })
         }
     }
 
     fn query_error<const FAILURE: u8>(name: &str) -> String {
-        let connection = Connection::open_in_memory().unwrap();
-        connection
-            .register_table_function::<FailingVTab<FAILURE>>(name)
-            .unwrap();
-        connection
-            .execute_batch(&format!("SELECT * FROM {name}()"))
+        let connection = crate::test_support::connection();
+        crate::duck::register_for_tests::<FailingVTab<FAILURE>>(&connection, name, None).unwrap();
+        let error = connection
+            .execute(
+                format!("SELECT * FROM {name}()"),
+                duckdb_neo::Parameters::None,
+            )
             .unwrap_err()
-            .to_string()
+            .to_string();
+        // Every guarded failure, including a panic, must leave the connection usable.
+        connection
+            .execute("SELECT 42", duckdb_neo::Parameters::None)
+            .unwrap();
+        error
     }
-
     #[test]
     fn callback_panics_become_duckdb_errors() {
         for error in [
@@ -156,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn duckdb_rs_contains_unwrapped_callback_panics() {
+    fn native_adapter_guards_unwrapped_domain_callback_panics() {
         let error = query_error::<UPSTREAM_BIND_PANIC>("upstream_bind_panic");
         assert!(
             error.contains("unwrapped table bind callback panic"),

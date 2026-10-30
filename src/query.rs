@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
-use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
+use crate::duck::{BindInfo, InitInfo, TableFunctionInfo, VTab};
+use crate::duck::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::model::PartitionOptions;
 use google_cloud_spanner::model::request_options::Priority;
@@ -100,7 +100,7 @@ impl VTab for SpannerQueryVTab {
                             col.name
                         ))
                     })?;
-                bind.add_result_column(&col.name, logical_type);
+                bind.add_result_column(&col.name, logical_type)?;
             }
 
             Ok(QueryBindData {
@@ -120,8 +120,8 @@ impl VTab for SpannerQueryVTab {
 
     fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
         vtab_safety::guard_callback("SpannerQueryVTab", "init", || {
-            let bind_data = unsafe { &*init.get_bind_data::<QueryBindData>() };
-            let vector_size = vector_size::runtime_vector_size();
+            let bind_data = init.get_bind_data::<QueryBindData>();
+            let vector_size = vector_size::runtime_vector_size(init.context)?;
 
             let projected_columns = init
                 .get_column_indices()
@@ -223,7 +223,7 @@ impl VTab for SpannerQueryVTab {
             let batch = match init_data.streaming.next_batch()? {
                 Some(batch) => batch,
                 None => {
-                    output.set_len(0);
+                    output.set_len(0)?;
                     return Ok(());
                 }
             };
@@ -344,7 +344,7 @@ fn write_projected_rows<R: convert::ConversionRow>(
     }
 
     if rows.is_empty() {
-        output.set_len(0);
+        output.set_len(0)?;
         return Ok(());
     }
 
@@ -360,7 +360,7 @@ fn write_projected_rows<R: convert::ConversionRow>(
         )?;
     }
 
-    output.set_len(rows.len());
+    output.set_len(rows.len())?;
     Ok(())
 }
 
@@ -542,29 +542,34 @@ mod tests {
             },
         ];
         let rows = vec![TestRow(vec![7_i64.to_value(), "not-a-bool".to_value()])];
-        let mut output = DataChunkHandle::new(&[LogicalTypeId::Bigint.into()]);
+        let context = crate::test_support::connection();
+        let mut output = DataChunkHandle::new(&context, &[LogicalTypeId::Bigint.into()]);
 
         write_projected_rows(&mut output, &rows, &columns, &[0]).unwrap();
 
-        assert_eq!(output.len(), 1);
-        let values = output.flat_vector(0);
-        assert_eq!(unsafe { values.as_slice_with_len::<i64>(1) }, &[7]);
+        assert_eq!(output.len().unwrap(), 1);
+        assert_eq!(
+            output.value_at(0, 0).unwrap().get::<i64>().unwrap(),
+            Some(7)
+        );
     }
 
     #[test]
-    fn empty_query_projection_preserves_cardinality() {
+    fn count_only_query_projection_preserves_cardinality() {
         let columns = vec![ColumnInfo {
             name: "id".to_string(),
             spanner_type: scalar_type(TypeCode::Int64),
             is_generated: false,
         }];
         let rows = vec![TestRow(vec![7_i64.to_value()])];
-        let mut output = DataChunkHandle::new(&[]);
+        let context = crate::test_support::connection();
+        let mut output = DataChunkHandle::new(&context, &[LogicalTypeId::Bigint.into()]);
 
         write_projected_rows(&mut output, &rows, &columns, &[]).unwrap();
 
-        assert_eq!(output.len(), 1);
-        assert_eq!(output.num_columns(), 0);
+        assert_eq!(output.len().unwrap(), 1);
+        // The engine supplies a dummy vector for COUNT(*) projections.
+        assert_eq!(output.num_columns(), 1);
     }
 
     #[test]
@@ -575,7 +580,8 @@ mod tests {
             is_generated: false,
         }];
         let rows = vec![TestRow(vec![7_i64.to_value()])];
-        let mut output = DataChunkHandle::new(&[]);
+        let context = crate::test_support::connection();
+        let mut output = DataChunkHandle::new(&context, &[LogicalTypeId::Bigint.into()]);
 
         let error = write_projected_rows(&mut output, &rows, &columns, &[1]).unwrap_err();
 
@@ -585,6 +591,6 @@ mod tests {
                 .contains("index 1 exceeds result schema with 1 columns"),
             "{error}"
         );
-        assert_eq!(output.len(), 0);
+        assert_eq!(output.len().unwrap(), 0);
     }
 }

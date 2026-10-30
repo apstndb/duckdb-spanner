@@ -1,47 +1,34 @@
-//! Copy Function API (COPY TO) for writing data to Spanner.
-//!
-//! Usage:
-//! ```sql
-//! COPY my_table TO 'SpannerTable' (FORMAT spanner);
-//! COPY my_table TO 'SpannerTable' (FORMAT spanner,
-//!     database_path 'projects/p/instances/i/databases/d',
-//!     dialect 'googlesql',
-//!     mode 'insert_or_update',
-//!     batch_size 500);
-//! ```
-//!
-//! ## batch_size and mutation limits
-//!
-//! Spanner limits commits to **80,000 mutations** including affected cells and
-//! secondary index entries. The same row can therefore consume many mutations.
-//! `batch_size` is capped at 80,000 rows as an absolute guard, but the default
-//! of 1000 is more conservative and wide/indexed tables should use less.
-
-use std::ffi::{CStr, CString, c_void};
-use std::os::raw::c_char;
-use std::sync::Arc;
-use std::time::Duration;
-
-use duckdb::ffi;
-use google_cloud_gax::error::rpc::Code;
-use google_cloud_gax::retry_policy::RetryPolicyExt;
-use google_cloud_spanner::Error as SpannerClientError;
-use google_cloud_spanner::client::DatabaseClient;
-use google_cloud_spanner::mutation::Mutation;
-use google_cloud_spanner::retry_policy::SpannerRetryPolicy;
-use google_cloud_spanner::transaction::{BasicTransactionRetryPolicy, WriteOnlyTransaction};
-use google_cloud_spanner::types::{Type, TypeCode};
+//! Native v2 COPY: bounded Spanner mutation windows committed only from flush.
+use crate::{
+    client, config,
+    connection::{ConnectionProfile, EndpointMode},
+    duck::{LogicalTypeHandle, LogicalTypeId},
+    runtime, schema,
+};
+use duckdb_neo::{
+    Result as NeoResult,
+    column_data_collection::ColumnDataCollection,
+    connection::Context,
+    copy_function::{CopyFunctionBuilder, CopyToBindInfo, CopyToFunctionCallbacks},
+    extension::Extension,
+    value::Value as NeoValue,
+};
+use google_cloud_gax::{error::rpc::Code, retry_policy::RetryPolicyExt};
+use google_cloud_spanner::{
+    Error as SpannerClientError,
+    client::DatabaseClient,
+    mutation::Mutation,
+    retry_policy::SpannerRetryPolicy,
+    transaction::{BasicTransactionRetryPolicy, WriteOnlyTransaction},
+    types::{Type, TypeCode},
+};
 use google_cloud_spanner_admin_database_v1::model::DatabaseDialect;
-use prost_types::value::Kind;
-use prost_types::{ListValue, Value};
-
-use crate::RegistrationError;
-use crate::client;
-use crate::config;
-use crate::connection::{ConnectionProfile, EndpointMode};
-use crate::runtime;
-use crate::schema;
-
+use prost_types::{ListValue, Value, value::Kind};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 const DEFAULT_BATCH_SIZE: usize = 1000;
 const MAX_BATCH_SIZE: usize = 80_000;
 const EXPLICIT_EMULATOR_WRITE_MAX_ATTEMPTS: u32 = 5;
@@ -60,77 +47,9 @@ const COPY_OPTION_NAMES: &[&str] = &[
     "endpoint_mode",
     "dialect",
     "mode",
-    "batch_size",
+    "mutation_batch_size",
     "columns",
 ];
-
-// These guards mirror the caller-owned handles documented by DuckDB's C API.
-macro_rules! owned_duckdb_handle {
-    ($name:ident, $raw:ty, $destroy:path) => {
-        struct $name($raw);
-
-        impl $name {
-            unsafe fn from_raw(raw: $raw) -> Self {
-                Self(raw)
-            }
-
-            fn as_raw(&self) -> $raw {
-                self.0
-            }
-        }
-
-        impl Drop for $name {
-            fn drop(&mut self) {
-                if !self.0.is_null() {
-                    unsafe { $destroy(&mut self.0) };
-                }
-            }
-        }
-    };
-}
-
-owned_duckdb_handle!(
-    OwnedDuckDbValue,
-    ffi::duckdb_value,
-    ffi::duckdb_destroy_value
-);
-owned_duckdb_handle!(
-    OwnedDuckDbLogicalType,
-    ffi::duckdb_logical_type,
-    ffi::duckdb_destroy_logical_type
-);
-owned_duckdb_handle!(
-    OwnedDuckDbClientContext,
-    ffi::duckdb_client_context,
-    ffi::duckdb_destroy_client_context
-);
-owned_duckdb_handle!(
-    OwnedDuckDbCopyFunction,
-    ffi::duckdb_copy_function,
-    ffi::duckdb_destroy_copy_function
-);
-
-struct OwnedDuckDbString(*mut c_char);
-
-impl OwnedDuckDbString {
-    unsafe fn from_raw(raw: *mut c_char) -> Self {
-        Self(raw)
-    }
-
-    fn as_ptr(&self) -> *mut c_char {
-        self.0
-    }
-}
-
-impl Drop for OwnedDuckDbString {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { ffi::duckdb_free(self.0.cast()) };
-        }
-    }
-}
-
-// ─── Types ──────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy)]
 enum MutationMode {
@@ -161,52 +80,355 @@ impl MutationMode {
     }
 }
 
-/// Metadata about a source column needed for reading values from DuckDB vectors.
 #[derive(Clone)]
 struct ColumnMeta {
-    type_id: u32,
-    /// DECIMAL scale (0 for non-decimal types).
-    decimal_scale: u8,
-    /// DECIMAL internal storage type (0 for non-decimal types).
-    decimal_internal_type: u32,
-    /// Fixed length for DuckDB ARRAY columns (0 for non-ARRAY types).
-    array_size: usize,
-    /// Child metadata for DuckDB LIST/ARRAY columns.
-    child: Option<Box<ColumnMeta>>,
-    /// Field metadata for DuckDB STRUCT columns.
-    struct_fields: Vec<StructFieldMeta>,
-    /// True when this DuckDB value is logical JSON. The physical type is still
-    /// VARCHAR, so the alias has to be stored separately. Ordinary VARCHAR text
-    /// is not JSON even when it is valid JSON text.
-    is_json: bool,
-    /// Target Spanner column type code (populated during GlobalInit).
-    spanner_type_code: TypeCode,
+    ty: LogicalTypeHandle,
+    target: Type,
 }
-
-#[derive(Clone)]
-struct StructFieldMeta {
-    name: String,
-    column: ColumnMeta,
-}
-
-/// Bind-phase data stored for the lifetime of the COPY operation.
 struct CopyBindData {
     profile: ConnectionProfile,
     dialect: DatabaseDialect,
     mode: MutationMode,
     batch_size: usize,
     target_columns: Option<Vec<String>>,
-    columns: Vec<ColumnMeta>,
+    columns: Vec<LogicalTypeHandle>,
 }
-
-/// Per-registration state attached to the copy function via `extra_info`.
-struct CopyExtraInfo {
-    /// When false, skip session config lookups during bind (avoids DuckDB SIGABRT
-    /// when spanner_* config options were not registered on this database).
-    config_enabled: bool,
+struct Copy;
+fn guard<T>(phase: &str, f: impl FnOnce() -> Result<T, String>) -> NeoResult<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .unwrap_or_else(|_| Err(format!("COPY {phase} callback panicked")))
+        .map_err(|message| duckdb_neo::Error::invalid_input(message.replace('\0', "\\0")))
 }
-
-/// Global state created during init and shared across sink calls.
+impl CopyToFunctionCallbacks for Copy {
+    type BindData = CopyBindData;
+    type InitData = Mutex<CopyGlobalState>;
+    type BatchData = ();
+    fn bind(&self, ctx: &Context, info: &CopyToBindInfo) -> NeoResult<CopyBindData> {
+        guard("bind", || {
+            let mut opts = HashMap::new();
+            for (key, value) in info.options().map_err(|e| e.to_string())? {
+                let id = value
+                    .logical_type()
+                    .and_then(|t| t.id())
+                    .map_err(|e| e.to_string())?;
+                let mut values = Vec::new();
+                if !value.is_null().map_err(|e| e.to_string())? {
+                    if matches!(
+                        id,
+                        duckdb_neo::logical_type::LogicalTypeID::List
+                            | duckdb_neo::logical_type::LogicalTypeID::Tuple
+                    ) {
+                        for child in value.children().map_err(|e| e.to_string())? {
+                            values.push(child.dbg_string().map_err(|e| e.to_string())?);
+                        }
+                    } else {
+                        values.push(value.dbg_string().map_err(|e| e.to_string())?);
+                    }
+                }
+                if opts.insert(key.to_ascii_lowercase(), values).is_some() {
+                    return Err(format!("duplicate COPY option {key}"));
+                }
+            }
+            validate_copy_option_names(&opts)?;
+            let settings = config::Settings::read(ctx).map_err(|e| e.to_string())?;
+            let cfg = |name: &str| settings.string(name);
+            let path = resolve_copy_database_path(&opts, cfg)?;
+            let endpoint = option_value(&opts, "endpoint")
+                .map(str::to_owned)
+                .or_else(|| cfg("spanner_endpoint"));
+            let mode = option_value(&opts, "endpoint_mode")
+                .map(str::to_owned)
+                .or_else(|| cfg("spanner_endpoint_mode"));
+            let env = std::env::var("SPANNER_EMULATOR_HOST").ok();
+            let profile =
+                ConnectionProfile::resolve(path, endpoint, mode.as_deref(), None, env.as_deref())
+                    .and_then(|p| p.with_tls_settings(cfg))
+                    .map_err(|e| e.to_string())?;
+            let dialect = option_value(&opts, "dialect")
+                .map(schema::parse_dialect)
+                .transpose()
+                .map_err(|e| e.to_string())?
+                .unwrap_or(DatabaseDialect::Unspecified);
+            let mode = option_value(&opts, "mode")
+                .map(MutationMode::parse)
+                .transpose()?
+                .unwrap_or(MutationMode::InsertOrUpdate);
+            let batch_size = parse_batch_size(option_value(&opts, "mutation_batch_size"))?;
+            let mut columns = Vec::new();
+            for i in 0..info.column_count().map_err(|e| e.to_string())? {
+                let (_, ty) = info.get_column(i).map_err(|e| e.to_string())?;
+                let ty = LogicalTypeHandle::from_neo(&ty).map_err(|e| e.to_string())?;
+                validate_source(&ty)?;
+                columns.push(ty);
+            }
+            Ok(CopyBindData {
+                profile,
+                dialect,
+                mode,
+                batch_size,
+                target_columns: opts.get("columns").cloned(),
+                columns,
+            })
+        })
+    }
+    fn init(
+        &self,
+        _: &Context,
+        bind: &CopyBindData,
+        path: &str,
+    ) -> NeoResult<Mutex<CopyGlobalState>> {
+        guard("init", || {
+            if path.is_empty() {
+                return Err("Table name cannot be empty".into());
+            }
+            let profile = bind.profile.clone();
+            let client = runtime::run_bounded(
+                "Spanner COPY client setup",
+                runtime::METADATA_DISCOVERY_TIMEOUT,
+                async move { client::get_or_create_client(&profile).await },
+            )
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string())?;
+            let schema_client = Arc::clone(&client);
+            let table_name = path.to_owned();
+            let dialect = bind.dialect.clone();
+            let profile = bind.profile.clone();
+            let schema_columns = runtime::run_bounded(
+                "Spanner COPY schema discovery",
+                runtime::METADATA_DISCOVERY_TIMEOUT,
+                async move {
+                    schema::discover_table_schema_for_copy(
+                        &schema_client,
+                        &table_name,
+                        dialect,
+                        &profile,
+                    )
+                    .await
+                },
+            )
+            .map_err(|e| format!("Schema discovery failed: {e}"))?
+            .map_err(|e| format!("Schema discovery failed: {e}"))?;
+            // Preserve positional defaults; the explicit columns option chooses by-name mapping.
+            let targets = resolve_copy_columns(
+                &schema_columns,
+                bind.target_columns.as_deref(),
+                bind.columns.len(),
+                path,
+            )?;
+            let mut columns = Vec::new();
+            for (source, target) in bind.columns.iter().zip(&targets) {
+                validate_target(source, &target.spanner_type)?;
+                columns.push(ColumnMeta {
+                    ty: source.clone(),
+                    target: target.spanner_type.clone(),
+                });
+            }
+            let route = if bind.profile.endpoint_mode() == EndpointMode::Emulator {
+                emulator_retry_route(
+                    bind.profile.data_endpoint(),
+                    bind.profile.sdk_emulator_mode(),
+                )
+            } else {
+                EmulatorRetryRoute::None
+            };
+            Ok(Mutex::new(CopyGlobalState {
+                client,
+                emulator_retry_route: route,
+                table_name: path.into(),
+                column_names: targets.iter().map(|t| t.name.clone()).collect(),
+                mode: bind.mode,
+                batch_size: bind.batch_size,
+                columns,
+                buffer: Vec::new(),
+                rows_written: 0,
+                failure: None,
+            }))
+        })
+    }
+    fn batch_size(
+        &self,
+        _: &Context,
+        bind: &CopyBindData,
+    ) -> NeoResult<Option<std::num::NonZeroUsize>> {
+        Ok(std::num::NonZeroUsize::new(bind.batch_size))
+    }
+    fn batch(
+        &self,
+        _: &Context,
+        _: &CopyBindData,
+        _: &Mutex<CopyGlobalState>,
+        _: &ColumnDataCollection<'_>,
+    ) -> NeoResult<()> {
+        // DuckDB retains this input until flush. Do not copy an entire engine
+        // batch into mutations here: engine BATCH_SIZE is only an independent hint.
+        Ok(())
+    }
+    fn flush(
+        &self,
+        ctx: &Context,
+        _: &CopyBindData,
+        state: &Mutex<CopyGlobalState>,
+        input: &ColumnDataCollection<'_>,
+        _: &mut (),
+    ) -> NeoResult<()> {
+        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(failure) = &state.failure {
+            return Err(duckdb_neo::Error::invalid_input(failure.clone()));
+        }
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), String> {
+                let mut scan = input.to_scan(ctx).map_err(|e| e.to_string())?;
+                while let Some(chunk) = scan.next_chunk().map_err(|e| e.to_string())? {
+                    for row in 0..chunk.row_count().map_err(|e| e.to_string())? {
+                        let mut values = Vec::with_capacity(state.columns.len());
+                        for (i, column) in state.columns.iter().enumerate() {
+                            let value = chunk
+                                .get_vector_at::<duckdb_neo::vector::Unknown>(i)
+                                .and_then(|v| v.get_value_slow(row))
+                                .map_err(|e| e.to_string())?;
+                            values.push(to_wire(&value, &column.ty, &column.target)?);
+                        }
+                        let mutation = build_mutation(
+                            state.mode,
+                            &state.table_name,
+                            &state.column_names,
+                            values,
+                        );
+                        state.buffer.push(mutation);
+                        if state.buffer.len() >= state.batch_size {
+                            flush_buffer(&mut state)?;
+                        }
+                    }
+                }
+                // Even the short final window belongs to flush, not finalize.
+                flush_buffer(&mut state)
+            }))
+            .unwrap_or_else(|_| Err("callback panicked".into()));
+        result.map_err(|cause| {
+            duckdb_neo::Error::invalid_input(record_copy_failure(&mut state, "flush", &cause))
+        })
+    }
+    fn finalize(
+        &self,
+        _: &Context,
+        _: &CopyBindData,
+        state: &Mutex<CopyGlobalState>,
+    ) -> NeoResult<()> {
+        guard("finalize", || {
+            let state = state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(failure) = &state.failure {
+                return Err(failure.clone());
+            }
+            if !state.buffer.is_empty() {
+                return Err("COPY finalize found unflushed mutations; refusing to commit".into());
+            }
+            eprintln!(
+                "[duckdb-spanner] COPY TO '{}': {} rows written",
+                state.table_name, state.rows_written
+            );
+            Ok(())
+        })
+    }
+}
+pub(crate) fn register(ext: &Extension) -> NeoResult<()> {
+    CopyFunctionBuilder::new("spanner", Copy).register(ext)
+}
+fn validate_source(ty: &LogicalTypeHandle) -> Result<(), String> {
+    use LogicalTypeId::*;
+    match ty.id() {
+        Interval => {
+            return Err("DuckDB INTERVAL source values are not supported by COPY TO Spanner: Spanner INTERVAL is query-only; use interval_to_iso8601(column) and copy VARCHAR to STRING".into());
+        }
+        Map | Any | Other | Bit | Time | TimeNs | TimestampTZNs => {
+            return Err(format!(
+                "Unsupported DuckDB type {:?} for COPY TO spanner",
+                ty.id()
+            ));
+        }
+        _ => {}
+    }
+    for i in 0..ty.num_children() {
+        validate_source(&ty.child(i))?;
+    }
+    Ok(())
+}
+fn validate_target(source: &LogicalTypeHandle, target: &Type) -> Result<(), String> {
+    use LogicalTypeId::*;
+    if matches!(source.id(), Float | Double) && target.code() == TypeCode::Numeric {
+        return Err("DuckDB FLOAT/DOUBLE source values cannot be copied to a Spanner NUMERIC target exactly; explicitly cast to DECIMAL".into());
+    }
+    if matches!(source.id(), List | Array) {
+        if target.code() != TypeCode::Array {
+            return Err("DuckDB LIST/ARRAY source column requires a Spanner ARRAY target".into());
+        }
+        let element = target
+            .array_element_type()
+            .ok_or("Spanner ARRAY target missing element metadata")?;
+        validate_target(&source.child(0), &element)?;
+    }
+    if source.id() == Struct && target.code() != TypeCode::Json {
+        return Err("DuckDB STRUCT source column requires a Spanner JSON target".into());
+    }
+    Ok(())
+}
+fn to_wire(value: &NeoValue, ty: &LogicalTypeHandle, target: &Type) -> Result<Value, String> {
+    if value.is_null().map_err(|e| e.to_string())? {
+        return Ok(Value {
+            kind: Some(Kind::NullValue(0)),
+        });
+    }
+    use LogicalTypeId::*;
+    if matches!(ty.id(), List | Array) {
+        let target = target
+            .array_element_type()
+            .ok_or("missing ARRAY target metadata")?;
+        let n = value.child_count().map_err(|e| e.to_string())?;
+        if n > 4_194_304 {
+            return Err("COPY array exceeds64MiB entry budget".into());
+        }
+        let values = (0..n)
+            .map(|i| {
+                to_wire(
+                    &value.get_child(i).map_err(|e| e.to_string())?,
+                    &ty.child(0),
+                    &target,
+                )
+            })
+            .collect::<Result<_, _>>()?;
+        return Ok(Value {
+            kind: Some(Kind::ListValue(ListValue { values })),
+        });
+    }
+    if ty.id() == Struct {
+        let json = crate::scalars::structural_json(value, ty).map_err(|e| e.to_string())?;
+        return Ok(Value {
+            kind: Some(Kind::StringValue(
+                serde_json::to_string(&json).map_err(|e| e.to_string())?,
+            )),
+        });
+    }
+    let json = crate::scalars::copy_scalar_json(value, ty).map_err(|e| e.to_string())?;
+    let kind = match json {
+        serde_json::Value::Null => Kind::NullValue(0),
+        serde_json::Value::Bool(v) => Kind::BoolValue(v),
+        serde_json::Value::Number(v) if matches!(ty.id(), Float | Double) => {
+            Kind::NumberValue(v.as_f64().ok_or("invalid float")?)
+        }
+        serde_json::Value::Number(v) => Kind::StringValue(v.to_string()),
+        serde_json::Value::String(v)
+            if ty.id() == Decimal
+                && matches!(target.code(), TypeCode::Float32 | TypeCode::Float64) =>
+        {
+            Kind::NumberValue(
+                v.parse()
+                    .map_err(|e| format!("DECIMAL to FLOAT64 conversion failed: {e}"))?,
+            )
+        }
+        serde_json::Value::String(v) => Kind::StringValue(v),
+        _ => return Err("unexpected composite scalar wire value".into()),
+    };
+    Ok(Value { kind: Some(kind) })
+}
 struct CopyGlobalState {
     client: Arc<DatabaseClient>,
     emulator_retry_route: EmulatorRetryRoute,
@@ -238,436 +460,8 @@ impl CopyBatchContext {
     }
 }
 
-// ─── Registration ───────────────────────────────────────────────────────────
-
-/// A fully allocated COPY-function builder that has not mutated DuckDB yet.
-pub(crate) struct PreparedCopyFunction(OwnedDuckDbCopyFunction);
-
-impl PreparedCopyFunction {
-    /// # Safety
-    /// `con` must be a valid `duckdb_connection`.
-    pub(crate) unsafe fn register(
-        self,
-        con: ffi::duckdb_connection,
-    ) -> Result<(), RegistrationError> {
-        let rc = if crate::should_fail_status("register COPY function") {
-            ffi::DuckDBError
-        } else {
-            unsafe { ffi::duckdb_register_copy_function(con, self.0.as_raw()) }
-        };
-        if rc != ffi::DuckDBSuccess {
-            return Err(RegistrationError::new(
-                "register COPY function",
-                "spanner",
-                format!("DuckDB returned status {rc}"),
-            ));
-        }
-        Ok(())
-    }
-}
-
-pub(crate) unsafe fn prepare_copy_function(
-    config_enabled: bool,
-) -> Result<PreparedCopyFunction, RegistrationError> {
-    crate::ensure_rustls_crypto_provider();
-
-    unsafe {
-        let copy_fn = OwnedDuckDbCopyFunction::from_raw(ffi::duckdb_create_copy_function());
-        if copy_fn.as_raw().is_null() || crate::should_fail_allocation("COPY function") {
-            return Err(RegistrationError::new(
-                "allocate COPY function",
-                "spanner",
-                "duckdb_create_copy_function returned null",
-            ));
-        }
-
-        let name = c"spanner";
-        ffi::duckdb_copy_function_set_name(copy_fn.as_raw(), name.as_ptr());
-        let extra = Box::new(CopyExtraInfo { config_enabled });
-        ffi::duckdb_copy_function_set_extra_info(
-            copy_fn.as_raw(),
-            Box::into_raw(extra) as *mut c_void,
-            Some(drop_box::<CopyExtraInfo>),
-        );
-        ffi::duckdb_copy_function_set_bind(copy_fn.as_raw(), Some(copy_bind));
-        ffi::duckdb_copy_function_set_global_init(copy_fn.as_raw(), Some(copy_global_init));
-        ffi::duckdb_copy_function_set_sink(copy_fn.as_raw(), Some(copy_sink));
-        ffi::duckdb_copy_function_set_finalize(copy_fn.as_raw(), Some(copy_finalize));
-
-        Ok(PreparedCopyFunction(copy_fn))
-    }
-}
-
-/// Register the `spanner` copy function on a raw DuckDB connection.
-///
-/// Set `config_enabled` when `register_config_options` was also called on the
-/// same database so COPY bind can fall back to `SET spanner_*` session defaults.
-///
-/// # Safety
-/// `con` must be a valid `duckdb_connection`.
-#[cfg(test)]
-pub(crate) unsafe fn register_copy_function(
-    con: ffi::duckdb_connection,
-    config_enabled: bool,
-) -> Result<(), RegistrationError> {
-    unsafe { prepare_copy_function(config_enabled)?.register(con) }
-}
-
-// ─── Callbacks ──────────────────────────────────────────────────────────────
-
-unsafe fn copy_config_enabled(info: ffi::duckdb_copy_function_bind_info) -> bool {
-    unsafe {
-        let extra = ffi::duckdb_copy_function_bind_get_extra_info(info) as *const CopyExtraInfo;
-        if extra.is_null() {
-            return false;
-        }
-        (*extra).config_enabled
-    }
-}
-
-unsafe extern "C" fn copy_bind(info: ffi::duckdb_copy_function_bind_info) {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        copy_bind_inner(info)
-    })) {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => unsafe { set_bind_error(info, &e) },
-        Err(_) => unsafe { set_bind_error(info, "panic in spanner copy bind") },
-    }
-}
-
-unsafe extern "C" fn copy_global_init(info: ffi::duckdb_copy_function_global_init_info) {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        copy_global_init_inner(info)
-    })) {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => unsafe { set_global_init_error(info, &e) },
-        Err(_) => unsafe { set_global_init_error(info, "panic in spanner copy global init") },
-    }
-}
-
-unsafe extern "C" fn copy_sink(
-    info: ffi::duckdb_copy_function_sink_info,
-    chunk: ffi::duckdb_data_chunk,
-) {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        copy_sink_inner(info, chunk)
-    })) {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => unsafe { set_sink_error(info, &e) },
-        Err(_) => unsafe {
-            let state_ptr = ffi::duckdb_copy_function_sink_get_global_state(info);
-            let error = record_copy_callback_panic(state_ptr, "sink");
-            set_sink_error(info, &error);
-        },
-    }
-}
-
-unsafe extern "C" fn copy_finalize(info: ffi::duckdb_copy_function_finalize_info) {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        copy_finalize_inner(info)
-    })) {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => unsafe { set_finalize_error(info, &e) },
-        Err(_) => unsafe {
-            let state_ptr = ffi::duckdb_copy_function_finalize_get_global_state(info);
-            let error = record_copy_callback_panic(state_ptr, "finalize");
-            set_finalize_error(info, &error);
-        },
-    }
-}
-
-// ─── Inner implementations ──────────────────────────────────────────────────
-
-unsafe fn copy_bind_inner(info: ffi::duckdb_copy_function_bind_info) -> Result<(), String> {
-    unsafe {
-        // Parse COPY options
-        let options_val =
-            OwnedDuckDbValue::from_raw(ffi::duckdb_copy_function_bind_get_options(info));
-        let opts = extract_options(options_val.as_raw());
-        validate_copy_option_names(&opts)?;
-
-        // Get client context for config fallback
-        let ctx = OwnedDuckDbClientContext::from_raw(
-            ffi::duckdb_copy_function_bind_get_client_context(info),
-        );
-        let have_ctx = !ctx.as_raw().is_null();
-        let config_enabled = copy_config_enabled(info);
-
-        let cfg = |name: &str| -> Option<String> {
-            if have_ctx && config_enabled {
-                config::get_config_string_from_context(ctx.as_raw(), name)
-            } else {
-                None
-            }
-        };
-
-        // Resolve database path: options → component parts → config
-        let database_path = resolve_copy_database_path(&opts, cfg)?;
-
-        let endpoint = option_value(&opts, "endpoint")
-            .map(ToOwned::to_owned)
-            .or_else(|| cfg("spanner_endpoint"));
-        let endpoint_mode = option_value(&opts, "endpoint_mode")
-            .map(ToOwned::to_owned)
-            .or_else(|| cfg("spanner_endpoint_mode"));
-        let emulator_host = std::env::var("SPANNER_EMULATOR_HOST").ok();
-        let profile = ConnectionProfile::resolve(
-            database_path,
-            endpoint,
-            endpoint_mode.as_deref(),
-            None,
-            emulator_host.as_deref(),
-        )
-        .and_then(|profile| profile.with_tls_settings(cfg))
-        .map_err(|error| error.to_string())?;
-
-        let dialect = option_value(&opts, "dialect")
-            .map(schema::parse_dialect)
-            .transpose()
-            .map_err(|e| e.to_string())?
-            .unwrap_or(DatabaseDialect::Unspecified);
-
-        let mode = match option_value(&opts, "mode") {
-            Some(m) => MutationMode::parse(m)?,
-            None => MutationMode::InsertOrUpdate,
-        };
-
-        let batch_size = parse_batch_size(option_value(&opts, "batch_size"))?;
-
-        // Collect source column type metadata
-        let column_count = ffi::duckdb_copy_function_bind_get_column_count(info) as usize;
-        let mut columns = Vec::with_capacity(column_count);
-
-        for i in 0..column_count {
-            let logical_type = OwnedDuckDbLogicalType::from_raw(
-                ffi::duckdb_copy_function_bind_get_column_type(info, i as u64),
-            );
-            let column = column_meta_from_logical_type(logical_type.as_raw())
-                .map_err(|error| format!("COPY source column {}: {error}", i + 1))?;
-            columns.push(column);
-        }
-
-        let data = Box::new(CopyBindData {
-            profile,
-            dialect,
-            mode,
-            batch_size,
-            target_columns: opts.get("columns").cloned(),
-            columns,
-        });
-
-        ffi::duckdb_copy_function_bind_set_bind_data(
-            info,
-            Box::into_raw(data) as *mut c_void,
-            Some(drop_box::<CopyBindData>),
-        );
-
-        Ok(())
-    }
-}
-
-unsafe fn copy_global_init_inner(
-    info: ffi::duckdb_copy_function_global_init_info,
-) -> Result<(), String> {
-    unsafe {
-        // File path = Spanner table name
-        let file_path_ptr = ffi::duckdb_copy_function_global_init_get_file_path(info);
-        if file_path_ptr.is_null() {
-            return Err("No table name specified (file path is null)".to_string());
-        }
-        let table_name = CStr::from_ptr(file_path_ptr).to_string_lossy().into_owned();
-        if table_name.is_empty() {
-            return Err("Table name cannot be empty".to_string());
-        }
-
-        // Get bind data
-        let bind_ptr = ffi::duckdb_copy_function_global_init_get_bind_data(info);
-        if bind_ptr.is_null() {
-            return Err("Bind data is null".to_string());
-        }
-        let bind_data = &*(bind_ptr as *const CopyBindData);
-        validate_batch_size(bind_data.batch_size)?;
-
-        // Connect to Spanner
-        let profile = bind_data.profile.clone();
-        let client = runtime::run_bounded(
-            "Spanner COPY client setup",
-            runtime::METADATA_DISCOVERY_TIMEOUT,
-            async move { client::get_or_create_client(&profile).await },
-        )
-        .map_err(|e| format!("Runtime error: {e}"))?
-        .map_err(|e| format!("Failed to connect to Spanner: {e}"))?;
-
-        // An explicit dialect avoids metadata discovery for endpoints that do not
-        // expose INFORMATION_SCHEMA.DATABASE_OPTIONS. COPY discovery retains
-        // unsupported generated columns so they can be excluded before conversion.
-        let schema_client = Arc::clone(&client);
-        let schema_table_name = table_name.clone();
-        let schema_dialect = bind_data.dialect.clone();
-        let schema_profile = bind_data.profile.clone();
-        let schema_columns = runtime::run_bounded(
-            "Spanner COPY schema discovery",
-            runtime::METADATA_DISCOVERY_TIMEOUT,
-            async move {
-                schema::discover_table_schema_for_copy(
-                    &schema_client,
-                    &schema_table_name,
-                    schema_dialect,
-                    &schema_profile,
-                )
-                .await
-            },
-        )
-        .map_err(|e| format!("Runtime error: {e}"))?
-        .map_err(|e| format!("Schema discovery failed for table '{table_name}': {e}"))?;
-
-        // Map the COPY source columns to the writable Spanner target columns,
-        // excluding generated columns (Spanner rejects writes to them).
-        //
-        // The DuckDB COPY C API does not expose source column aliases in this version,
-        // so unnamed COPY operations map positionally. The explicit `columns` COPY
-        // option supplies Spanner target names in source-column order when needed.
-        let targets = resolve_copy_columns(
-            &schema_columns,
-            bind_data.target_columns.as_deref(),
-            bind_data.columns.len(),
-            &table_name,
-        )?;
-
-        let column_names: Vec<String> = targets.iter().map(|c| c.name.clone()).collect();
-
-        // Enrich DuckDB column metadata with Spanner target type codes
-        let mut columns = bind_data.columns.clone();
-        for (source_idx, (col, target)) in columns.iter_mut().zip(targets.iter()).enumerate() {
-            apply_spanner_type(col, &target.spanner_type).map_err(|error| {
-                format!(
-                    "COPY source column {} targeting Spanner column '{}': {error}",
-                    source_idx + 1,
-                    target.name
-                )
-            })?;
-        }
-
-        let emulator_retry_route = if bind_data.profile.endpoint_mode() == EndpointMode::Emulator {
-            emulator_retry_route(
-                bind_data.profile.data_endpoint(),
-                bind_data.profile.sdk_emulator_mode(),
-            )
-        } else {
-            EmulatorRetryRoute::None
-        };
-        let state = Box::new(CopyGlobalState {
-            client,
-            emulator_retry_route,
-            table_name,
-            column_names,
-            mode: bind_data.mode,
-            batch_size: bind_data.batch_size,
-            columns,
-            // Grow with actual input rather than trusting an unbounded user option as capacity.
-            buffer: Vec::new(),
-            rows_written: 0,
-            failure: None,
-        });
-
-        ffi::duckdb_copy_function_global_init_set_global_state(
-            info,
-            Box::into_raw(state) as *mut c_void,
-            Some(drop_box::<CopyGlobalState>),
-        );
-
-        Ok(())
-    }
-}
-
-unsafe fn copy_sink_inner(
-    info: ffi::duckdb_copy_function_sink_info,
-    chunk: ffi::duckdb_data_chunk,
-) -> Result<(), String> {
-    unsafe {
-        let state_ptr = ffi::duckdb_copy_function_sink_get_global_state(info);
-        if state_ptr.is_null() {
-            return Err(copy_failure_message("sink", "global state is null", 0));
-        }
-        // DuckDB 1.5.6's C COPY adapter leaves execution_mode unset, so this
-        // PhysicalCopyToFile sink is serial and the global state is not aliased.
-        let state = &mut *state_ptr.cast::<CopyGlobalState>();
-        if let Some(failure) = &state.failure {
-            return Err(failure.clone());
-        }
-
-        if let Err(cause) = copy_sink_chunk(state, chunk) {
-            return Err(record_copy_failure(state, "sink", &cause));
-        }
-
-        Ok(())
-    }
-}
-
-unsafe fn copy_sink_chunk(
-    state: &mut CopyGlobalState,
-    chunk: ffi::duckdb_data_chunk,
-) -> Result<(), String> {
-    unsafe {
-        let row_count = ffi::duckdb_data_chunk_get_size(chunk) as usize;
-        if row_count == 0 {
-            return Ok(());
-        }
-
-        let col_count = state.columns.len();
-
-        // The pinned DuckDB C COPY adapter flattens the chunk before this callback.
-        let vectors: Vec<ffi::duckdb_vector> = (0..col_count)
-            .map(|i| ffi::duckdb_data_chunk_get_vector(chunk, i as u64))
-            .collect();
-
-        for row_idx in 0..row_count {
-            let mut values = Vec::with_capacity(col_count);
-            for (vector, column) in vectors.iter().zip(&state.columns) {
-                let val = read_duckdb_value(*vector, row_idx, column)?;
-                values.push(val);
-            }
-            state.buffer.push(build_mutation(
-                state.mode,
-                &state.table_name,
-                &state.column_names,
-                values,
-            ));
-
-            if state.buffer.len() >= state.batch_size {
-                flush_buffer(state)?;
-            }
-        }
-
-        Ok(())
-    }
-}
-
-unsafe fn copy_finalize_inner(info: ffi::duckdb_copy_function_finalize_info) -> Result<(), String> {
-    unsafe {
-        let state_ptr = ffi::duckdb_copy_function_finalize_get_global_state(info);
-        if state_ptr.is_null() {
-            return Ok(());
-        }
-        let state = &mut *state_ptr.cast::<CopyGlobalState>();
-        if let Some(failure) = &state.failure {
-            return Err(failure.clone());
-        }
-
-        if let Err(cause) = flush_buffer(state) {
-            return Err(record_copy_failure(state, "finalize", &cause));
-        }
-
-        eprintln!(
-            "[duckdb-spanner] COPY TO '{}': {} rows written",
-            state.table_name, state.rows_written
-        );
-
-        Ok(())
-    }
-}
-
 fn copy_failure_message(phase: &str, cause: &str, rows_written: u64) -> String {
+    let cause = cause.replace('\0', "\\0");
     format!(
         "COPY {phase} failed: {cause}; rows_written={rows_written}; earlier batches remain committed"
     )
@@ -685,193 +479,6 @@ fn record_copy_failure(state: &mut CopyGlobalState, phase: &str, cause: &str) ->
     failure
 }
 
-unsafe fn record_copy_callback_panic(state_ptr: *mut c_void, phase: &str) -> String {
-    unsafe {
-        if state_ptr.is_null() {
-            return copy_failure_message(phase, "callback panicked", 0);
-        }
-
-        let state = &mut *state_ptr.cast::<CopyGlobalState>();
-        record_copy_failure(state, phase, "callback panicked")
-    }
-}
-
-unsafe fn column_meta_from_logical_type(
-    logical_type: ffi::duckdb_logical_type,
-) -> Result<ColumnMeta, String> {
-    unsafe {
-        if logical_type.is_null() {
-            return Err("DuckDB returned null logical type for COPY source column".to_string());
-        }
-
-        let type_id = ffi::duckdb_get_type_id(logical_type);
-        validate_copy_source_type(type_id)?;
-        let is_json = logical_type_is_json(logical_type);
-        let (decimal_scale, decimal_internal_type) =
-            if type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL {
-                (
-                    ffi::duckdb_decimal_scale(logical_type),
-                    ffi::duckdb_decimal_internal_type(logical_type),
-                )
-            } else {
-                (0, 0)
-            };
-
-        let (array_size, child, struct_fields) = match type_id {
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST => {
-                let child_type = OwnedDuckDbLogicalType::from_raw(
-                    ffi::duckdb_list_type_child_type(logical_type),
-                );
-                let child = column_meta_from_logical_type(child_type.as_raw())?;
-                (0, Some(Box::new(child)), Vec::new())
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_ARRAY => {
-                let child_type = OwnedDuckDbLogicalType::from_raw(
-                    ffi::duckdb_array_type_child_type(logical_type),
-                );
-                let child = column_meta_from_logical_type(child_type.as_raw())?;
-                (
-                    ffi::duckdb_array_type_array_size(logical_type) as usize,
-                    Some(Box::new(child)),
-                    Vec::new(),
-                )
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_STRUCT => {
-                let field_count = ffi::duckdb_struct_type_child_count(logical_type) as usize;
-                let mut fields = Vec::with_capacity(field_count);
-                for field_idx in 0..field_count {
-                    let name_ptr = OwnedDuckDbString::from_raw(ffi::duckdb_struct_type_child_name(
-                        logical_type,
-                        field_idx as u64,
-                    ));
-                    if name_ptr.as_ptr().is_null() {
-                        return Err(format!("DuckDB STRUCT field {field_idx} has no name"));
-                    }
-                    let name = CStr::from_ptr(name_ptr.as_ptr())
-                        .to_string_lossy()
-                        .into_owned();
-
-                    let child_type = OwnedDuckDbLogicalType::from_raw(
-                        ffi::duckdb_struct_type_child_type(logical_type, field_idx as u64),
-                    );
-                    let column = column_meta_from_logical_type(child_type.as_raw())?;
-                    fields.push(StructFieldMeta { name, column });
-                }
-                (0, None, fields)
-            }
-            _ => (0, None, Vec::new()),
-        };
-
-        Ok(ColumnMeta {
-            type_id,
-            decimal_scale,
-            decimal_internal_type,
-            array_size,
-            child,
-            struct_fields,
-            is_json,
-            spanner_type_code: TypeCode::Unspecified,
-        })
-    }
-}
-
-fn logical_type_is_json(logical_type: ffi::duckdb_logical_type) -> bool {
-    unsafe {
-        if ffi::duckdb_get_type_id(logical_type) != ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR {
-            return false;
-        }
-        let alias = OwnedDuckDbString::from_raw(ffi::duckdb_logical_type_get_alias(logical_type));
-        if alias.as_ptr().is_null() {
-            return false;
-        }
-        CStr::from_ptr(alias.as_ptr())
-            .to_str()
-            .is_ok_and(|alias| alias.eq_ignore_ascii_case("json"))
-    }
-}
-
-fn validate_copy_source_type(type_id: ffi::duckdb_type) -> Result<(), String> {
-    if type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTERVAL {
-        return Err(
-            "DuckDB INTERVAL source values are not supported by COPY TO Spanner: \
-             Spanner INTERVAL is query-only and cannot be stored in table columns. \
-             To preserve the value as text, use interval_to_iso8601(column) and copy \
-             the resulting VARCHAR to a Spanner STRING column"
-                .to_string(),
-        );
-    }
-    Ok(())
-}
-
-fn apply_spanner_type(col: &mut ColumnMeta, spanner_type: &Type) -> Result<(), String> {
-    col.spanner_type_code = spanner_type.code();
-    if matches!(
-        col.type_id,
-        ffi::DUCKDB_TYPE_DUCKDB_TYPE_FLOAT | ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE
-    ) && spanner_type.code() == TypeCode::Numeric
-    {
-        let source_type = if col.type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_FLOAT {
-            "FLOAT"
-        } else {
-            "DOUBLE"
-        };
-        return Err(format!(
-            "DuckDB {source_type} source values cannot be copied to a Spanner NUMERIC target \
-             exactly: binary floating-point values cannot be guaranteed to fit the target \
-             precision and scale. Explicitly cast the source to an appropriate DECIMAL type \
-             after choosing the required rounding and overflow policy"
-        ));
-    }
-
-    let source_is_array = col.type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST
-        || col.type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_ARRAY;
-
-    if source_is_array {
-        if spanner_type.code() != TypeCode::Array {
-            return Err(format!(
-                "DuckDB LIST/ARRAY source column requires a Spanner ARRAY target, got TypeCode {:?}",
-                spanner_type.code()
-            ));
-        }
-
-        let child = col.child.as_deref_mut().ok_or_else(|| {
-            "DuckDB LIST/ARRAY source column is missing child metadata".to_string()
-        })?;
-        let elem_type = spanner_type
-            .array_element_type()
-            .ok_or_else(|| "Spanner ARRAY target is missing element type metadata".to_string())?;
-        apply_spanner_type(child, &elem_type)?;
-    }
-
-    if col.type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_STRUCT && spanner_type.code() != TypeCode::Json {
-        return Err(format!(
-            "DuckDB STRUCT source column requires a Spanner JSON target, got TypeCode {:?}",
-            spanner_type.code()
-        ));
-    }
-
-    Ok(())
-}
-
-// ─── Source → target column mapping ─────────────────────────────────────────
-
-/// Map the COPY source columns to the writable Spanner target columns.
-///
-/// Generated columns (which Spanner rejects writes to) are always excluded from
-/// the writable target set. Two mapping strategies are supported:
-///
-/// * **By name** (`source_names = Some(..)`): each
-///   source column is matched to a target column case-insensitively. A source
-///   column with no target match — or one that resolves to a generated column —
-///   is a hard error listing the available writable target columns.
-/// * **Positional** (`source_names = None`): the source
-///   columns are mapped to the writable target columns in ordinal order, and only
-///   the arity is validated. This is the fallback used at runtime because the
-///   DuckDB COPY C API does not expose source column names in this version.
-///
-/// Returns one target [`schema::ColumnInfo`] per source column, in source order,
-/// which the caller uses both as the mutation column list and to enrich the
-/// source metadata with Spanner target types.
 fn resolve_copy_columns(
     schema_columns: &[schema::ColumnInfo],
     source_names: Option<&[String]>,
@@ -968,99 +575,6 @@ fn join_column_names(columns: &[&schema::ColumnInfo]) -> String {
         .join(", ")
 }
 
-// ─── Option extraction ──────────────────────────────────────────────────────
-
-/// Extract options from the COPY statement's options value.
-///
-/// DuckDB returns options as a STRUCT where each field is a LIST of values.
-/// Scalar options use their first value, while list-valued options retain every
-/// value. In particular, `columns ['Value', 'Id']` must preserve both names.
-unsafe fn extract_options(
-    options_val: ffi::duckdb_value,
-) -> std::collections::HashMap<String, Vec<String>> {
-    unsafe {
-        let mut opts = std::collections::HashMap::new();
-
-        if options_val.is_null() || ffi::duckdb_is_null_value(options_val) {
-            return opts;
-        }
-
-        // NOTE: duckdb_get_value_type returns an internal reference — do NOT destroy it.
-        let options_type = ffi::duckdb_get_value_type(options_val);
-        let type_id = ffi::duckdb_get_type_id(options_type);
-
-        if type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_STRUCT {
-            let child_count = ffi::duckdb_struct_type_child_count(options_type);
-            for i in 0..child_count {
-                let name_ptr = OwnedDuckDbString::from_raw(ffi::duckdb_struct_type_child_name(
-                    options_type,
-                    i,
-                ));
-                if name_ptr.as_ptr().is_null() {
-                    continue;
-                }
-                let name = CStr::from_ptr(name_ptr.as_ptr())
-                    .to_string_lossy()
-                    .to_ascii_lowercase();
-
-                // Skip 'format' — already consumed by DuckDB
-                if name == "format" {
-                    continue;
-                }
-
-                // Preserve the option name even when DuckDB represents its value
-                // as NULL or an empty scalar. Validation must not let an unknown
-                // name disappear merely because its value was not extractable.
-                opts.entry(name.clone()).or_default();
-
-                let child_val =
-                    OwnedDuckDbValue::from_raw(ffi::duckdb_get_struct_child(options_val, i));
-                if !child_val.as_raw().is_null() && !ffi::duckdb_is_null_value(child_val.as_raw()) {
-                    // Child may be a LIST; try to get the first element.
-                    // NOTE: duckdb_get_value_type returns an internal reference — do NOT destroy it.
-                    let child_type = ffi::duckdb_get_value_type(child_val.as_raw());
-                    let child_type_id = ffi::duckdb_get_type_id(child_type);
-
-                    if child_type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST {
-                        let list_size = ffi::duckdb_get_list_size(child_val.as_raw());
-                        let mut values = Vec::with_capacity(list_size as usize);
-                        for index in 0..list_size {
-                            let elem = OwnedDuckDbValue::from_raw(ffi::duckdb_get_list_child(
-                                child_val.as_raw(),
-                                index,
-                            ));
-                            if let Some(s) = value_to_string_allow_empty(elem.as_raw()) {
-                                values.push(s);
-                            }
-                        }
-                        opts.insert(name, values);
-                    } else if let Some(s) = value_to_string(child_val.as_raw()) {
-                        opts.insert(name, vec![s]);
-                    }
-                }
-            }
-        } else if type_id == ffi::DUCKDB_TYPE_DUCKDB_TYPE_MAP {
-            let map_size = ffi::duckdb_get_map_size(options_val);
-            for i in 0..map_size {
-                let key = OwnedDuckDbValue::from_raw(ffi::duckdb_get_map_key(options_val, i));
-                let val = OwnedDuckDbValue::from_raw(ffi::duckdb_get_map_value(options_val, i));
-                if let Some(k) = value_to_string(key.as_raw()) {
-                    let key = k.to_ascii_lowercase();
-                    if key != "format" {
-                        let values = value_to_string(val.as_raw())
-                            .map(|value| vec![value])
-                            .unwrap_or_default();
-                        opts.insert(key, values);
-                    }
-                }
-            }
-        }
-
-        // NOTE: options_type is an internal reference from duckdb_get_value_type — do NOT destroy it.
-        opts
-    }
-}
-
 fn option_value<'a>(
     opts: &'a std::collections::HashMap<String, Vec<String>>,
     name: &str,
@@ -1092,7 +606,7 @@ fn parse_batch_size(value: Option<&str>) -> Result<usize, String> {
     let batch_size = match value {
         Some(value) => value
             .parse::<usize>()
-            .map_err(|e| format!("Invalid batch_size '{value}': {e}"))?,
+            .map_err(|e| format!("Invalid mutation_batch_size '{value}': {e}"))?,
         None => DEFAULT_BATCH_SIZE,
     };
     validate_batch_size(batch_size)?;
@@ -1101,46 +615,16 @@ fn parse_batch_size(value: Option<&str>) -> Result<usize, String> {
 
 fn validate_batch_size(batch_size: usize) -> Result<(), String> {
     if batch_size == 0 {
-        return Err("Invalid batch_size '0': must be greater than zero".to_string());
+        return Err("Invalid mutation_batch_size '0': must be greater than zero".to_string());
     }
     if batch_size > MAX_BATCH_SIZE {
         return Err(format!(
-            "Invalid batch_size '{batch_size}': must not exceed {MAX_BATCH_SIZE} rows; use a lower value for multi-column or indexed tables"
+            "Invalid mutation_batch_size '{batch_size}': must not exceed {MAX_BATCH_SIZE} rows; use a lower value for multi-column or indexed tables"
         ));
     }
     Ok(())
 }
 
-/// Extract a string from a `duckdb_value`.
-unsafe fn value_to_string(val: ffi::duckdb_value) -> Option<String> {
-    unsafe { value_to_string_allow_empty(val).filter(|s| !s.is_empty()) }
-}
-
-/// Extract a string while preserving empty values for list-valued options.
-unsafe fn value_to_string_allow_empty(val: ffi::duckdb_value) -> Option<String> {
-    unsafe {
-        if val.is_null() || ffi::duckdb_is_null_value(val) {
-            return None;
-        }
-        let c_str = OwnedDuckDbString::from_raw(ffi::duckdb_get_varchar(val));
-        if c_str.as_ptr().is_null() {
-            return None;
-        }
-        let s = CStr::from_ptr(c_str.as_ptr())
-            .to_string_lossy()
-            .into_owned();
-        Some(s)
-    }
-}
-
-/// Resolve the Spanner database resource path from COPY options and config.
-///
-/// Resolution order (matching `bind_utils::resolve_database_path`):
-/// 1. project/instance/database options, with config fallback for omitted components
-/// 2. database_path option
-/// 3. spanner_project/spanner_instance/spanner_database config
-/// 4. spanner_database_path config
-/// 5. error
 fn resolve_copy_database_path(
     opts: &std::collections::HashMap<String, Vec<String>>,
     cfg: impl Fn(&str) -> Option<String>,
@@ -1212,8 +696,6 @@ fn resolve_copy_database_path(
             .to_string(),
     )
 }
-
-// ─── Buffer flush / mutation building ───────────────────────────────────────
 
 fn emulator_retry_route(endpoint: Option<&str>, sdk_emulator_mode: bool) -> EmulatorRetryRoute {
     // The pinned SDK marks only SPANNER_EMULATOR_HOST clients as emulator;
@@ -1371,584 +853,6 @@ fn build_mutation(
     builder.build()
 }
 
-// ─── DuckDB vector → Spanner proto Value conversion ─────────────────────────
-
-/// Read a value from a DuckDB vector at the given row and convert to Spanner proto Value.
-///
-/// # Safety
-/// - `data` must point to valid vector data of the appropriate type
-/// - `validity` may be null (meaning all rows are valid)
-/// - `row_idx` must be within the chunk's row count
-unsafe fn read_duckdb_value(
-    vector: ffi::duckdb_vector,
-    row_idx: usize,
-    col: &ColumnMeta,
-) -> Result<Value, String> {
-    unsafe {
-        let data = ffi::duckdb_vector_get_data(vector);
-        let validity = ffi::duckdb_vector_get_validity(vector);
-
-        // NULL check
-        if !validity.is_null() && !ffi::duckdb_validity_row_is_valid(validity, row_idx as u64) {
-            return Ok(Value {
-                kind: Some(Kind::NullValue(0)),
-            });
-        }
-
-        let kind = match col.type_id {
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN => {
-                let v = *data.cast::<bool>().add(row_idx);
-                Kind::BoolValue(v)
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_TINYINT => {
-                let v = *data.cast::<i8>().add(row_idx);
-                Kind::StringValue((v as i64).to_string())
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT => {
-                let v = *data.cast::<i16>().add(row_idx);
-                Kind::StringValue((v as i64).to_string())
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER => {
-                let v = *data.cast::<i32>().add(row_idx);
-                Kind::StringValue((v as i64).to_string())
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT => {
-                let v = *data.cast::<i64>().add(row_idx);
-                Kind::StringValue(v.to_string())
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_UTINYINT => {
-                let v = *data.cast::<u8>().add(row_idx);
-                Kind::StringValue((v as i64).to_string())
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_USMALLINT => {
-                let v = *data.cast::<u16>().add(row_idx);
-                Kind::StringValue((v as i64).to_string())
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER => {
-                let v = *data.cast::<u32>().add(row_idx);
-                Kind::StringValue((v as i64).to_string())
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT => {
-                let v = *data.cast::<u64>().add(row_idx);
-                Kind::StringValue(v.to_string())
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT => {
-                let v = *data.cast::<i128>().add(row_idx);
-                Kind::StringValue(v.to_string())
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_UHUGEINT => {
-                let v = *data.cast::<u128>().add(row_idx);
-                Kind::StringValue(v.to_string())
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_FLOAT => {
-                let v = *data.cast::<f32>().add(row_idx);
-                if v.is_nan() {
-                    Kind::StringValue("NaN".to_string())
-                } else if v.is_infinite() {
-                    Kind::StringValue(if v > 0.0 { "Infinity" } else { "-Infinity" }.to_string())
-                } else {
-                    Kind::NumberValue(v as f64)
-                }
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE => {
-                let v = *data.cast::<f64>().add(row_idx);
-                if v.is_nan() {
-                    Kind::StringValue("NaN".to_string())
-                } else if v.is_infinite() {
-                    Kind::StringValue(if v > 0.0 { "Infinity" } else { "-Infinity" }.to_string())
-                } else {
-                    Kind::NumberValue(v)
-                }
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR => {
-                let str_ptr = data.cast::<ffi::duckdb_string_t>().add(row_idx);
-                let s = read_duckdb_string(str_ptr);
-                Kind::StringValue(s)
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB => {
-                let str_ptr = data.cast::<ffi::duckdb_string_t>().add(row_idx);
-                let bytes = read_duckdb_bytes(str_ptr);
-                use base64::Engine;
-                Kind::StringValue(base64::engine::general_purpose::STANDARD.encode(&bytes))
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_DATE => {
-                let days = *data.cast::<i32>().add(row_idx);
-                Kind::StringValue(epoch_days_to_date_string(days)?)
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP | ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ => {
-                let micros = *data.cast::<i64>().add(row_idx);
-                Kind::StringValue(epoch_timestamp_to_rfc3339(
-                    micros,
-                    col.type_id,
-                    "microseconds",
-                    1_000,
-                )?)
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_S => {
-                let secs = *data.cast::<i64>().add(row_idx);
-                Kind::StringValue(epoch_timestamp_to_rfc3339(
-                    secs,
-                    col.type_id,
-                    "seconds",
-                    1_000_000_000,
-                )?)
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_MS => {
-                let millis = *data.cast::<i64>().add(row_idx);
-                Kind::StringValue(epoch_timestamp_to_rfc3339(
-                    millis,
-                    col.type_id,
-                    "milliseconds",
-                    1_000_000,
-                )?)
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_NS => {
-                let nanos = *data.cast::<i64>().add(row_idx);
-                Kind::StringValue(epoch_timestamp_to_rfc3339(
-                    nanos,
-                    col.type_id,
-                    "nanoseconds",
-                    1,
-                )?)
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL => {
-                let raw_i128 = read_decimal_raw(data, row_idx, col.decimal_internal_type);
-                // If the target Spanner column is FLOAT64 or FLOAT32, convert to NumberValue.
-                // Spanner FLOAT64 rejects StringValue (except for NaN/Infinity).
-                if col.spanner_type_code == TypeCode::Float64
-                    || col.spanner_type_code == TypeCode::Float32
-                {
-                    let s = decimal_i128_to_string(raw_i128, col.decimal_scale);
-                    let f: f64 = s
-                        .parse()
-                        .map_err(|e| format!("DECIMAL to FLOAT64 conversion failed: {e}"))?;
-                    Kind::NumberValue(f)
-                } else {
-                    Kind::StringValue(decimal_i128_to_string(raw_i128, col.decimal_scale))
-                }
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_UUID => {
-                let raw = *data.cast::<u128>().add(row_idx);
-                // Reverse the MSB flip DuckDB applies for sort ordering
-                let uuid_bits = raw ^ (1u128 << 127);
-                Kind::StringValue(uuid::Uuid::from_u128(uuid_bits).to_string())
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST => {
-                let child = col.child.as_deref().ok_or_else(|| {
-                    "DuckDB LIST source column is missing child metadata".to_string()
-                })?;
-                let entry = *data.cast::<ffi::duckdb_list_entry>().add(row_idx);
-                let child_vector = ffi::duckdb_list_vector_get_child(vector);
-                let mut values = Vec::with_capacity(entry.length as usize);
-                for child_idx in entry.offset..entry.offset + entry.length {
-                    values.push(read_duckdb_value(child_vector, child_idx as usize, child)?);
-                }
-                Kind::ListValue(ListValue { values })
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_ARRAY => {
-                let child = col.child.as_deref().ok_or_else(|| {
-                    "DuckDB ARRAY source column is missing child metadata".to_string()
-                })?;
-                let child_vector = ffi::duckdb_array_vector_get_child(vector);
-                let start = row_idx
-                    .checked_mul(col.array_size)
-                    .ok_or_else(|| "DuckDB ARRAY child offset overflow".to_string())?;
-                let mut values = Vec::with_capacity(col.array_size);
-                for child_idx in start..start + col.array_size {
-                    values.push(read_duckdb_value(child_vector, child_idx, child)?);
-                }
-                Kind::ListValue(ListValue { values })
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_STRUCT => {
-                let json = read_duckdb_json_value(vector, row_idx, col)?;
-                let s = serde_json::to_string(&json)
-                    .map_err(|e| format!("STRUCT to JSON conversion failed: {e}"))?;
-                Kind::StringValue(s)
-            }
-            _ => {
-                return Err(format!(
-                    "Unsupported DuckDB type {} for COPY TO spanner",
-                    col.type_id
-                ));
-            }
-        };
-
-        Ok(Value { kind: Some(kind) })
-    }
-}
-
-unsafe fn read_duckdb_json_value(
-    vector: ffi::duckdb_vector,
-    row_idx: usize,
-    col: &ColumnMeta,
-) -> Result<serde_json::Value, String> {
-    unsafe {
-        let data = ffi::duckdb_vector_get_data(vector);
-        let validity = ffi::duckdb_vector_get_validity(vector);
-
-        if !validity.is_null() && !ffi::duckdb_validity_row_is_valid(validity, row_idx as u64) {
-            return Ok(serde_json::Value::Null);
-        }
-
-        match col.type_id {
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_BOOLEAN => {
-                let v = *data.cast::<bool>().add(row_idx);
-                Ok(serde_json::Value::Bool(v))
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_TINYINT => {
-                let v = *data.cast::<i8>().add(row_idx);
-                Ok(serde_json::Value::Number((v as i64).into()))
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT => {
-                let v = *data.cast::<i16>().add(row_idx);
-                Ok(serde_json::Value::Number((v as i64).into()))
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER => {
-                let v = *data.cast::<i32>().add(row_idx);
-                Ok(serde_json::Value::Number((v as i64).into()))
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT => {
-                let v = *data.cast::<i64>().add(row_idx);
-                Ok(serde_json::Value::Number(v.into()))
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_UTINYINT => {
-                let v = *data.cast::<u8>().add(row_idx);
-                Ok(serde_json::Value::Number((v as u64).into()))
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_USMALLINT => {
-                let v = *data.cast::<u16>().add(row_idx);
-                Ok(serde_json::Value::Number((v as u64).into()))
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_UINTEGER => {
-                let v = *data.cast::<u32>().add(row_idx);
-                Ok(serde_json::Value::Number((v as u64).into()))
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_UBIGINT => {
-                let v = *data.cast::<u64>().add(row_idx);
-                Ok(serde_json::Value::Number(v.into()))
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT => {
-                let v = *data.cast::<i128>().add(row_idx);
-                Ok(serde_json::Value::String(v.to_string()))
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_UHUGEINT => {
-                let v = *data.cast::<u128>().add(row_idx);
-                Ok(serde_json::Value::String(v.to_string()))
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_FLOAT => {
-                let v = *data.cast::<f32>().add(row_idx);
-                json_number_or_string(v as f64)
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE => {
-                let v = *data.cast::<f64>().add(row_idx);
-                json_number_or_string(v)
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR => {
-                let str_ptr = data.cast::<ffi::duckdb_string_t>().add(row_idx);
-                let text = read_duckdb_string(str_ptr);
-                if col.is_json {
-                    // Parse the logical JSON document. A physical VARCHAR with
-                    // the same text stays a JSON string below.
-                    serde_json::from_str(&text)
-                        .map_err(|e| format!("Invalid DuckDB JSON value: {e}"))
-                } else {
-                    Ok(serde_json::Value::String(text))
-                }
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_BLOB => {
-                let str_ptr = data.cast::<ffi::duckdb_string_t>().add(row_idx);
-                let bytes = read_duckdb_bytes(str_ptr);
-                use base64::Engine;
-                Ok(serde_json::Value::String(
-                    base64::engine::general_purpose::STANDARD.encode(&bytes),
-                ))
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_DATE => {
-                let days = *data.cast::<i32>().add(row_idx);
-                Ok(serde_json::Value::String(epoch_days_to_date_string(days)?))
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP | ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ => {
-                let micros = *data.cast::<i64>().add(row_idx);
-                Ok(serde_json::Value::String(epoch_timestamp_to_rfc3339(
-                    micros,
-                    col.type_id,
-                    "microseconds",
-                    1_000,
-                )?))
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_S => {
-                let secs = *data.cast::<i64>().add(row_idx);
-                Ok(serde_json::Value::String(epoch_timestamp_to_rfc3339(
-                    secs,
-                    col.type_id,
-                    "seconds",
-                    1_000_000_000,
-                )?))
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_MS => {
-                let millis = *data.cast::<i64>().add(row_idx);
-                Ok(serde_json::Value::String(epoch_timestamp_to_rfc3339(
-                    millis,
-                    col.type_id,
-                    "milliseconds",
-                    1_000_000,
-                )?))
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_NS => {
-                let nanos = *data.cast::<i64>().add(row_idx);
-                Ok(serde_json::Value::String(epoch_timestamp_to_rfc3339(
-                    nanos,
-                    col.type_id,
-                    "nanoseconds",
-                    1,
-                )?))
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_DECIMAL => {
-                let raw_i128 = read_decimal_raw(data, row_idx, col.decimal_internal_type);
-                Ok(serde_json::Value::String(decimal_i128_to_string(
-                    raw_i128,
-                    col.decimal_scale,
-                )))
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_UUID => {
-                let raw = *data.cast::<u128>().add(row_idx);
-                let uuid_bits = raw ^ (1u128 << 127);
-                Ok(serde_json::Value::String(
-                    uuid::Uuid::from_u128(uuid_bits).to_string(),
-                ))
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST => {
-                let child = col.child.as_deref().ok_or_else(|| {
-                    "DuckDB LIST source column is missing child metadata".to_string()
-                })?;
-                let entry = *data.cast::<ffi::duckdb_list_entry>().add(row_idx);
-                let child_vector = ffi::duckdb_list_vector_get_child(vector);
-                let mut values = Vec::with_capacity(entry.length as usize);
-                for child_idx in entry.offset..entry.offset + entry.length {
-                    values.push(read_duckdb_json_value(
-                        child_vector,
-                        child_idx as usize,
-                        child,
-                    )?);
-                }
-                Ok(serde_json::Value::Array(values))
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_ARRAY => {
-                let child = col.child.as_deref().ok_or_else(|| {
-                    "DuckDB ARRAY source column is missing child metadata".to_string()
-                })?;
-                let child_vector = ffi::duckdb_array_vector_get_child(vector);
-                let start = row_idx
-                    .checked_mul(col.array_size)
-                    .ok_or_else(|| "DuckDB ARRAY child offset overflow".to_string())?;
-                let mut values = Vec::with_capacity(col.array_size);
-                for child_idx in start..start + col.array_size {
-                    values.push(read_duckdb_json_value(child_vector, child_idx, child)?);
-                }
-                Ok(serde_json::Value::Array(values))
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_STRUCT => {
-                let mut object = serde_json::Map::with_capacity(col.struct_fields.len());
-                for (field_idx, field) in col.struct_fields.iter().enumerate() {
-                    let child_vector =
-                        ffi::duckdb_struct_vector_get_child(vector, field_idx as u64);
-                    let value = read_duckdb_json_value(child_vector, row_idx, &field.column)?;
-                    object.insert(field.name.clone(), value);
-                }
-                Ok(serde_json::Value::Object(object))
-            }
-            _ => Err(format!(
-                "Unsupported DuckDB type {} in STRUCT to JSON conversion",
-                col.type_id
-            )),
-        }
-    }
-}
-
-fn json_number_or_string(v: f64) -> Result<serde_json::Value, String> {
-    if v.is_finite() {
-        serde_json::Number::from_f64(v)
-            .map(serde_json::Value::Number)
-            .ok_or_else(|| format!("Invalid JSON number: {v}"))
-    } else if v.is_nan() {
-        Ok(serde_json::Value::String("NaN".to_string()))
-    } else {
-        Ok(serde_json::Value::String(
-            if v > 0.0 { "Infinity" } else { "-Infinity" }.to_string(),
-        ))
-    }
-}
-
-/// Read a DECIMAL raw value as i128, handling different internal storage types.
-unsafe fn read_decimal_raw(data: *mut c_void, row_idx: usize, internal_type: u32) -> i128 {
-    unsafe {
-        match internal_type {
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT => *data.cast::<i16>().add(row_idx) as i128,
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER => *data.cast::<i32>().add(row_idx) as i128,
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT => *data.cast::<i64>().add(row_idx) as i128,
-            _ => *data.cast::<i128>().add(row_idx), // HUGEINT for width > 18
-        }
-    }
-}
-
-// ─── String/blob reading from DuckDB vectors ────────────────────────────────
-
-unsafe fn read_duckdb_string(str_ptr: *mut ffi::duckdb_string_t) -> String {
-    unsafe {
-        let len = ffi::duckdb_string_t_length(*str_ptr) as usize;
-        let data = ffi::duckdb_string_t_data(str_ptr);
-        let bytes = std::slice::from_raw_parts(data.cast::<u8>(), len);
-        String::from_utf8_lossy(bytes).into_owned()
-    }
-}
-
-unsafe fn read_duckdb_bytes(str_ptr: *mut ffi::duckdb_string_t) -> Vec<u8> {
-    unsafe {
-        let len = ffi::duckdb_string_t_length(*str_ptr) as usize;
-        let data = ffi::duckdb_string_t_data(str_ptr);
-        std::slice::from_raw_parts(data.cast::<u8>(), len).to_vec()
-    }
-}
-
-// ─── Scalar conversion helpers ──────────────────────────────────────────────
-
-fn epoch_days_to_date_string(days: i32) -> Result<String, String> {
-    let epoch = time::Date::from_calendar_date(1970, time::Month::January, 1)
-        .map_err(|e| format!("Date error: {e}"))?;
-    let date = epoch
-        .checked_add(time::Duration::days(days as i64))
-        .ok_or_else(|| format!("Date overflow for epoch days: {days}"))?;
-    let (year, month, day) = date.to_calendar_date();
-    Ok(format!("{:04}-{:02}-{:02}", year, month as u8, day))
-}
-
-fn epoch_timestamp_to_rfc3339(
-    value: i64,
-    logical_type: ffi::duckdb_type,
-    unit: &str,
-    nanos_per_unit: i128,
-) -> Result<String, String> {
-    let finite = unsafe {
-        match logical_type {
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP | ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_TZ => {
-                ffi::duckdb_is_finite_timestamp(ffi::duckdb_timestamp { micros: value })
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_S => {
-                ffi::duckdb_is_finite_timestamp_s(ffi::duckdb_timestamp_s { seconds: value })
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_MS => {
-                ffi::duckdb_is_finite_timestamp_ms(ffi::duckdb_timestamp_ms { millis: value })
-            }
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_NS => {
-                ffi::duckdb_is_finite_timestamp_ns(ffi::duckdb_timestamp_ns { nanos: value })
-            }
-            _ => {
-                return Err(format!(
-                    "Unsupported timestamp logical type: {logical_type:?}"
-                ));
-            }
-        }
-    };
-    if !finite {
-        return Err(format!(
-            "COPY does not support infinite DuckDB timestamps ({unit}={value})"
-        ));
-    }
-
-    let nanos = (value as i128)
-        .checked_mul(nanos_per_unit)
-        .ok_or_else(|| format!("Timestamp overflow for {unit} {value}"))?;
-    let ts = time::OffsetDateTime::from_unix_timestamp_nanos(nanos)
-        .map_err(|e| format!("Timestamp overflow for {unit} {value}: {e}"))?;
-    ts.format(&time::format_description::well_known::Rfc3339)
-        .map_err(|e| format!("Timestamp format error: {e}"))
-}
-
-fn decimal_i128_to_string(raw: i128, scale: u8) -> String {
-    if scale == 0 {
-        return raw.to_string();
-    }
-
-    let divisor = 10i128.pow(scale as u32);
-    let is_negative = raw < 0;
-    let abs = if is_negative {
-        if raw == i128::MIN {
-            // Practically unreachable for DECIMAL(38,9), but handle gracefully
-            return format!("-{}", (raw as u128).wrapping_neg());
-        }
-        (-raw) as u128
-    } else {
-        raw as u128
-    };
-
-    let divisor_u = divisor as u128;
-    let integer_part = abs / divisor_u;
-    let fractional_part = abs % divisor_u;
-
-    if fractional_part == 0 {
-        if is_negative {
-            format!("-{integer_part}")
-        } else {
-            format!("{integer_part}")
-        }
-    } else {
-        let frac_str = format!("{:0>width$}", fractional_part, width = scale as usize);
-        let frac_trimmed = frac_str.trim_end_matches('0');
-        if is_negative {
-            format!("-{integer_part}.{frac_trimmed}")
-        } else {
-            format!("{integer_part}.{frac_trimmed}")
-        }
-    }
-}
-
-// ─── Error setters ──────────────────────────────────────────────────────────
-
-fn copy_callback_error_message(msg: &str) -> CString {
-    let sanitized = msg.replace('\0', "\\0");
-    CString::new(sanitized).unwrap_or_else(|_| c"spanner COPY callback failed".to_owned())
-}
-
-unsafe fn set_bind_error(info: ffi::duckdb_copy_function_bind_info, msg: &str) {
-    unsafe {
-        let c_msg = copy_callback_error_message(msg);
-        ffi::duckdb_copy_function_bind_set_error(info, c_msg.as_ptr());
-    }
-}
-
-unsafe fn set_global_init_error(info: ffi::duckdb_copy_function_global_init_info, msg: &str) {
-    unsafe {
-        let c_msg = copy_callback_error_message(msg);
-        ffi::duckdb_copy_function_global_init_set_error(info, c_msg.as_ptr());
-    }
-}
-
-unsafe fn set_sink_error(info: ffi::duckdb_copy_function_sink_info, msg: &str) {
-    unsafe {
-        let c_msg = copy_callback_error_message(msg);
-        ffi::duckdb_copy_function_sink_set_error(info, c_msg.as_ptr());
-    }
-}
-
-unsafe fn set_finalize_error(info: ffi::duckdb_copy_function_finalize_info, msg: &str) {
-    unsafe {
-        let c_msg = copy_callback_error_message(msg);
-        ffi::duckdb_copy_function_finalize_set_error(info, c_msg.as_ptr());
-    }
-}
-
-// ─── Memory management ─────────────────────────────────────────────────────
-
-unsafe extern "C" fn drop_box<T>(ptr: *mut c_void) {
-    unsafe {
-        if !ptr.is_null() {
-            drop(Box::from_raw(ptr as *mut T));
-        }
-    }
-}
-
-// ─── Tests ──────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2095,8 +999,18 @@ mod tests {
 
     #[test]
     fn copy_callback_error_message_sanitizes_nul() {
-        let message = copy_callback_error_message("bind failed\0with context");
-        assert_eq!(message.to_str().unwrap(), "bind failed\\0with context");
+        let message = guard("bind", || {
+            Err::<(), String>("bind failed\0with context".into())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(message.contains("bind failed\\0with context"), "{message}");
+        let failure = copy_failure_message("flush", "commit failed\0with context", 1);
+        assert!(
+            failure.contains("commit failed\\0with context"),
+            "{failure}"
+        );
+        assert!(!failure.contains('\0'));
     }
 
     fn col(name: &str, is_generated: bool) -> schema::ColumnInfo {
@@ -2119,109 +1033,11 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
-    fn logical_type(type_id: ffi::duckdb_type) -> OwnedDuckDbLogicalType {
-        unsafe {
-            let logical_type =
-                OwnedDuckDbLogicalType::from_raw(ffi::duckdb_create_logical_type(type_id));
-            assert!(!logical_type.as_raw().is_null());
-            logical_type
-        }
-    }
-
-    fn list_type(child: &OwnedDuckDbLogicalType) -> OwnedDuckDbLogicalType {
-        unsafe {
-            let logical_type =
-                OwnedDuckDbLogicalType::from_raw(ffi::duckdb_create_list_type(child.as_raw()));
-            assert!(!logical_type.as_raw().is_null());
-            logical_type
-        }
-    }
-
-    fn array_type(child: &OwnedDuckDbLogicalType, size: u64) -> OwnedDuckDbLogicalType {
-        unsafe {
-            let logical_type = OwnedDuckDbLogicalType::from_raw(ffi::duckdb_create_array_type(
-                child.as_raw(),
-                size,
-            ));
-            assert!(!logical_type.as_raw().is_null());
-            logical_type
-        }
-    }
-
-    fn column_from_logical_type(
-        logical_type: &OwnedDuckDbLogicalType,
-    ) -> Result<ColumnMeta, String> {
-        unsafe { column_meta_from_logical_type(logical_type.as_raw()) }
-    }
-
-    fn json_alias(type_id: ffi::duckdb_type) -> OwnedDuckDbLogicalType {
-        let logical_type = logical_type(type_id);
-        let alias = CString::new("JSON").unwrap();
-        unsafe {
-            ffi::duckdb_logical_type_set_alias(logical_type.as_raw(), alias.as_ptr());
-        }
-        logical_type
-    }
-
-    fn struct_type(members: &[(&str, &OwnedDuckDbLogicalType)]) -> OwnedDuckDbLogicalType {
-        let mut types: Vec<ffi::duckdb_logical_type> = members
-            .iter()
-            .map(|(_, logical_type)| logical_type.as_raw())
-            .collect();
-        let names: Vec<CString> = members
-            .iter()
-            .map(|(name, _)| CString::new(*name).unwrap())
-            .collect();
-        let mut name_ptrs: Vec<*const c_char> = names.iter().map(|name| name.as_ptr()).collect();
-        unsafe {
-            let raw = ffi::duckdb_create_struct_type(
-                types.as_mut_ptr(),
-                name_ptrs.as_mut_ptr(),
-                members.len() as _,
-            );
-            let logical_type = OwnedDuckDbLogicalType::from_raw(raw);
-            assert!(!logical_type.as_raw().is_null());
-            logical_type
-        }
-    }
-
-    fn column_error_from_logical_type(logical_type: &OwnedDuckDbLogicalType) -> String {
-        match column_from_logical_type(logical_type) {
-            Ok(_) => panic!("logical type unexpectedly passed COPY metadata validation"),
-            Err(err) => err,
-        }
-    }
-
     fn options(values: &[(&str, &str)]) -> std::collections::HashMap<String, Vec<String>> {
         values
             .iter()
             .map(|(key, value)| ((*key).to_string(), vec![(*value).to_string()]))
             .collect()
-    }
-
-    #[test]
-    fn json_alias_is_kept_through_nested_copy_metadata() {
-        let json_ty = json_alias(ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR);
-        let varchar_ty = logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR);
-        let json_meta = column_from_logical_type(&json_ty).unwrap();
-        let varchar_meta = column_from_logical_type(&varchar_ty).unwrap();
-        assert!(json_meta.is_json);
-        assert!(!varchar_meta.is_json);
-        assert_eq!(json_meta.type_id, ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR);
-
-        let nested = struct_type(&[("obj", &json_ty), ("text", &varchar_ty)]);
-        let nested = column_from_logical_type(&nested).unwrap();
-        assert!(!nested.is_json);
-        assert!(nested.struct_fields[0].column.is_json);
-        assert!(!nested.struct_fields[1].column.is_json);
-
-        let list = list_type(&json_ty);
-        let list = column_from_logical_type(&list).unwrap();
-        assert!(list.child.unwrap().is_json);
-
-        let array = array_type(&varchar_ty, 2);
-        let array = column_from_logical_type(&array).unwrap();
-        assert!(!array.child.unwrap().is_json);
     }
 
     #[test]
@@ -2387,7 +1203,7 @@ mod tests {
             err,
             "Unknown COPY FORMAT spanner option(s): a_typo, z_typo. Recognized options: \
              database_path, project, instance, database, endpoint, endpoint_mode, dialect, mode, \
-             batch_size, columns"
+             mutation_batch_size, columns"
         );
     }
 
@@ -2406,7 +1222,7 @@ mod tests {
         assert_eq!(parse_batch_size(Some("1")).unwrap(), 1);
         assert_eq!(
             parse_batch_size(Some("0")).unwrap_err(),
-            "Invalid batch_size '0': must be greater than zero"
+            "Invalid mutation_batch_size '0': must be greater than zero"
         );
     }
 
@@ -2419,101 +1235,6 @@ mod tests {
         let value = (MAX_BATCH_SIZE + 1).to_string();
         let error = parse_batch_size(Some(&value)).unwrap_err();
         assert!(error.contains("must not exceed 80000 rows"), "{error}");
-    }
-
-    #[test]
-    fn timestamp_formatter_preserves_ordinary_pre_and_post_epoch_values() {
-        assert_eq!(
-            epoch_timestamp_to_rfc3339(
-                -1,
-                ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_S,
-                "seconds",
-                1_000_000_000,
-            )
-            .unwrap(),
-            "1969-12-31T23:59:59Z"
-        );
-        assert_eq!(
-            epoch_timestamp_to_rfc3339(
-                1_234,
-                ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_MS,
-                "milliseconds",
-                1_000_000,
-            )
-            .unwrap(),
-            "1970-01-01T00:00:01.234Z"
-        );
-        assert_eq!(
-            epoch_timestamp_to_rfc3339(
-                -1,
-                ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP,
-                "microseconds",
-                1_000,
-            )
-            .unwrap(),
-            "1969-12-31T23:59:59.999999Z"
-        );
-        assert_eq!(
-            epoch_timestamp_to_rfc3339(
-                1,
-                ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_NS,
-                "nanoseconds",
-                1,
-            )
-            .unwrap(),
-            "1970-01-01T00:00:00.000000001Z"
-        );
-    }
-
-    #[test]
-    fn timestamp_formatter_rejects_i64_extremes_without_wrapping() {
-        for (value, logical_type, unit, nanos_per_unit) in [
-            (
-                i64::MIN,
-                ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_S,
-                "seconds",
-                1_000_000_000,
-            ),
-            (
-                i64::MAX,
-                ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_S,
-                "seconds",
-                1_000_000_000,
-            ),
-            (
-                i64::MIN,
-                ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_MS,
-                "milliseconds",
-                1_000_000,
-            ),
-            (
-                i64::MAX,
-                ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_MS,
-                "milliseconds",
-                1_000_000,
-            ),
-            (
-                -i64::MAX,
-                ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_NS,
-                "nanoseconds",
-                1,
-            ),
-            (
-                i64::MAX,
-                ffi::DUCKDB_TYPE_DUCKDB_TYPE_TIMESTAMP_NS,
-                "nanoseconds",
-                1,
-            ),
-        ] {
-            let err =
-                epoch_timestamp_to_rfc3339(value, logical_type, unit, nanos_per_unit).unwrap_err();
-            assert!(
-                err.starts_with("COPY does not support infinite DuckDB timestamps")
-                    || err.starts_with("Timestamp overflow"),
-                "{err}"
-            );
-            assert!(err.contains(unit), "{err}");
-        }
     }
 
     #[test]
@@ -2543,104 +1264,6 @@ mod tests {
         let policy = copy_transaction_retry_policy();
         assert_eq!(policy.max_attempts(), WRITE_TRANSACTION_MAX_ATTEMPTS);
         assert_eq!(policy.total_timeout(), WRITE_TRANSACTION_TOTAL_TIMEOUT);
-    }
-
-    #[test]
-    fn interval_source_is_rejected_with_string_workaround() {
-        let interval = logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTERVAL);
-        let err = column_error_from_logical_type(&interval);
-
-        assert!(err.contains("Spanner INTERVAL is query-only"), "{err}");
-        assert!(err.contains("interval_to_iso8601(column)"), "{err}");
-        assert!(err.contains("Spanner STRING"), "{err}");
-    }
-
-    #[test]
-    fn float_and_double_to_numeric_are_rejected_before_conversion() {
-        for type_id in [
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_FLOAT,
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE,
-        ] {
-            let logical_type = logical_type(type_id);
-            let mut source = column_from_logical_type(&logical_type).unwrap();
-            let err = apply_spanner_type(&mut source, &spanner_types::numeric()).unwrap_err();
-
-            assert!(
-                err.contains("cannot be copied to a Spanner NUMERIC"),
-                "{err}"
-            );
-            assert!(err.contains("cannot be guaranteed"), "{err}");
-            assert!(err.contains("Explicitly cast"), "{err}");
-            assert!(err.contains("DECIMAL"), "{err}");
-        }
-    }
-
-    #[test]
-    fn fixed_array_float_to_numeric_is_rejected_during_preflight() {
-        let float = logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_FLOAT);
-        let array = array_type(&float, 3);
-        let mut source = column_from_logical_type(&array).unwrap();
-
-        assert_eq!(source.type_id, ffi::DUCKDB_TYPE_DUCKDB_TYPE_ARRAY);
-        assert_eq!(source.array_size, 3);
-        assert_eq!(
-            source.child.as_deref().unwrap().type_id,
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_FLOAT
-        );
-
-        let err = apply_spanner_type(&mut source, &spanner_types::array(spanner_types::numeric()))
-            .unwrap_err();
-
-        assert!(err.contains("DuckDB FLOAT"), "{err}");
-        assert!(err.contains("Spanner NUMERIC"), "{err}");
-    }
-
-    #[test]
-    fn nested_container_double_to_numeric_is_rejected_during_preflight() {
-        let double = logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE);
-        let array = array_type(&double, 2);
-        let list = list_type(&array);
-        let mut source = column_from_logical_type(&list).unwrap();
-
-        assert_eq!(source.type_id, ffi::DUCKDB_TYPE_DUCKDB_TYPE_LIST);
-        let array_meta = source.child.as_deref().unwrap();
-        assert_eq!(array_meta.type_id, ffi::DUCKDB_TYPE_DUCKDB_TYPE_ARRAY);
-        assert_eq!(array_meta.array_size, 2);
-        assert_eq!(
-            array_meta.child.as_deref().unwrap().type_id,
-            ffi::DUCKDB_TYPE_DUCKDB_TYPE_DOUBLE
-        );
-
-        let err = apply_spanner_type(
-            &mut source,
-            &spanner_types::array(spanner_types::array(spanner_types::numeric())),
-        )
-        .unwrap_err();
-
-        assert!(err.contains("DuckDB DOUBLE"), "{err}");
-        assert!(err.contains("Spanner NUMERIC"), "{err}");
-    }
-
-    #[test]
-    fn nested_interval_is_rejected_while_collecting_logical_type_metadata() {
-        let interval = logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTERVAL);
-        let list = list_type(&interval);
-        let array = array_type(&list, 2);
-
-        let err = column_error_from_logical_type(&array);
-
-        assert!(err.contains("DuckDB INTERVAL"), "{err}");
-        assert!(err.contains("interval_to_iso8601(column)"), "{err}");
-    }
-
-    #[test]
-    fn float_to_float_target_remains_supported() {
-        let float = logical_type(ffi::DUCKDB_TYPE_DUCKDB_TYPE_FLOAT);
-        let mut source = column_from_logical_type(&float).unwrap();
-
-        apply_spanner_type(&mut source, &spanner_types::float64()).unwrap();
-
-        assert_eq!(source.spanner_type_code, TypeCode::Float64);
     }
 
     #[tokio::test]
@@ -2780,5 +1403,97 @@ mod tests {
                 .set_message("different internal error"),
         );
         assert!(!is_internal_emulator_schema_error(&err));
+    }
+    fn descriptor(text: &str) -> LogicalTypeHandle {
+        let context = crate::test_support::connection();
+        let native = duckdb_neo::logical_type::LogicalType::from_text(&context, text).unwrap();
+        LogicalTypeHandle::from_neo(&native).unwrap()
+    }
+    #[test]
+    fn json_alias_is_kept_through_nested_copy_metadata() {
+        let json = descriptor("JSON");
+        assert_eq!(json.id(), LogicalTypeId::Varchar);
+        assert_eq!(json.get_alias().as_deref(), Some("JSON"));
+        assert_eq!(descriptor("VARCHAR").get_alias(), None);
+        let nested = descriptor("STRUCT(obj JSON, text VARCHAR)");
+        assert_eq!(nested.child(0).get_alias().as_deref(), Some("JSON"));
+        assert_eq!(nested.child(1).get_alias(), None);
+        assert_eq!(
+            descriptor("JSON[]").child(0).get_alias().as_deref(),
+            Some("JSON")
+        );
+        assert_eq!(descriptor("VARCHAR[2]").child(0).get_alias(), None);
+    }
+    #[test]
+    fn interval_source_is_rejected_with_string_workaround() {
+        for text in ["INTERVAL", "INTERVAL[]", "STRUCT(x INTERVAL[])"] {
+            let error = validate_source(&descriptor(text)).unwrap_err();
+            assert!(error.contains("INTERVAL is query-only"), "{error}");
+            assert!(error.contains("interval_to_iso8601(column)"), "{error}");
+        }
+    }
+    #[test]
+    fn float_and_double_to_numeric_are_rejected_before_conversion() {
+        for text in ["FLOAT", "DOUBLE"] {
+            let error = validate_target(&descriptor(text), &spanner_types::numeric()).unwrap_err();
+            assert!(
+                error.contains("cannot be copied to a Spanner NUMERIC"),
+                "{error}"
+            );
+            assert!(error.contains("DECIMAL"), "{error}");
+            validate_target(&descriptor(text), &spanner_types::float64()).unwrap();
+        }
+    }
+    #[test]
+    fn fixed_array_and_nested_float_to_numeric_are_rejected_during_preflight() {
+        let fixed = descriptor("FLOAT[3]");
+        assert_eq!(fixed.id(), LogicalTypeId::Array);
+        assert_eq!(fixed.array_size(), 3);
+        assert_eq!(fixed.child(0).id(), LogicalTypeId::Float);
+        assert!(validate_target(&fixed, &spanner_types::array(spanner_types::numeric())).is_err());
+        let nested = descriptor("DOUBLE[2][]");
+        assert_eq!(nested.child(0).array_size(), 2);
+        assert!(
+            validate_target(
+                &nested,
+                &spanner_types::array(spanner_types::array(spanner_types::numeric()))
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn copy_timestamp_formatter_preserves_units_and_rejects_infinity() {
+        use duckdb_neo::{connection::FFILink, value::ValueInput};
+        let context = crate::test_support::connection();
+        for (raw, expected) in [(-1, "1969-12-31T23:59:59Z"), (1, "1970-01-01T00:00:01Z")] {
+            let value = context.create_value(ValueInput::TimestampSec(raw)).unwrap();
+            assert_eq!(
+                crate::scalars::copy_scalar_json(&value, &descriptor("TIMESTAMP_S")).unwrap(),
+                serde_json::json!(expected)
+            );
+        }
+        let value = context.create_value(ValueInput::TimestampNs(1)).unwrap();
+        assert_eq!(
+            crate::scalars::copy_scalar_json(&value, &descriptor("TIMESTAMP_NS")).unwrap(),
+            serde_json::json!("1970-01-01T00:00:00.000000001Z")
+        );
+        for raw in [-i64::MAX, i64::MAX] {
+            for (input, ty) in [
+                (ValueInput::TimestampSec(raw), "TIMESTAMP_S"),
+                (ValueInput::TimestampMs(raw), "TIMESTAMP_MS"),
+                (ValueInput::Timestamp(raw), "TIMESTAMP"),
+                (ValueInput::TimestampNs(raw), "TIMESTAMP_NS"),
+            ] {
+                let value = context.create_value(input).unwrap();
+                let error = crate::scalars::copy_scalar_json(&value, &descriptor(ty)).unwrap_err();
+                assert!(error.to_string().contains("infinite"), "{ty}: {error}");
+            }
+        }
+        // Engine2 treats i64::MIN nanoseconds as finite; do not conflate it
+        // with the actual negative-infinity sentinel (-i64::MAX).
+        let value = context
+            .create_value(ValueInput::TimestampNs(i64::MIN))
+            .unwrap();
+        assert!(crate::scalars::copy_scalar_json(&value, &descriptor("TIMESTAMP_NS")).is_ok());
     }
 }

@@ -108,22 +108,25 @@ jobs:
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_check_extension_rejects_mismatched_host.py
       - run: PYTHONDONTWRITEBYTECODE=1 python3 -m unittest scripts/test_makefile_test_profiles.py
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets --features loadable-extension -- -D warnings
-      - run: cargo test --lib
+      - run: cargo clippy --lib --features loadable-extension -- -D warnings
+      - run: cargo clippy --all-targets --features static-extension -- -D warnings
+      - run: cargo test --features static-extension --lib
 
   duckdb-stable-build:
     name: Build extension binaries
     needs: changes
     if: ${{ needs.changes.outputs.run_distribution == 'true' }}
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@969bc76276acec1c0a3922ff500d2ec3a1a3b037 # 969bc76276acec1c0a3922ff500d2ec3a1a3b037
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@ebdcc1961780b0ce1272a0d7637dc58447c34885 # ebdcc1961780b0ce1272a0d7637dc58447c34885
     with:
-      duckdb_version: v1.5.6
-      ci_tools_version: 969bc76276acec1c0a3922ff500d2ec3a1a3b037
+      duckdb_version: v2.0.0
+      ci_tools_version: ebdcc1961780b0ce1272a0d7637dc58447c34885
       extension_name: spanner
       extra_toolchains: rust;python3
       reduced_ci_mode: ${{ needs.changes.outputs.reduced_ci_mode }}
       run_disk_clean_step: ${{ github.event_name != 'pull_request' }}
       # musl: not targeted; wasm: extension uses tokio+gRPC+rustls (not wasm-compatible).
+      # Current ci-tools makes macOS x86_64 opt-in; retain the existing six artifacts.
+      opt_in_archs: 'osx_amd64'
       exclude_archs: 'linux_amd64_musl;wasm_mvp;wasm_eh;wasm_threads'
       # macOS/windows runners lack a Spanner emulator; tests run in emulator-tests below.
       skip_tests: true
@@ -149,13 +152,13 @@ jobs:
 
       - name: Offline release smoke profile
         env:
-          DUCKDB_TEST_VERSION: 1.5.6
+          DUCKDB_TEST_VERSION: 2.0.0
         run: make community_smoke
 
       - name: SQLLogicTest (make test_release)
         run: make configure release test_release
 
-      - name: SQLLogicTest with opt-in PEG parser
+      - name: SQLLogicTest with default PEG parser mirror
         run: make test_peg_parser
 
       - name: Exact DuckDB extension compatibility checks
@@ -195,4 +198,4 @@ jobs:
           cache-on-failure: true
 
       - name: Rust integration tests
-        run: cargo test --test integration_test
+        run: cargo test --features static-extension --test integration_test

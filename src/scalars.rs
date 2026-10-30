@@ -1,475 +1,343 @@
-//! Native scalar functions replacing SQL macros for Spanner parameter helpers.
-
+//! Native v2 scalar callbacks and owned-value parameter conversion.
+use crate::duck::{LogicalTypeHandle, LogicalTypeId};
 use base64::Engine;
-use duckdb::arrow::array::{Array, StringArray};
-use duckdb::core::{
-    DataChunkHandle, FlatVector, ListVector, LogicalTypeHandle, LogicalTypeId, StructVector,
+use duckdb_neo::{
+    DuckDBType, Result as NeoResult,
+    connection::Context,
+    data_chunk::VectorCollection,
+    enums::FunctionProperty,
+    extension::Extension,
+    scalar::{ScalarCallbacks, ScalarFunctionBuilder},
+    signature::{FunctionParameter, SignatureBuilder},
+    types::*,
+    value::Value as NeoValue,
+    vector::{Unknown, Vector},
 };
-use duckdb::ffi::{
-    duckdb_date, duckdb_hugeint, duckdb_interval, duckdb_string_t, duckdb_time, duckdb_time_ns,
-    duckdb_timestamp, duckdb_uhugeint,
-};
-use duckdb::types::DuckString;
-use duckdb::vscalar::{ScalarFunctionSignature, VScalar};
-use duckdb::vtab::arrow::{WritableVector, write_arrow_array_to_vector};
 use serde_json::{Map, Value, json};
 use time::OffsetDateTime;
-
-use crate::RegistrationError;
-
 const TIMESTAMP_NS_INFINITY_ERROR: &str = "TIMESTAMP_NS infinity is not a valid Spanner TIMESTAMP";
-
-pub struct SpannerValueScalar;
-pub struct SpannerTypedScalar;
-pub struct SpannerParamsScalar;
-pub struct IntervalToIso8601Scalar;
-
-/// Register scalars on a raw connection with null-input special handling.
-///
-/// # Safety
-/// `raw_con` must be a valid `duckdb_connection`.
-pub(crate) struct PreparedScalars(Vec<(&'static str, OwnedScalarFunctionSet)>);
-
-impl PreparedScalars {
-    /// # Safety
-    /// `raw_con` must be a valid `duckdb_connection`.
-    pub(crate) unsafe fn register(
-        self,
-        raw_con: duckdb::ffi::duckdb_connection,
-    ) -> Result<(), RegistrationError> {
-        for (name, set) in self.0 {
-            let rc = if crate::should_fail_status("register scalar function") {
-                duckdb::ffi::DuckDBError
-            } else {
-                unsafe { duckdb::ffi::duckdb_register_scalar_function_set(raw_con, set.0) }
-            };
-            if rc != duckdb::ffi::DuckDBSuccess {
-                return Err(RegistrationError::new(
-                    "register scalar function",
-                    name,
-                    format!("DuckDB returned status {rc}"),
-                ));
+#[derive(Clone, Copy)]
+enum Operation {
+    Value,
+    Typed,
+    Params,
+    Interval,
+}
+struct Scalar(Operation);
+impl ScalarCallbacks for Scalar {
+    type BindData = ();
+    type InitData = ();
+    fn exec(
+        &self,
+        _: Option<&()>,
+        _: Option<&mut ()>,
+        _ctx: &Context,
+        input: &mut VectorCollection,
+        output: Vector<'_, Unknown>,
+    ) -> NeoResult<()> {
+        crate::vtab_safety::guard_callback("SpannerScalar", "exec", || {
+            let count = input.row_count()?;
+            let ty = LogicalTypeHandle::from_neo(input.get_untyped_vector_at(0)?.logical_type())?;
+            match self.0 {
+                Operation::Value => validate_spanner_value_type(&ty, "spanner_value", false)?,
+                Operation::Typed => validate_spanner_value_type(&ty, "spanner_typed", true)?,
+                Operation::Params if ty.id() != LogicalTypeId::SqlNull => {
+                    validate_params_struct_type(&ty)?
+                }
+                _ => {}
             }
-        }
-        Ok(())
-    }
-}
-
-struct OwnedScalarFunctionSet(duckdb::ffi::duckdb_scalar_function_set);
-
-impl Drop for OwnedScalarFunctionSet {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { duckdb::ffi::duckdb_destroy_scalar_function_set(&mut self.0) };
-        }
-    }
-}
-
-struct OwnedScalarFunction(duckdb::ffi::duckdb_scalar_function);
-
-impl Drop for OwnedScalarFunction {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { duckdb::ffi::duckdb_destroy_scalar_function(&mut self.0) };
-        }
-    }
-}
-
-struct OwnedLogicalType(duckdb::ffi::duckdb_logical_type);
-
-impl Drop for OwnedLogicalType {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe { duckdb::ffi::duckdb_destroy_logical_type(&mut self.0) };
-        }
-    }
-}
-
-pub(crate) unsafe fn prepare_scalars_c_api() -> Result<PreparedScalars, RegistrationError> {
-    unsafe {
-        Ok(PreparedScalars(vec![
-            (
-                "spanner_value",
-                prepare_nullable_scalar::<SpannerValueScalar>(
-                    "spanner_value",
-                    &[duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_ANY],
-                )?,
-            ),
-            (
-                "spanner_typed",
-                prepare_nullable_scalar::<SpannerTypedScalar>(
-                    "spanner_typed",
-                    &[
-                        duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_ANY,
-                        duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR,
-                    ],
-                )?,
-            ),
-            (
-                "spanner_params",
-                prepare_nullable_scalar::<SpannerParamsScalar>(
-                    "spanner_params",
-                    &[duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_ANY],
-                )?,
-            ),
-            (
-                "interval_to_iso8601",
-                prepare_nullable_scalar::<IntervalToIso8601Scalar>(
-                    "interval_to_iso8601",
-                    &[duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTERVAL],
-                )?,
-            ),
-        ]))
-    }
-}
-
-#[cfg(test)]
-pub(crate) unsafe fn register_scalars_c_api(
-    raw_con: duckdb::ffi::duckdb_connection,
-) -> Result<(), RegistrationError> {
-    unsafe { prepare_scalars_c_api()?.register(raw_con) }
-}
-
-unsafe fn prepare_nullable_scalar<S: VScalar>(
-    name: &str,
-    param_type_ids: &[u32],
-) -> Result<OwnedScalarFunctionSet, RegistrationError>
-where
-    S::State: Default,
-{
-    unsafe {
-        use std::ffi::CString;
-
-        use duckdb::core::DataChunkHandle;
-        use duckdb::ffi::{
-            DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR, DuckDBSuccess, duckdb_add_scalar_function_to_set,
-            duckdb_create_logical_type, duckdb_create_scalar_function,
-            duckdb_create_scalar_function_set, duckdb_data_chunk, duckdb_function_info,
-            duckdb_scalar_function_add_parameter, duckdb_scalar_function_set_error,
-            duckdb_scalar_function_set_extra_info, duckdb_scalar_function_set_function,
-            duckdb_scalar_function_set_name, duckdb_scalar_function_set_return_type,
-            duckdb_scalar_function_set_special_handling, duckdb_scalar_function_set_volatile,
-            duckdb_vector,
-        };
-
-        unsafe extern "C" fn drop_scalar_state<T>(ptr: *mut std::ffi::c_void) {
-            let _ = unsafe { Box::from_raw(ptr.cast::<T>()) };
-        }
-
-        unsafe extern "C" fn scalar_invoke<S: VScalar>(
-            info: duckdb_function_info,
-            input: duckdb_data_chunk,
-            mut output: duckdb_vector,
-        ) where
-            S::State: Default,
-        {
-            unsafe {
-                let extra =
-                    duckdb::ffi::duckdb_scalar_function_get_extra_info(info) as *const S::State;
-                let state = if extra.is_null() {
-                    &S::State::default()
-                } else {
-                    &*extra
+            let mut strings = Vec::with_capacity(count);
+            for row in 0..count {
+                let value = input.get_untyped_vector_at(0)?.get_value_slow(row)?;
+                let text = match self.0 {
+                    Operation::Value => Some(serde_json::to_string(&typed_param_envelope(
+                        value_json(&value, &ty)?,
+                        spanner_type_name(&ty).unwrap_or_else(|| format!("{:?}", ty.id())),
+                        json_type_flags(&ty).0 || json_type_flags(&ty).1,
+                    ))?),
+                    Operation::Typed => {
+                        let type_value = input.get_untyped_vector_at(1)?.get_value_slow(row)?;
+                        match type_value.get::<String>()? {
+                            Some(name) => Some(serde_json::to_string(&typed_param_envelope(
+                                value_json(&value, &ty)?,
+                                name,
+                                json_type_flags(&ty).0 || json_type_flags(&ty).1,
+                            ))?),
+                            None => None,
+                        }
+                    }
+                    Operation::Params => {
+                        if value.is_null()? {
+                            None
+                        } else {
+                            let mut params = Map::new();
+                            for i in 0..ty.num_children() {
+                                let field = ty.child(i);
+                                let child = value.get_child(i)?;
+                                params.insert(
+                                    ty.child_name(i),
+                                    struct_field_to_param_json(
+                                        value_json(&child, &field)?,
+                                        &field,
+                                        is_json_type(&field),
+                                    ),
+                                );
+                            }
+                            Some(serde_json::to_string(&Value::Object(params))?)
+                        }
+                    }
+                    Operation::Interval => value
+                        .get::<IntervalValue>()?
+                        .map(|v| duckdb_interval_to_iso8601(v.months, v.days, v.micros)),
                 };
-                #[repr(C)]
-                struct UnownedChunk {
-                    ptr: duckdb_data_chunk,
-                    owned: bool,
-                }
-                let mut chunk: DataChunkHandle = std::mem::transmute(UnownedChunk {
-                    ptr: input,
-                    owned: false,
-                });
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    S::invoke(state, &mut chunk, &mut output)
-                }));
-                // DataChunkHandle's layout is private in duckdb-rs. This wrapper is borrowed
-                // from DuckDB, so it must never run Drop, including after a caught panic.
-                std::mem::forget(chunk);
-
-                let error = match result {
-                    Ok(Ok(())) => None,
-                    Ok(Err(e)) => Some(e.to_string()),
-                    Err(payload) => Some(format!(
-                        "Rust panic in DuckDB scalar function: {}",
-                        panic_payload_message(payload.as_ref())
-                    )),
-                };
-                if let Some(error) = error {
-                    let msg = CString::new(error.replace('\0', "\\0"))
-                        .expect("escaped scalar error cannot contain NUL");
-                    duckdb_scalar_function_set_error(info, msg.as_ptr());
-                }
+                strings.push(text);
             }
-        }
-
-        let c_name = CString::new(name).expect("scalar name must be valid UTF-8");
-        let set = OwnedScalarFunctionSet(duckdb_create_scalar_function_set(c_name.as_ptr()));
-        if set.0.is_null() || crate::should_fail_allocation("scalar function set") {
-            return Err(RegistrationError::new(
-                "allocate scalar function set",
-                name,
-                "duckdb_create_scalar_function_set returned null",
-            ));
-        }
-        let scalar_function = OwnedScalarFunction(duckdb_create_scalar_function());
-        if scalar_function.0.is_null() || crate::should_fail_allocation("scalar function") {
-            return Err(RegistrationError::new(
-                "allocate scalar function",
-                name,
-                "duckdb_create_scalar_function returned null",
-            ));
-        }
-        duckdb_scalar_function_set_name(scalar_function.0, c_name.as_ptr());
-        let return_type =
-            OwnedLogicalType(duckdb_create_logical_type(DUCKDB_TYPE_DUCKDB_TYPE_VARCHAR));
-        if return_type.0.is_null() || crate::should_fail_allocation("scalar return type") {
-            return Err(RegistrationError::new(
-                "allocate scalar return type",
-                name,
-                "duckdb_create_logical_type returned null",
-            ));
-        }
-        duckdb_scalar_function_set_return_type(scalar_function.0, return_type.0);
-        for type_id in param_type_ids {
-            let param_type = OwnedLogicalType(duckdb_create_logical_type(*type_id));
-            if param_type.0.is_null() || crate::should_fail_allocation("scalar parameter type") {
-                return Err(RegistrationError::new(
-                    "allocate scalar parameter type",
-                    name,
-                    format!("duckdb_create_logical_type returned null for type {type_id}"),
-                ));
+            let mut output = output.cast::<String>()?;
+            output.set_size(count)?;
+            let mut writer = output.writer()?;
+            for (row, text) in strings.iter().enumerate() {
+                writer.set(row, text.as_deref())?;
             }
-            duckdb_scalar_function_add_parameter(scalar_function.0, param_type.0);
-        }
-        duckdb_scalar_function_set_function(scalar_function.0, Some(scalar_invoke::<S>));
-        duckdb_scalar_function_set_special_handling(scalar_function.0);
-        if S::volatile() {
-            duckdb_scalar_function_set_volatile(scalar_function.0);
-        }
-        let state = Box::new(S::State::default());
-        duckdb_scalar_function_set_extra_info(
-            scalar_function.0,
-            Box::into_raw(state) as *mut std::ffi::c_void,
-            Some(drop_scalar_state::<S::State>),
-        );
-        let rc = duckdb_add_scalar_function_to_set(set.0, scalar_function.0);
-        if rc != DuckDBSuccess {
-            return Err(RegistrationError::new(
-                "add scalar overload",
-                name,
-                format!("DuckDB returned status {rc}"),
-            ));
-        }
-        Ok(set)
-    }
-}
-
-fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        message
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.as_str()
-    } else {
-        "non-string panic payload"
-    }
-}
-
-fn varchar_sig(params: Vec<LogicalTypeHandle>) -> ScalarFunctionSignature {
-    ScalarFunctionSignature::exact(params, LogicalTypeHandle::from(LogicalTypeId::Varchar))
-}
-
-impl VScalar for SpannerValueScalar {
-    type State = ();
-
-    fn invoke(
-        _: &Self::State,
-        input: &mut DataChunkHandle,
-        output: &mut dyn WritableVector,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let logical_type = input.flat_vector(0).logical_type();
-        let len = input.len();
-
-        validate_spanner_value_type(&logical_type, "spanner_value", false)?;
-
-        if logical_type.id() == LogicalTypeId::Interval {
-            let vec = input.flat_vector(0);
-            let mut strings = Vec::with_capacity(len);
-            for row in 0..len {
-                if vec.row_is_null(row as u64) {
-                    let obj = json!({"value": null, "type": "INTERVAL"});
-                    strings.push(serde_json::to_string(&obj)?);
-                } else {
-                    let interval =
-                        unsafe { vec.as_slice_with_len::<duckdb_interval>(row + 1)[row] };
-                    let iso =
-                        duckdb_interval_to_iso8601(interval.months, interval.days, interval.micros);
-                    let obj = json!({"value": iso, "type": "INTERVAL"});
-                    strings.push(serde_json::to_string(&obj)?);
-                }
-            }
-            return write_string_array(&strings, output);
-        }
-
-        write_spanner_value_strings(input, 0, &logical_type, output, |ty| {
-            spanner_type_name(ty).unwrap_or_else(|| format!("{:?}", ty.id()))
+            Ok(())
         })
-    }
-
-    fn signatures() -> Vec<ScalarFunctionSignature> {
-        vec![varchar_sig(vec![LogicalTypeHandle::from(
-            LogicalTypeId::Any,
-        )])]
+        .map_err(|e| duckdb_neo::Error::invalid_input(e.to_string()))
     }
 }
-
-impl VScalar for SpannerTypedScalar {
-    type State = ();
-
-    fn invoke(
-        _: &Self::State,
-        input: &mut DataChunkHandle,
-        output: &mut dyn WritableVector,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let value_type = input.flat_vector(0).logical_type();
-        let len = input.len();
-
-        validate_spanner_value_type(&value_type, "spanner_typed", true)?;
-
-        let mut types: Vec<Option<String>> = Vec::with_capacity(len);
-        {
-            let type_vec = input.flat_vector(1);
-            for row in 0..len {
-                if type_vec.row_is_null(row as u64) {
-                    types.push(None);
-                } else {
-                    types.push(Some(read_varchar_at(&type_vec, row)?));
-                }
-            }
-        }
-        let (value_is_json, child_is_json) = json_type_flags(&value_type);
-        let mut strings: Vec<Option<String>> = Vec::with_capacity(len);
-        for (row, typ) in types.into_iter().enumerate() {
-            // A NULL type argument is SQL NULL for every value type. INTERVAL
-            // must not substitute its own type name; an explicit non-NULL type
-            // still builds the envelope, including a typed NULL value.
-            let Some(typ) = typ else {
-                strings.push(None);
-                continue;
-            };
-            let value =
-                vector_to_json_value(input, 0, row, &value_type, value_is_json, child_is_json)?;
-            let obj = typed_param_envelope(value, typ, value_is_json || child_is_json);
-            strings.push(Some(serde_json::to_string(&obj)?));
-        }
-
-        let array: std::sync::Arc<dyn Array> = std::sync::Arc::new(StringArray::from(strings));
-        write_arrow_array_to_vector(&array, output)
-    }
-
-    fn signatures() -> Vec<ScalarFunctionSignature> {
-        vec![varchar_sig(vec![
-            LogicalTypeHandle::from(LogicalTypeId::Any),
-            LogicalTypeHandle::from(LogicalTypeId::Varchar),
-        ])]
-    }
-}
-
-impl VScalar for SpannerParamsScalar {
-    type State = ();
-
-    fn invoke(
-        _: &Self::State,
-        input: &mut DataChunkHandle,
-        output: &mut dyn WritableVector,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let len = input.len();
-        let struct_ty = input.flat_vector(0).logical_type();
-        if struct_ty.id() == LogicalTypeId::SqlNull {
-            let values: Vec<Option<String>> = vec![None; len];
-            let array: std::sync::Arc<dyn Array> = std::sync::Arc::new(StringArray::from(values));
-            return write_arrow_array_to_vector(&array, output);
-        }
-        validate_params_struct_type(&struct_ty)?;
-        let null_rows: Vec<bool> = {
-            let vector = input.flat_vector(0);
-            (0..len).map(|row| vector.row_is_null(row as u64)).collect()
+pub(crate) fn register(ext: &Extension) -> NeoResult<()> {
+    for (name, op) in [
+        ("spanner_value", Operation::Value),
+        ("spanner_typed", Operation::Typed),
+        ("spanner_params", Operation::Params),
+        ("interval_to_iso8601", Operation::Interval),
+    ] {
+        let parameter = if matches!(op, Operation::Interval) {
+            FunctionParameter::new::<IntervalValue>("value")
+        } else {
+            FunctionParameter::new::<Any>("value")
         };
-        let struct_vec = input.struct_vector(0);
-        let fields: Vec<ParamField> = (0..struct_ty.num_children())
-            .map(|field_idx| {
-                let ty = struct_ty.child(field_idx);
-                ParamField {
-                    name: struct_ty.child_name(field_idx),
-                    is_json: is_json_type(&ty),
-                    ty,
-                }
-            })
-            .collect();
-
-        let mut strings: Vec<Option<String>> = Vec::with_capacity(len);
-        for (row, is_null) in null_rows.into_iter().enumerate() {
-            if is_null {
-                strings.push(None);
-                continue;
-            }
-            let map = struct_row_to_map(&struct_vec, row, &fields, len)?;
-            strings.push(Some(serde_json::to_string(&Value::Object(map))?));
+        let mut signature = SignatureBuilder::new().param(parameter);
+        if matches!(op, Operation::Typed) {
+            signature = signature.param(FunctionParameter::new::<String>("type"));
         }
-
-        let array: std::sync::Arc<dyn Array> = std::sync::Arc::new(StringArray::from(strings));
-        write_arrow_array_to_vector(&array, output)
+        ScalarFunctionBuilder::new(
+            name,
+            signature.return_type(String::logical_type(ext)?),
+            Scalar(op),
+        )
+        .set_property(FunctionProperty::HasSpecialNullHandling(true))
+        .register(ext)?;
     }
-
-    fn signatures() -> Vec<ScalarFunctionSignature> {
-        vec![varchar_sig(vec![LogicalTypeHandle::from(
-            LogicalTypeId::Any,
-        )])]
-    }
+    Ok(())
 }
-
-impl VScalar for IntervalToIso8601Scalar {
-    type State = ();
-
-    fn invoke(
-        _: &Self::State,
-        input: &mut DataChunkHandle,
-        output: &mut dyn WritableVector,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let len = input.len();
-        let vec = input.flat_vector(0);
-        let mut values: Vec<Option<String>> = Vec::with_capacity(len);
-        for row in 0..len {
-            if vec.row_is_null(row as u64) {
-                values.push(None);
-            } else {
-                let interval = unsafe { vec.as_slice_with_len::<duckdb_interval>(row + 1)[row] };
-                values.push(Some(duckdb_interval_to_iso8601(
-                    interval.months,
-                    interval.days,
-                    interval.micros,
-                )));
-            }
+pub(crate) fn value_json(
+    value: &NeoValue,
+    ty: &LogicalTypeHandle,
+) -> std::result::Result<Value, Box<dyn std::error::Error>> {
+    if value.is_null()? {
+        return Ok(Value::Null);
+    }
+    if is_json_type(ty) {
+        let text = value.get::<String>()?.ok_or("missing non-NULL JSON")?;
+        let parsed: Value = serde_json::from_str(&text)?;
+        return Ok(Value::String(serde_json::to_string(&parsed)?));
+    }
+    if matches!(ty.id(), LogicalTypeId::List | LogicalTypeId::Array) {
+        let n = value.child_count()?;
+        if n > 4_194_304 {
+            return Err("parameter child count exceeds64MiB entry budget".into());
         }
-        let array: std::sync::Arc<dyn Array> = std::sync::Arc::new(StringArray::from(values));
-        write_arrow_array_to_vector(&array, output)
+        return Ok(Value::Array(
+            (0..n)
+                .map(|i| value_json(&value.get_child(i)?, &ty.child(0)))
+                .collect::<std::result::Result<_, _>>()?,
+        ));
     }
-
-    fn signatures() -> Vec<ScalarFunctionSignature> {
-        vec![varchar_sig(vec![LogicalTypeHandle::from(
-            LogicalTypeId::Interval,
-        )])]
+    macro_rules! get {
+        ($t:ty) => {
+            value.get::<$t>()?.ok_or("missing non-NULL value")?
+        };
+    }
+    use LogicalTypeId::*;
+    Ok(match ty.id() {
+        Boolean => json!(get!(bool)),
+        Tinyint => json!(get!(i8)),
+        Smallint => json!(get!(i16)),
+        Integer => json!(get!(i32)),
+        Bigint => json!(get!(i64)),
+        UTinyint => json!(get!(u8)),
+        USmallint => json!(get!(u16)),
+        UInteger => json!(get!(u32)),
+        UBigint => Value::String(get!(u64).to_string()),
+        Hugeint => Value::String(get!(i128).to_string()),
+        UHugeint => Value::String(get!(u128).to_string()),
+        Float => float_to_json_value(get!(f32) as f64)?,
+        Double => float_to_json_value(get!(f64))?,
+        Decimal => {
+            let d = get!(DecimalValue);
+            Value::String(format_decimal128(d.value, u32::from(d.scale)))
+        }
+        Date => Value::String(epoch_days_to_date_string(get!(DateValue).0)?),
+        Timestamp => Value::String(micros_to_spanner_timestamp_string(get!(TimestampValue).0)?),
+        TimestampTZ => Value::String(micros_to_spanner_timestamp_string(
+            get!(TimestampTzValue).0,
+        )?),
+        TimestampS => Value::String(micros_to_spanner_timestamp_string(
+            get!(TimestampSecValue)
+                .0
+                .checked_mul(1_000_000)
+                .ok_or("TIMESTAMP_S overflow")?,
+        )?),
+        TimestampMs => Value::String(micros_to_spanner_timestamp_string(
+            get!(TimestampMsValue)
+                .0
+                .checked_mul(1000)
+                .ok_or("TIMESTAMP_MS overflow")?,
+        )?),
+        TimestampNs => {
+            let nanos = get!(TimestampNsValue).0;
+            // DuckDB2.0 timestamp_base.hpp uses +/-i64::MAX as infinity;
+            // do not turn them into finite dates in1677/2262.
+            if nanos == i64::MAX || nanos == -i64::MAX {
+                return Err(TIMESTAMP_NS_INFINITY_ERROR.into());
+            }
+            Value::String(
+                OffsetDateTime::from_unix_timestamp_nanos(i128::from(nanos))?
+                    .format(&time::format_description::well_known::Rfc3339)?,
+            )
+        }
+        Varchar => Value::String(get!(String)),
+        Blob => Value::String(base64::engine::general_purpose::STANDARD.encode(get!(BlobValue).0)),
+        Bit => Value::String(
+            base64::engine::general_purpose::STANDARD
+                .encode(bit_physical_to_blob(&get!(BitValue).0)?),
+        ),
+        Uuid => Value::String(uuid::Uuid::from_bytes(get!(UuidValueRaw).to_bytes()).to_string()),
+        Time => Value::String(micros_to_time_string(get!(TimeValue).0)?),
+        TimeNs => Value::String(nanos_to_time_string(get!(TimeNsValue).0)?),
+        Interval => {
+            let i = get!(IntervalValue);
+            Value::String(duckdb_interval_to_iso8601(i.months, i.days, i.micros))
+        }
+        id => return Err(format!("Unsupported DuckDB value type {id:?}").into()),
+    })
+}
+/// Structural JSON conversion for COPY. Logical JSON children are parsed once;
+/// ordinary strings remain strings, including envelope-like user text.
+pub(crate) fn structural_json(
+    value: &NeoValue,
+    ty: &LogicalTypeHandle,
+) -> std::result::Result<Value, Box<dyn std::error::Error>> {
+    if value.is_null()? {
+        return Ok(Value::Null);
+    }
+    if is_json_type(ty) {
+        return Ok(serde_json::from_str(
+            &value.get::<String>()?.ok_or("missing JSON")?,
+        )?);
+    }
+    match ty.id() {
+        LogicalTypeId::Struct => {
+            let mut fields = Map::new();
+            for i in 0..ty.num_children() {
+                fields.insert(
+                    ty.child_name(i),
+                    structural_json(&value.get_child(i)?, &ty.child(i))?,
+                );
+            }
+            Ok(Value::Object(fields))
+        }
+        LogicalTypeId::List | LogicalTypeId::Array => {
+            let count = value.child_count()?;
+            if count > 4_194_304 {
+                return Err("COPY JSON child count exceeds64MiB entry budget".into());
+            }
+            Ok(Value::Array(
+                (0..count)
+                    .map(|i| structural_json(&value.get_child(i)?, &ty.child(0)))
+                    .collect::<std::result::Result<_, _>>()?,
+            ))
+        }
+        _ => copy_scalar_json(value, ty),
     }
 }
 
-fn write_string_array(
-    strings: &[String],
-    output: &mut dyn WritableVector,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let array: std::sync::Arc<dyn Array> = std::sync::Arc::new(StringArray::from(strings.to_vec()));
-    write_arrow_array_to_vector(&array, output)
+/// COPY's established JSON formatting differs intentionally from parameter
+/// envelopes: unsigned64 is a JSON number, decimals trim fractional zeros and
+/// timestamps use RFC3339 precision. Keep these paths distinct.
+pub(crate) fn copy_scalar_json(
+    value: &NeoValue,
+    ty: &LogicalTypeHandle,
+) -> std::result::Result<Value, Box<dyn std::error::Error>> {
+    if value.is_null()? {
+        return Ok(Value::Null);
+    }
+    use LogicalTypeId::*;
+    let timestamp = match ty.id() {
+        Timestamp => Some((
+            value.get::<TimestampValue>()?.ok_or("missing timestamp")?.0,
+            1000_i128,
+        )),
+        TimestampTZ => Some((
+            value
+                .get::<TimestampTzValue>()?
+                .ok_or("missing timestamp")?
+                .0,
+            1000_i128,
+        )),
+        TimestampS => Some((
+            value
+                .get::<TimestampSecValue>()?
+                .ok_or("missing timestamp")?
+                .0,
+            1_000_000_000_i128,
+        )),
+        TimestampMs => Some((
+            value
+                .get::<TimestampMsValue>()?
+                .ok_or("missing timestamp")?
+                .0,
+            1_000_000_i128,
+        )),
+        TimestampNs => Some((
+            value
+                .get::<TimestampNsValue>()?
+                .ok_or("missing timestamp")?
+                .0,
+            1_i128,
+        )),
+        _ => None,
+    };
+    if let Some((raw, unit)) = timestamp {
+        if raw == i64::MAX || raw == -i64::MAX {
+            return Err("COPY does not support infinite DuckDB timestamps".into());
+        }
+        let nanos = i128::from(raw)
+            .checked_mul(unit)
+            .ok_or("COPY timestamp overflow")?;
+        return Ok(Value::String(
+            OffsetDateTime::from_unix_timestamp_nanos(nanos)?
+                .format(&time::format_description::well_known::Rfc3339)?,
+        ));
+    }
+    if ty.id() == UBigint {
+        return Ok(json!(
+            value.get::<u64>()?.ok_or("missing unsigned integer")?
+        ));
+    }
+    if ty.id() == Decimal {
+        let d = value.get::<DecimalValue>()?.ok_or("missing decimal")?;
+        let formatted = format_decimal128(d.value, u32::from(d.scale));
+        return Ok(Value::String(if d.scale == 0 {
+            formatted
+        } else {
+            formatted
+                .trim_end_matches('0')
+                .trim_end_matches('.')
+                .to_string()
+        }));
+    }
+    value_json(value, ty)
 }
-
 fn scalar_type_name(id: LogicalTypeId) -> Option<&'static str> {
     match id {
         LogicalTypeId::Boolean => Some("BOOL"),
@@ -593,82 +461,9 @@ fn spanner_type_name(ty: &LogicalTypeHandle) -> Option<String> {
     }
 }
 
-struct ParamField {
-    name: String,
-    ty: LogicalTypeHandle,
-    is_json: bool,
-}
-
 fn is_supported_param_container(ty: &LogicalTypeHandle) -> bool {
     matches!(ty.id(), LogicalTypeId::List | LogicalTypeId::Array)
         && logical_scalar_type_name(&ty.child(0)).is_some()
-}
-
-fn struct_field_json_value(
-    struct_vec: &StructVector,
-    field_idx: usize,
-    row: usize,
-    cap: usize,
-    field: &ParamField,
-) -> Result<Value, Box<dyn std::error::Error>> {
-    let (value_is_json, child_is_json) = json_type_flags(&field.ty);
-    match field.ty.id() {
-        LogicalTypeId::List => {
-            let list_vec = struct_vec.list_vector_child(field_idx);
-            if list_vec.row_is_null(row as u64) {
-                Ok(Value::Null)
-            } else {
-                list_vector_to_json_value(&list_vec, row, &field.ty, child_is_json)
-            }
-        }
-        LogicalTypeId::Array => {
-            let array_vec = struct_vec.array_vector_child(field_idx);
-            if array_vec.row_is_null(row as u64) {
-                Ok(Value::Null)
-            } else {
-                array_vector_to_json_value(&array_vec, row, &field.ty, child_is_json)
-            }
-        }
-        _ => {
-            let child_vec = struct_vec.child(field_idx, cap);
-            flat_vector_to_json_value(&child_vec, row, &field.ty, value_is_json)
-        }
-    }
-}
-
-fn struct_row_to_map(
-    struct_vec: &StructVector,
-    row: usize,
-    fields: &[ParamField],
-    cap: usize,
-) -> Result<Map<String, Value>, Box<dyn std::error::Error>> {
-    let mut map = Map::new();
-    for (field_idx, field) in fields.iter().enumerate() {
-        let value = struct_field_json_value(struct_vec, field_idx, row, cap, field)?;
-        map.insert(
-            field.name.clone(),
-            struct_field_to_param_json(value, &field.ty, field.is_json),
-        );
-    }
-    Ok(map)
-}
-
-fn write_spanner_value_strings(
-    input: &mut DataChunkHandle,
-    col: usize,
-    ty: &LogicalTypeHandle,
-    output: &mut dyn WritableVector,
-    type_name: impl Fn(&LogicalTypeHandle) -> String,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let len = input.len();
-    let (value_is_json, child_is_json) = json_type_flags(ty);
-    let mut strings = Vec::with_capacity(len);
-    for row in 0..len {
-        let value = vector_to_json_value(input, col, row, ty, value_is_json, child_is_json)?;
-        let obj = typed_param_envelope(value, type_name(ty), value_is_json || child_is_json);
-        strings.push(serde_json::to_string(&obj)?);
-    }
-    write_string_array(&strings, output)
 }
 
 fn typed_param_envelope(
@@ -686,219 +481,6 @@ fn typed_param_envelope(
         );
     }
     Value::Object(object)
-}
-
-fn vector_to_json_value(
-    input: &mut DataChunkHandle,
-    col: usize,
-    row: usize,
-    ty: &LogicalTypeHandle,
-    value_is_json: bool,
-    child_is_json: bool,
-) -> Result<Value, Box<dyn std::error::Error>> {
-    if input.flat_vector(col).row_is_null(row as u64) {
-        return Ok(Value::Null);
-    }
-
-    match ty.id() {
-        LogicalTypeId::List => {
-            let list_vec = input.list_vector(col);
-            list_vector_to_json_value(&list_vec, row, ty, child_is_json)
-        }
-        LogicalTypeId::Array => {
-            let array_vec = input.array_vector(col);
-            array_vector_to_json_value(&array_vec, row, ty, child_is_json)
-        }
-        _ => {
-            let vec = input.flat_vector(col);
-            flat_vector_to_json_value(&vec, row, ty, value_is_json)
-        }
-    }
-}
-
-fn list_vector_to_json_value(
-    list_vec: &ListVector,
-    row: usize,
-    ty: &LogicalTypeHandle,
-    child_is_json: bool,
-) -> Result<Value, Box<dyn std::error::Error>> {
-    let (offset, length) = list_vec.get_entry(row);
-    if length == 0 {
-        return Ok(Value::Array(Vec::new()));
-    }
-    let child_ty = ty.child(0);
-    let child = list_vec.child(offset + length);
-    let mut out = Vec::with_capacity(length);
-    for j in 0..length {
-        out.push(flat_vector_to_json_value(
-            &child,
-            offset + j,
-            &child_ty,
-            child_is_json,
-        )?);
-    }
-    Ok(Value::Array(out))
-}
-
-fn array_vector_to_json_value(
-    array_vec: &duckdb::core::ArrayVector,
-    row: usize,
-    ty: &LogicalTypeHandle,
-    child_is_json: bool,
-) -> Result<Value, Box<dyn std::error::Error>> {
-    let array_size = array_vec.get_array_size() as usize;
-    let child_ty = ty.child(0);
-    let base = row * array_size;
-    let child = array_vec.child(base + array_size);
-    let mut out = Vec::with_capacity(array_size);
-    for j in 0..array_size {
-        out.push(flat_vector_to_json_value(
-            &child,
-            base + j,
-            &child_ty,
-            child_is_json,
-        )?);
-    }
-    Ok(Value::Array(out))
-}
-
-fn flat_vector_to_json_value(
-    vec: &FlatVector,
-    row: usize,
-    ty: &LogicalTypeHandle,
-    is_json: bool,
-) -> Result<Value, Box<dyn std::error::Error>> {
-    if vec.row_is_null(row as u64) {
-        return Ok(Value::Null);
-    }
-
-    if is_json {
-        let json_text = read_varchar_at(vec, row)?;
-        let value: Value = serde_json::from_str(&json_text)
-            .map_err(|e| format!("Invalid DuckDB JSON value: {e}"))?;
-        return Ok(Value::String(serde_json::to_string(&value)?));
-    }
-
-    match ty.id() {
-        LogicalTypeId::Boolean => Ok(json!(unsafe {
-            vec.as_slice_with_len::<bool>(row + 1)[row]
-        })),
-        LogicalTypeId::Tinyint => Ok(json!(
-            unsafe { vec.as_slice_with_len::<i8>(row + 1)[row] } as i64
-        )),
-        LogicalTypeId::Smallint => Ok(json!(
-            unsafe { vec.as_slice_with_len::<i16>(row + 1)[row] } as i64
-        )),
-        LogicalTypeId::Integer => Ok(json!(unsafe { vec.as_slice_with_len::<i32>(row + 1)[row] })),
-        LogicalTypeId::Bigint => Ok(json!(unsafe { vec.as_slice_with_len::<i64>(row + 1)[row] })),
-        LogicalTypeId::UTinyint => Ok(json!(
-            unsafe { vec.as_slice_with_len::<u8>(row + 1)[row] } as i64
-        )),
-        LogicalTypeId::USmallint => Ok(json!(
-            unsafe { vec.as_slice_with_len::<u16>(row + 1)[row] } as i64
-        )),
-        LogicalTypeId::UInteger => Ok(json!(
-            unsafe { vec.as_slice_with_len::<u32>(row + 1)[row] } as i64
-        )),
-        LogicalTypeId::UBigint => Ok(Value::String(
-            unsafe { vec.as_slice_with_len::<u64>(row + 1)[row] }.to_string(),
-        )),
-        LogicalTypeId::Hugeint => {
-            let raw = unsafe { vec.as_slice_with_len::<duckdb_hugeint>(row + 1)[row] };
-            Ok(Value::String(hugeint_to_i128(raw).to_string()))
-        }
-        LogicalTypeId::UHugeint => {
-            let raw = unsafe { vec.as_slice_with_len::<duckdb_uhugeint>(row + 1)[row] };
-            Ok(Value::String(uhugeint_to_u128(raw).to_string()))
-        }
-        LogicalTypeId::Decimal => Ok(Value::String(decimal_vector_to_string(vec, row, ty)?)),
-        LogicalTypeId::Date => {
-            let days = unsafe { vec.as_slice_with_len::<duckdb_date>(row + 1)[row].days };
-            Ok(Value::String(epoch_days_to_date_string(days)?))
-        }
-        LogicalTypeId::Timestamp | LogicalTypeId::TimestampTZ => {
-            let micros = unsafe { vec.as_slice_with_len::<duckdb_timestamp>(row + 1)[row].micros };
-            Ok(Value::String(micros_to_spanner_timestamp_string(micros)?))
-        }
-        LogicalTypeId::TimestampS => {
-            let seconds = unsafe { vec.as_slice_with_len::<i64>(row + 1)[row] };
-            let micros = seconds
-                .checked_mul(1_000_000)
-                .ok_or_else(|| format!("TIMESTAMP_S overflow for seconds {seconds}"))?;
-            Ok(Value::String(micros_to_spanner_timestamp_string(micros)?))
-        }
-        LogicalTypeId::TimestampMs => {
-            let millis = unsafe { vec.as_slice_with_len::<i64>(row + 1)[row] };
-            let micros = millis
-                .checked_mul(1_000)
-                .ok_or_else(|| format!("TIMESTAMP_MS overflow for milliseconds {millis}"))?;
-            Ok(Value::String(micros_to_spanner_timestamp_string(micros)?))
-        }
-        LogicalTypeId::TimestampNs => {
-            let nanos = unsafe { vec.as_slice_with_len::<i64>(row + 1)[row] };
-            // DuckDB stores ±infinity as the i64 nanosecond sentinels. Those
-            // values are inside OffsetDateTime's range, so formatting them
-            // without this check emits a finite year-2262 or year-1677 timestamp.
-            let finite = unsafe {
-                duckdb::ffi::duckdb_is_finite_timestamp_ns(duckdb::ffi::duckdb_timestamp_ns {
-                    nanos,
-                })
-            };
-            if !finite {
-                return Err(TIMESTAMP_NS_INFINITY_ERROR.into());
-            }
-            let timestamp = OffsetDateTime::from_unix_timestamp_nanos(nanos as i128)?;
-            // Preserve the source's nanosecond precision. Other timestamp
-            // physical types intentionally use their microsecond-exact helper.
-            Ok(Value::String(
-                timestamp.format(&time::format_description::well_known::Rfc3339)?,
-            ))
-        }
-        LogicalTypeId::Blob => {
-            let bytes = read_blob_at(vec, row)?;
-            Ok(Value::String(
-                base64::engine::general_purpose::STANDARD.encode(bytes),
-            ))
-        }
-        LogicalTypeId::Bit => {
-            // DuckDB's physical BIT string starts with a padding-count byte.
-            // CAST(bit AS BLOB) strips that header and masks the padding bits.
-            let physical = read_blob_at(vec, row)?;
-            let bytes = bit_physical_to_blob(&physical)?;
-            Ok(Value::String(
-                base64::engine::general_purpose::STANDARD.encode(bytes),
-            ))
-        }
-        LogicalTypeId::Float => {
-            float_to_json_value(unsafe { vec.as_slice_with_len::<f32>(row + 1)[row] } as f64)
-        }
-        LogicalTypeId::Double => {
-            float_to_json_value(unsafe { vec.as_slice_with_len::<f64>(row + 1)[row] })
-        }
-        LogicalTypeId::Varchar => Ok(Value::String(read_varchar_at(vec, row)?)),
-        LogicalTypeId::Uuid => {
-            let raw = unsafe { vec.as_slice_with_len::<duckdb_hugeint>(row + 1)[row] };
-            let uuid_bits = (hugeint_to_i128(raw) as u128) ^ (1u128 << 127);
-            Ok(Value::String(uuid::Uuid::from_u128(uuid_bits).to_string()))
-        }
-        LogicalTypeId::Time => {
-            let micros = unsafe { vec.as_slice_with_len::<duckdb_time>(row + 1)[row].micros };
-            Ok(Value::String(micros_to_time_string(micros)?))
-        }
-        LogicalTypeId::TimeNs => {
-            let nanos = unsafe { vec.as_slice_with_len::<duckdb_time_ns>(row + 1)[row].nanos };
-            Ok(Value::String(nanos_to_time_string(nanos)?))
-        }
-        LogicalTypeId::Interval => {
-            let interval = unsafe { vec.as_slice_with_len::<duckdb_interval>(row + 1)[row] };
-            Ok(Value::String(duckdb_interval_to_iso8601(
-                interval.months,
-                interval.days,
-                interval.micros,
-            )))
-        }
-        id => Err(format!("Unsupported DuckDB physical vector type {id:?}").into()),
-    }
 }
 
 fn epoch_days_to_date_string(days: i32) -> Result<String, Box<dyn std::error::Error>> {
@@ -922,14 +504,6 @@ fn float_to_json_value(value: f64) -> Result<Value, Box<dyn std::error::Error>> 
     } else {
         Ok(Value::String("-Infinity".to_string()))
     }
-}
-
-fn hugeint_to_i128(value: duckdb_hugeint) -> i128 {
-    ((value.upper as i128) << 64) | value.lower as i128
-}
-
-fn uhugeint_to_u128(value: duckdb_uhugeint) -> u128 {
-    ((value.upper as u128) << 64) | value.lower as u128
 }
 
 fn micros_to_time_string(micros: i64) -> Result<String, Box<dyn std::error::Error>> {
@@ -958,54 +532,6 @@ fn nanos_to_time_string(nanos: i64) -> Result<String, Box<dyn std::error::Error>
     Ok(format!("{hour:02}:{minute:02}:{second:02}.{fractional:09}"))
 }
 
-fn decimal_vector_to_string(
-    vec: &FlatVector,
-    row: usize,
-    ty: &LogicalTypeHandle,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let internal_type = decimal_internal_type(ty.decimal_width());
-    let data = unsafe { vec.as_mut_ptr::<std::ffi::c_void>() };
-    let raw = unsafe { read_decimal_raw(data, row, internal_type) };
-    Ok(format_decimal128(raw, ty.decimal_scale() as u32))
-}
-
-fn decimal_internal_type(width: u8) -> u32 {
-    if width <= 4 {
-        duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT
-    } else if width <= 9 {
-        duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER
-    } else if width <= 18 {
-        duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT
-    } else {
-        duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_HUGEINT
-    }
-}
-
-unsafe fn read_decimal_raw(
-    data: *mut std::ffi::c_void,
-    row_idx: usize,
-    internal_type: u32,
-) -> i128 {
-    unsafe {
-        match internal_type {
-            duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_SMALLINT => {
-                *data.cast::<i16>().add(row_idx) as i128
-            }
-            duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER => {
-                *data.cast::<i32>().add(row_idx) as i128
-            }
-            duckdb::ffi::DUCKDB_TYPE_DUCKDB_TYPE_BIGINT => *data.cast::<i64>().add(row_idx) as i128,
-            _ => hugeint_to_i128(*data.cast::<duckdb_hugeint>().add(row_idx)),
-        }
-    }
-}
-
-/// Convert DuckDB's physical BIT storage to the bytes produced by `CAST(bit AS BLOB)`.
-///
-/// The first byte is the count of padding bits in the following byte. The
-/// remaining bytes are the payload, with padding bits set. `Bit::BitToBlob`
-/// keeps the low `(8 - padding)` bits of that first payload byte and copies
-/// the rest unchanged.
 fn bit_physical_to_blob(physical: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     if physical.len() < 2 {
         return Err("BIT value is missing its DuckDB storage header".into());
@@ -1024,20 +550,6 @@ fn bit_physical_to_blob(physical: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::
     bytes.push(physical[1] & mask);
     bytes.extend_from_slice(&physical[2..]);
     Ok(bytes)
-}
-
-fn read_blob_at(vec: &FlatVector, row: usize) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let strings = unsafe { vec.as_slice_with_len::<duckdb_string_t>(row + 1) };
-    let mut s = strings[row];
-    let len = unsafe { duckdb::ffi::duckdb_string_t_length(s) } as usize;
-    let data = unsafe { duckdb::ffi::duckdb_string_t_data(&mut s) };
-    Ok(unsafe { std::slice::from_raw_parts(data.cast::<u8>(), len).to_vec() })
-}
-
-fn read_varchar_at(vec: &FlatVector, row: usize) -> Result<String, Box<dyn std::error::Error>> {
-    let strings = unsafe { vec.as_slice_with_len::<duckdb_string_t>(row + 1) };
-    let mut s = strings[row];
-    Ok(DuckString::new(&mut s).as_str().to_string())
 }
 
 fn struct_field_to_param_json(value: Value, ty: &LogicalTypeHandle, is_json: bool) -> Value {
@@ -1214,57 +726,10 @@ pub fn duckdb_interval_to_iso8601(months: i32, days: i32, micros: i64) -> String
 mod tests {
     use super::*;
     use duckdb::Connection;
-
-    struct PanickingScalar;
-
-    impl VScalar for PanickingScalar {
-        type State = ();
-
-        fn invoke(
-            _: &Self::State,
-            _: &mut DataChunkHandle,
-            _: &mut dyn WritableVector,
-        ) -> Result<(), Box<dyn std::error::Error>> {
-            panic!("intentional scalar panic")
-        }
-
-        fn signatures() -> Vec<ScalarFunctionSignature> {
-            vec![varchar_sig(vec![LogicalTypeHandle::from(
-                LogicalTypeId::Integer,
-            )])]
-        }
-    }
-
     fn open_test_connection() -> Connection {
-        use duckdb::ffi::{self, DuckDBSuccess};
-        unsafe {
-            let mut db = std::ptr::null_mut();
-            let r = ffi::duckdb_open_ext(
-                c":memory:".as_ptr(),
-                &mut db,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-            );
-            assert_eq!(r, DuckDBSuccess, "duckdb_open_ext failed");
-            let mut raw_con = std::ptr::null_mut();
-            let rc = ffi::duckdb_connect(db, &mut raw_con);
-            assert_eq!(rc, DuckDBSuccess, "duckdb_connect failed");
-            register_scalars_c_api(raw_con).unwrap();
-            PreparedScalars(vec![(
-                "test_panicking_scalar",
-                prepare_nullable_scalar::<PanickingScalar>(
-                    "test_panicking_scalar",
-                    &[ffi::DUCKDB_TYPE_DUCKDB_TYPE_INTEGER],
-                )
-                .unwrap(),
-            )])
-            .register(raw_con)
-            .unwrap();
-            ffi::duckdb_disconnect(&mut raw_con);
-            Connection::open_from_raw(db).unwrap()
-        }
+        crate::register_static_extension().unwrap();
+        Connection::open_in_memory().unwrap()
     }
-
     fn query_string(conn: &Connection, expression: &str) -> String {
         conn.query_row(&format!("SELECT {expression}"), [], |row| row.get(0))
             .unwrap()
@@ -1788,13 +1253,44 @@ mod tests {
 
     #[test]
     fn test_scalar_callback_catches_panics() {
-        let conn = open_test_connection();
-
-        assert_query_error(
-            &conn,
-            "test_panicking_scalar(1)",
-            "Rust panic in DuckDB scalar function: intentional scalar panic",
-        );
+        struct Panicking;
+        impl ScalarCallbacks for Panicking {
+            type BindData = ();
+            type InitData = ();
+            fn exec(
+                &self,
+                _: Option<&()>,
+                _: Option<&mut ()>,
+                _: &Context,
+                _: &mut VectorCollection,
+                _: Vector<'_, Unknown>,
+            ) -> NeoResult<()> {
+                crate::vtab_safety::guard_callback("test_panicking_scalar", "exec", || {
+                    panic!("intentional scalar panic")
+                })
+                .map_err(|error| duckdb_neo::Error::invalid_input(error.to_string()))
+            }
+        }
+        let conn = crate::test_support::connection();
+        ScalarFunctionBuilder::new(
+            "test_panicking_scalar",
+            SignatureBuilder::new()
+                .param(FunctionParameter::new::<i32>("v"))
+                .return_type(String::logical_type(&conn).unwrap()),
+            Panicking,
+        )
+        .register(&conn)
+        .unwrap();
+        let error = conn
+            .execute(
+                "SELECT test_panicking_scalar(1)",
+                duckdb_neo::Parameters::None,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("intentional scalar panic"), "{error}");
+        conn.execute("SELECT 42", duckdb_neo::Parameters::None)
+            .unwrap();
     }
 
     #[test]

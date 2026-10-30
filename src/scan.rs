@@ -1,8 +1,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
-use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
+use crate::duck::{BindInfo, InitInfo, TableFunctionInfo, VTab};
+use crate::duck::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
 use google_cloud_spanner::client::DatabaseClient;
 use google_cloud_spanner::key::KeySet;
 use google_cloud_spanner::model::PartitionOptions;
@@ -104,7 +104,7 @@ impl VTab for SpannerScanVTab {
                             col.name
                         ))
                     })?;
-                bind.add_result_column(&col.name, logical_type);
+                bind.add_result_column(&col.name, logical_type)?;
             }
 
             Ok(ScanBindData {
@@ -124,8 +124,8 @@ impl VTab for SpannerScanVTab {
 
     fn init(init: &InitInfo) -> Result<Self::InitData, Box<dyn std::error::Error>> {
         vtab_safety::guard_callback("SpannerScanVTab", "init", || {
-            let bind_data = unsafe { &*init.get_bind_data::<ScanBindData>() };
-            let vector_size = vector_size::runtime_vector_size();
+            let bind_data = init.get_bind_data::<ScanBindData>();
+            let vector_size = vector_size::runtime_vector_size(init.context)?;
 
             // Get projected column indices (DuckDB tells us which columns it needs)
             let projected_columns: Vec<usize> = init
@@ -232,7 +232,7 @@ impl VTab for SpannerScanVTab {
             let batch = match init_data.streaming.next_batch()? {
                 Some(batch) => batch,
                 None => {
-                    output.set_len(0);
+                    output.set_len(0)?;
                     return Ok(());
                 }
             };
@@ -515,7 +515,7 @@ fn write_projected_rows<R: convert::ConversionRow>(
     }
 
     if rows.is_empty() {
-        output.set_len(0);
+        output.set_len(0)?;
         return Ok(());
     }
 
@@ -531,7 +531,7 @@ fn write_projected_rows<R: convert::ConversionRow>(
         )?;
     }
 
-    output.set_len(rows.len());
+    output.set_len(rows.len())?;
     Ok(())
 }
 
@@ -611,20 +611,48 @@ mod tests {
                 kind: Some(ProtoKind::StringValue("not-a-bool".to_string())),
             }]),
         ])];
-        let mut output = DataChunkHandle::new(&[
-            LogicalTypeHandle::list(&LogicalTypeId::Bigint.into()),
-            LogicalTypeHandle::list(&LogicalTypeId::Boolean.into()),
-        ]);
-        output.set_len(1);
-
-        let sentinels = [(1, 1), (0, 2)];
-        for (column_idx, &(offset, length)) in sentinels.iter().enumerate() {
-            let mut list = output.list_vector(column_idx);
-            let _child = list.child(2);
-            list.set_len(2);
-            list.set_entry(0, offset, length);
-        }
-
+        let context = crate::test_support::connection();
+        let mut output = DataChunkHandle::new(
+            &context,
+            &[
+                LogicalTypeHandle::list(&LogicalTypeId::Bigint.into()),
+                LogicalTypeHandle::list(&LogicalTypeId::Boolean.into()),
+            ],
+        );
+        output.set_len(1).unwrap();
+        let first = duckdb_neo::value::ValueInput::List {
+            child_type: &LogicalTypeHandle::from(LogicalTypeId::Bigint)
+                .build(&context)
+                .unwrap(),
+            children: &[duckdb_neo::ToValue::value(&9_i64, &context).unwrap()],
+        };
+        output
+            .write(
+                0,
+                0,
+                duckdb_neo::connection::FFILink::create_value(&context, first).unwrap(),
+            )
+            .unwrap();
+        let second = duckdb_neo::value::ValueInput::List {
+            child_type: &LogicalTypeHandle::from(LogicalTypeId::Boolean)
+                .build(&context)
+                .unwrap(),
+            children: &[
+                duckdb_neo::ToValue::value(&true, &context).unwrap(),
+                duckdb_neo::ToValue::value(&false, &context).unwrap(),
+            ],
+        };
+        output
+            .write(
+                1,
+                0,
+                duckdb_neo::connection::FFILink::create_value(&context, second).unwrap(),
+            )
+            .unwrap();
+        let before = [
+            output.value_at(0, 0).unwrap().dbg_string().unwrap(),
+            output.value_at(1, 0).unwrap().dbg_string().unwrap(),
+        ];
         let result = write_projected_rows(&mut output, &rows, &columns, &[0, 1]);
         match result {
             Err(SpannerError::Conversion(message)) => {
@@ -635,14 +663,16 @@ mod tests {
             other => panic!("expected Conversion error, got {other:?}"),
         }
 
-        assert_eq!(output.len(), 1, "failed projection changed chunk length");
-        for (column_idx, &entry) in sentinels.iter().enumerate() {
-            let list = output.list_vector(column_idx);
-            assert_eq!(list.len(), 2, "column {column_idx} length changed");
+        assert_eq!(
+            output.len().unwrap(),
+            1,
+            "failed projection changed chunk length"
+        );
+        for (column, expected) in before.iter().enumerate() {
             assert_eq!(
-                list.get_entry(0),
-                entry,
-                "column {column_idx} entry was overwritten"
+                &output.value_at(column, 0).unwrap().dbg_string().unwrap(),
+                expected,
+                "column {column} was overwritten"
             );
         }
     }

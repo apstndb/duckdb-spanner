@@ -1,7 +1,7 @@
 use std::fmt;
 use std::sync::LazyLock;
 
-use duckdb::core::{LogicalTypeHandle, LogicalTypeId};
+use crate::duck::{LogicalTypeHandle, LogicalTypeId};
 use google_cloud_spanner::model;
 use google_cloud_spanner::types::{self as spanner_types, Type, TypeCode};
 

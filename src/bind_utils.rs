@@ -1,4 +1,4 @@
-use duckdb::vtab::BindInfo;
+use crate::duck::BindInfo;
 use google_cloud_spanner::model::request_options::Priority;
 use google_cloud_spanner::transaction::TimestampBound;
 
